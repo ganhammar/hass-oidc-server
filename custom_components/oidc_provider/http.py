@@ -30,6 +30,7 @@ from .const import (
     GRANT_TYPE_REFRESH_TOKEN,
     GROUP_OWNER,
     HA_GROUP_TO_OIDC_GROUP,
+    ID_TOKEN_EXPIRY,
     MAX_TOKEN_ATTEMPTS,
     RATE_LIMIT_PENALTY,
     RATE_LIMIT_WINDOW,
@@ -43,6 +44,8 @@ from .const import (
     STORAGE_VERSION,
     SUPPORTED_CODE_CHALLENGE_METHODS,
     SUPPORTED_SCOPES,
+    TOKEN_USE_ACCESS,
+    TOKEN_USE_ID,
 )
 from .security import verify_client_secret
 from .token_validator import get_issuer_from_request
@@ -184,6 +187,7 @@ class OIDCContinueView(HomeAssistantView):
         redirect_uri = stored_request["redirect_uri"]
         scope = stored_request["scope"]
         state = stored_request["state"]
+        nonce = stored_request.get("nonce")
         code_challenge = stored_request.get("code_challenge")
         code_challenge_method = stored_request.get("code_challenge_method")
 
@@ -197,6 +201,15 @@ class OIDCContinueView(HomeAssistantView):
             "redirect_uri": redirect_uri,
             "scope": scope,
             "user_id": user.id,
+            "nonce": nonce,
+            # OIDC §2 defines auth_time as when End-User authentication occurred.
+            # /oidc/continue is auth-gated, so we know the user *is* authenticated
+            # here, but the underlying HA session may be older. We stamp the time
+            # the user transited the consent step as the closest approximation
+            # available without reaching into HA's session internals. max_age
+            # is not honored at the authorize endpoint, so this approximation
+            # cannot mask a missed re-authentication today.
+            "auth_time": int(time.time()),
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
@@ -248,6 +261,9 @@ class OIDCDiscoveryView(HomeAssistantView):
                 "aud",
                 "exp",
                 "iat",
+                "auth_time",
+                "nonce",
+                "at_hash",
             ],
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
         }
@@ -338,6 +354,7 @@ class OIDCAuthorizationView(HomeAssistantView):
         response_type = request.query.get("response_type")
         scope = request.query.get("scope", "")
         state = request.query.get("state", "")
+        nonce = request.query.get("nonce")
         code_challenge = request.query.get("code_challenge")
         code_challenge_method = request.query.get(
             "code_challenge_method", CODE_CHALLENGE_METHOD_S256
@@ -354,6 +371,14 @@ class OIDCAuthorizationView(HomeAssistantView):
                 text="The openid scope is required for OIDC requests.",
                 status=400,
             )
+
+        # NOTE: max_age (OIDC Core §3.1.2.1) is intentionally not honored here.
+        # The auth_time claim emitted in the id_token is stamped at the
+        # /oidc/continue step, which approximates "authentication occurred"
+        # because HA may have authenticated the user via a long-lived session.
+        # If max_age support is added, auth_time MUST move to a primitive
+        # representing actual login time (e.g. the HA refresh token's
+        # created_at), otherwise max_age would silently no-op.
 
         # Check if PKCE is required
         require_pkce = hass.data[DOMAIN].get(CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE)
@@ -405,6 +430,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             "response_type": response_type,
             "scope": scope,
             "state": state,
+            "nonce": nonce,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "expires_at": time.time() + 600,  # 10 minutes
@@ -631,16 +657,20 @@ class OIDCTokenView(HomeAssistantView):
         client_id = auth_data["client_id"]
         scope = auth_data["scope"]
 
-        access_token, id_token = await self._generate_tokens(
-            _request, hass, user_id, scope, client_id
-        )
+        nonce = auth_data.get("nonce")
+        auth_time = auth_data.get("auth_time")
+
+        access_token = await self._generate_access_token(_request, hass, user_id, scope, client_id)
         refresh_token = secrets.token_urlsafe(32)
 
-        # Store refresh token
+        # Store refresh token (nonce + auth_time persisted so future refreshes
+        # produce spec-correct id_tokens after Home Assistant restarts).
         hass.data[DOMAIN]["refresh_tokens"][refresh_token] = {
             "user_id": user_id,
             "client_id": client_id,
             "scope": scope,
+            "nonce": nonce,
+            "auth_time": auth_time,
             "expires_at": time.time() + REFRESH_TOKEN_EXPIRY,
         }
 
@@ -650,16 +680,31 @@ class OIDCTokenView(HomeAssistantView):
         # Delete used authorization code
         del auth_codes[code]
 
-        return web.json_response(
-            {
-                "access_token": access_token,
-                "id_token": id_token,
-                "token_type": "Bearer",
-                "expires_in": ACCESS_TOKEN_EXPIRY,
-                "refresh_token": refresh_token,
-                "scope": scope,
-            }
-        )
+        response_body: dict[str, Any] = {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRY,
+            "refresh_token": refresh_token,
+            "scope": scope,
+        }
+
+        # Issue an id_token only when openid scope was granted (OIDC Core §3.1.3.3).
+        # The authorize endpoint already enforces openid, so this branch is
+        # effectively always taken today; the explicit check is defense-in-depth
+        # against future changes loosening the authorize-side check.
+        if SCOPE_OPENID in (scope or "").split():
+            response_body["id_token"] = await self._generate_id_token(
+                _request,
+                hass,
+                user_id,
+                scope,
+                client_id,
+                nonce=nonce,
+                auth_time=auth_time,
+                access_token=access_token,
+            )
+
+        return web.json_response(response_body)
 
     async def _handle_refresh_token(
         self, _request: web.Request, hass: HomeAssistant, data: Any
@@ -683,55 +728,61 @@ class OIDCTokenView(HomeAssistantView):
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         # Generate new access token
-        access_token, id_token = await self._generate_tokens(
+        access_token = await self._generate_access_token(
             _request, hass, token_data["user_id"], token_data["scope"], token_data["client_id"]
         )
 
-        return web.json_response(
-            {
-                "access_token": access_token,
-                "token_type": "Bearer",
-                "id_token": id_token,
-                "expires_in": ACCESS_TOKEN_EXPIRY,
-                "scope": token_data["scope"],
-            }
-        )
+        # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
+        # Original nonce and auth_time are carried forward; iat/exp/at_hash are
+        # fresh. Old refresh tokens persisted before this change have neither
+        # field, handled by .get() returning None.
+        response_body: dict[str, Any] = {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRY,
+            "scope": token_data["scope"],
+        }
 
-    async def _generate_tokens(
+        scope_value = token_data["scope"] or ""
+        if SCOPE_OPENID in scope_value.split():
+            response_body["id_token"] = await self._generate_id_token(
+                _request,
+                hass,
+                token_data["user_id"],
+                token_data["scope"],
+                token_data["client_id"],
+                nonce=token_data.get("nonce"),
+                auth_time=token_data.get("auth_time"),
+                access_token=access_token,
+            )
+
+        return web.json_response(response_body)
+
+    async def _generate_access_token(
         self, request: web.Request, hass: HomeAssistant, user_id: str, scope: str, client_id: str
-    ) -> tuple[str, str]:
-        """Generate access and id tokens."""
+    ) -> str:
+        """Generate JWT access token."""
         now = int(time.time())
 
         # Use dynamic issuer based on the actual base URL
         base_url = get_issuer_from_request(request)
 
-        access_payload = {
+        payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
             "iss": base_url,
             "aud": client_id,
+            "scope": scope,
+            "token_use": TOKEN_USE_ACCESS,
         }
-        id_payload = access_payload.copy()
 
-        user = await hass.auth.async_get_user(user_id)
+        # Include groups claim when the groups scope is requested
         requested_scopes = scope.split() if scope else []
-        if user:
-            if SCOPE_GROUPS in requested_scopes:
-                # claims should be only included on id_token, but some clients may expect groups
-                # in access_token too, so we include in both
-                access_payload["groups"] = _resolve_user_groups(user)
-                id_payload["groups"] = _resolve_user_groups(user)
-
-            if SCOPE_PROFILE in requested_scopes:
-                id_payload["name"] = user.name
-
-            if SCOPE_EMAIL in requested_scopes:
-                username = user.name or ""
-                if _looks_like_email(username):
-                    id_payload["email"] = username
-                    id_payload["email_verified"] = False
+        if SCOPE_GROUPS in requested_scopes:
+            user = await hass.auth.async_get_user(user_id)
+            if user:
+                payload["groups"] = _resolve_user_groups(user)
 
         private_key = hass.data[DOMAIN]["jwt_private_key"]
         kid = hass.data[DOMAIN]["jwt_kid"]
@@ -741,12 +792,82 @@ class OIDCTokenView(HomeAssistantView):
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        access_token = jwt.encode(
-            access_payload, private_pem, algorithm="RS256", headers={"kid": kid}
-        )
-        id_token = jwt.encode(id_payload, private_pem, algorithm="RS256", headers={"kid": kid})
+        return jwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": kid})
 
-        return access_token, id_token
+    async def _generate_id_token(
+        self,
+        request: web.Request,
+        hass: HomeAssistant,
+        user_id: str,
+        scope: str,
+        client_id: str,
+        *,
+        nonce: str | None,
+        auth_time: int | None,
+        access_token: str,
+    ) -> str:
+        """Generate an OIDC ID Token (OIDC Core 1.0 §2)."""
+        now = int(time.time())
+        base_url = get_issuer_from_request(request)
+
+        payload: dict[str, Any] = {
+            "iss": base_url,
+            "sub": user_id,
+            "aud": client_id,
+            "iat": now,
+            "exp": now + ID_TOKEN_EXPIRY,
+            "token_use": TOKEN_USE_ID,
+        }
+
+        if auth_time is not None:
+            payload["auth_time"] = int(auth_time)
+
+        # Nonce: MUST be echoed when present in the auth request,
+        # MUST NOT be included otherwise (OIDC Core §3.1.3.7).
+        if nonce is not None:
+            payload["nonce"] = nonce
+
+        # at_hash: base64url-encoded left-most half of the SHA-256 hash of the
+        # access token (OIDC Core §3.1.3.6). Defense-in-depth binding so a
+        # stolen access token cannot be paired with a different id_token.
+        digest = hashlib.sha256(access_token.encode("ascii")).digest()
+        payload["at_hash"] = (
+            base64.urlsafe_b64encode(digest[: len(digest) // 2]).decode("ascii").rstrip("=")
+        )
+
+        # Scope-gated identity claims. OIDC Core §5.4 permits returning these
+        # in the id_token; many real-world clients (oauth2-proxy, mod_auth_openidc)
+        # only read identity from the id_token, so include them when granted.
+        requested_scopes = scope.split() if scope else []
+        user = None
+        if (
+            SCOPE_PROFILE in requested_scopes
+            or SCOPE_EMAIL in requested_scopes
+            or SCOPE_GROUPS in requested_scopes
+        ):
+            user = await hass.auth.async_get_user(user_id)
+
+        if user and SCOPE_PROFILE in requested_scopes:
+            payload["name"] = user.name
+
+        if user and SCOPE_EMAIL in requested_scopes:
+            username = user.name or ""
+            if _looks_like_email(username):
+                payload["email"] = username
+                payload["email_verified"] = False
+
+        if user and SCOPE_GROUPS in requested_scopes:
+            payload["groups"] = _resolve_user_groups(user)
+
+        private_key = hass.data[DOMAIN]["jwt_private_key"]
+        kid = hass.data[DOMAIN]["jwt_kid"]
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        return jwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": kid})
 
 
 class OIDCUserInfoView(HomeAssistantView):
@@ -790,6 +911,14 @@ class OIDCUserInfoView(HomeAssistantView):
                     "verify_exp": True,
                 },
             )
+
+            # Reject id_tokens at the userinfo endpoint. Only access tokens
+            # are accepted here. Tokens issued before the token_use claim
+            # existed have no token_use; treat absent as access for backward
+            # compatibility, but explicitly reject token_use="id".
+            if payload.get("token_use") == TOKEN_USE_ID:
+                _LOGGER.warning("ID token presented at userinfo endpoint")
+                return web.json_response({"error": "invalid_token"}, status=401)
 
             # Verify the audience claim exists and matches a registered client
             aud = payload.get("aud")

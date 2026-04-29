@@ -33,7 +33,20 @@ def test_discovery_document_structure():
             "client_secret_post",
             "client_secret_basic",
         ],
-        "claims_supported": ["sub", "name", "email", "iss", "aud", "exp", "iat"],
+        "claims_supported": [
+            "sub",
+            "name",
+            "email",
+            "email_verified",
+            "groups",
+            "iss",
+            "aud",
+            "exp",
+            "iat",
+            "auth_time",
+            "nonce",
+            "at_hash",
+        ],
     }
 
     # Required OIDC discovery fields

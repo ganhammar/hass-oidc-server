@@ -211,6 +211,10 @@ async def test_oidc_discovery_endpoint():
     assert "client_secret_post" in data["token_endpoint_auth_methods_supported"]
     assert "client_secret_basic" in data["token_endpoint_auth_methods_supported"]
 
+    # ID token claims advertised after id_token issuance was added
+    for claim in ("auth_time", "nonce", "at_hash"):
+        assert claim in data["claims_supported"]
+
 
 @pytest.mark.asyncio
 async def test_oidc_discovery_with_proxy():
@@ -840,13 +844,10 @@ async def test_oidc_token_view_basic_auth():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = AsyncMock()
-
-    mock_auth = Mock()
-    mock_auth.async_get_user = AsyncMock(return_value=None)
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
-    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1245,13 +1246,10 @@ async def test_oidc_token_view_valid_pkce():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = AsyncMock()
-
-    mock_auth = Mock()
-    mock_auth.async_get_user = AsyncMock(return_value=None)
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
-    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1278,6 +1276,13 @@ async def test_oidc_token_view_valid_pkce():
         }
     }
 
+    mock_user = Mock()
+    mock_user.name = "Test User"
+    mock_user.is_owner = False
+    mock_user.groups = []
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
+
     request = MagicMock()
     request.app = {"hass": hass}
     request.remote = "127.0.0.1"
@@ -1302,8 +1307,8 @@ async def test_oidc_token_view_valid_pkce():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert "access_token" in data
-    assert "id_token" in data
     assert "refresh_token" in data
+    assert "id_token" in data
     assert data["token_type"] == "Bearer"
     assert data["scope"] == "openid profile"
 
@@ -1349,7 +1354,8 @@ async def test_oidc_token_view_includes_groups_in_access_token():
     mock_auth = Mock()
     mock_auth.async_get_user = AsyncMock(return_value=mock_user)
 
-    mock_token_store = AsyncMock()
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
     hass.auth = mock_auth
@@ -1434,13 +1440,10 @@ async def test_oidc_token_view_excludes_groups_without_scope():
     )
     public_key = private_key.public_key()
 
-    mock_token_store = AsyncMock()
-
-    mock_auth = Mock()
-    mock_auth.async_get_user = AsyncMock(return_value=None)
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
-    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1466,6 +1469,13 @@ async def test_oidc_token_view_excludes_groups_without_scope():
             "token_store": mock_token_store,
         }
     }
+
+    mock_user = Mock()
+    mock_user.name = "Test User"
+    mock_user.is_owner = False
+    mock_user.groups = []
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
 
     request = MagicMock()
     request.app = {"hass": hass}
@@ -1513,13 +1523,10 @@ async def test_oidc_token_view_refresh_token():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = AsyncMock()
-
-    mock_auth = Mock()
-    mock_auth.async_get_user = AsyncMock(return_value=None)
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
-    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1541,6 +1548,13 @@ async def test_oidc_token_view_refresh_token():
             "token_store": mock_token_store,
         }
     }
+
+    mock_user = Mock()
+    mock_user.name = "user@example.com"
+    mock_user.is_owner = False
+    mock_user.groups = []
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
 
     mock_url = Mock()
     mock_url.origin.return_value = "http://localhost"
