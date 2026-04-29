@@ -9,8 +9,13 @@ STORAGE_KEY_TOKENS = f"{DOMAIN}.tokens"
 
 # Token expiry times (in seconds)
 ACCESS_TOKEN_EXPIRY = 3600  # 1 hour
+ID_TOKEN_EXPIRY = 3600  # 1 hour
 REFRESH_TOKEN_EXPIRY = 2592000  # 30 days
 AUTHORIZATION_CODE_EXPIRY = 600  # 10 minutes
+
+# Token type discriminator (custom claim used to distinguish access vs id tokens)
+TOKEN_USE_ACCESS = "access"
+TOKEN_USE_ID = "id"
 
 # OIDC scopes
 SCOPE_OPENID = "openid"
