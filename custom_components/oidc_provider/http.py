@@ -631,7 +631,9 @@ class OIDCTokenView(HomeAssistantView):
         client_id = auth_data["client_id"]
         scope = auth_data["scope"]
 
-        access_token = await self._generate_access_token(_request, hass, user_id, scope, client_id)
+        access_token, id_token = await self._generate_tokens(
+            _request, hass, user_id, scope, client_id
+        )
         refresh_token = secrets.token_urlsafe(32)
 
         # Store refresh token
@@ -651,6 +653,7 @@ class OIDCTokenView(HomeAssistantView):
         return web.json_response(
             {
                 "access_token": access_token,
+                "id_token": id_token,
                 "token_type": "Bearer",
                 "expires_in": ACCESS_TOKEN_EXPIRY,
                 "refresh_token": refresh_token,
@@ -680,7 +683,7 @@ class OIDCTokenView(HomeAssistantView):
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         # Generate new access token
-        access_token = await self._generate_access_token(
+        access_token, id_token = await self._generate_tokens(
             _request, hass, token_data["user_id"], token_data["scope"], token_data["client_id"]
         )
 
@@ -688,35 +691,47 @@ class OIDCTokenView(HomeAssistantView):
             {
                 "access_token": access_token,
                 "token_type": "Bearer",
+                "id_token": id_token,
                 "expires_in": ACCESS_TOKEN_EXPIRY,
                 "scope": token_data["scope"],
             }
         )
 
-    async def _generate_access_token(
+    async def _generate_tokens(
         self, request: web.Request, hass: HomeAssistant, user_id: str, scope: str, client_id: str
-    ) -> str:
-        """Generate JWT access token."""
+    ) -> tuple[str, str]:
+        """Generate access and id tokens."""
         now = int(time.time())
 
         # Use dynamic issuer based on the actual base URL
         base_url = get_issuer_from_request(request)
 
-        payload = {
+        access_payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
             "iss": base_url,
             "aud": client_id,
-            "scope": scope,
         }
+        id_payload = access_payload.copy()
 
-        # Include groups claim when the groups scope is requested
+        user = await hass.auth.async_get_user(user_id)
         requested_scopes = scope.split() if scope else []
-        if SCOPE_GROUPS in requested_scopes:
-            user = await hass.auth.async_get_user(user_id)
-            if user:
-                payload["groups"] = _resolve_user_groups(user)
+        if user:
+            if SCOPE_GROUPS in requested_scopes:
+                # claims should be only included on id_token, but some clients may expect groups
+                # in access_token too, so we include in both
+                access_payload["groups"] = _resolve_user_groups(user)
+                id_payload["groups"] = _resolve_user_groups(user)
+
+            if SCOPE_PROFILE in requested_scopes:
+                id_payload["name"] = user.name
+
+            if SCOPE_EMAIL in requested_scopes:
+                username = user.name or ""
+                if _looks_like_email(username):
+                    id_payload["email"] = username
+                    id_payload["email_verified"] = False
 
         private_key = hass.data[DOMAIN]["jwt_private_key"]
         kid = hass.data[DOMAIN]["jwt_kid"]
@@ -726,7 +741,12 @@ class OIDCTokenView(HomeAssistantView):
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        return jwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": kid})
+        access_token = jwt.encode(
+            access_payload, private_pem, algorithm="RS256", headers={"kid": kid}
+        )
+        id_token = jwt.encode(id_payload, private_pem, algorithm="RS256", headers={"kid": kid})
+
+        return access_token, id_token
 
 
 class OIDCUserInfoView(HomeAssistantView):

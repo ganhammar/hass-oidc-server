@@ -840,10 +840,13 @@ async def test_oidc_token_view_basic_auth():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = Mock()
-    mock_token_store.async_save = AsyncMock()
+    mock_token_store = AsyncMock()
+
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=None)
 
     hass = Mock()
+    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -892,6 +895,7 @@ async def test_oidc_token_view_basic_auth():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert "access_token" in data
+    assert "id_token" in data
     assert "refresh_token" in data
     assert data["token_type"] == "Bearer"
 
@@ -1241,10 +1245,13 @@ async def test_oidc_token_view_valid_pkce():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = Mock()
-    mock_token_store.async_save = AsyncMock()
+    mock_token_store = AsyncMock()
+
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=None)
 
     hass = Mock()
+    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1295,6 +1302,7 @@ async def test_oidc_token_view_valid_pkce():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert "access_token" in data
+    assert "id_token" in data
     assert "refresh_token" in data
     assert data["token_type"] == "Bearer"
     assert data["scope"] == "openid profile"
@@ -1341,8 +1349,7 @@ async def test_oidc_token_view_includes_groups_in_access_token():
     mock_auth = Mock()
     mock_auth.async_get_user = AsyncMock(return_value=mock_user)
 
-    mock_token_store = Mock()
-    mock_token_store.async_save = AsyncMock()
+    mock_token_store = AsyncMock()
 
     hass = Mock()
     hass.auth = mock_auth
@@ -1427,10 +1434,13 @@ async def test_oidc_token_view_excludes_groups_without_scope():
     )
     public_key = private_key.public_key()
 
-    mock_token_store = Mock()
-    mock_token_store.async_save = AsyncMock()
+    mock_token_store = AsyncMock()
+
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=None)
 
     hass = Mock()
+    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1503,10 +1513,13 @@ async def test_oidc_token_view_refresh_token():
         public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
-    mock_token_store = Mock()
-    mock_token_store.async_save = AsyncMock()
+    mock_token_store = AsyncMock()
+
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=None)
 
     hass = Mock()
+    hass.auth = mock_auth
     hass.data = {
         DOMAIN: {
             "clients": {
@@ -1555,6 +1568,7 @@ async def test_oidc_token_view_refresh_token():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert "access_token" in data
+    assert "id_token" in data
     assert data["token_type"] == "Bearer"
     assert data["scope"] == "openid email"
 
