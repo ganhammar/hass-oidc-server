@@ -17,10 +17,11 @@ def load_const_module():
 def test_discovery_document_structure():
     """Test OIDC discovery document has required fields."""
     base_url = "https://example.com"
+    issuer = f"{base_url}/oidc"
     const = load_const_module()
 
     discovery = {
-        "issuer": base_url,
+        "issuer": issuer,
         "authorization_endpoint": f"{base_url}/auth/oidc/authorize",
         "token_endpoint": f"{base_url}/auth/oidc/token",
         "userinfo_endpoint": f"{base_url}/auth/oidc/userinfo",
@@ -59,7 +60,7 @@ def test_discovery_document_structure():
     assert "id_token_signing_alg_values_supported" in discovery
 
     # Validate values
-    assert discovery["issuer"] == base_url
+    assert discovery["issuer"] == issuer
     assert "code" in discovery["response_types_supported"]
     assert "RS256" in discovery["id_token_signing_alg_values_supported"]
     assert "openid" in discovery["scopes_supported"]
