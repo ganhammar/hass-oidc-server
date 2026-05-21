@@ -1,5 +1,6 @@
 """Tests for token validator."""
 
+import logging
 import time
 
 import jwt
@@ -9,7 +10,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from custom_components.oidc_provider.const import DOMAIN
-from custom_components.oidc_provider.token_validator import validate_access_token
+from custom_components.oidc_provider.token_validator import (
+    _describe_token,
+    validate_access_token,
+)
 
 
 @pytest.fixture
@@ -374,3 +378,82 @@ async def test_validate_access_token_rejects_unsuffixed_iss(mock_hass_with_keys)
 
     assert validate_access_token(hass, token, "https://ha.example.com") is None
     assert validate_access_token(hass, token, "https://ha.example.com/oidc") is None
+
+
+def test_describe_token_extracts_header_fields():
+    """JWT-shaped tokens surface alg/kid/typ for diagnostics."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    token = jwt.encode(
+        {"sub": "u"}, private_pem, algorithm="RS256", headers={"kid": "abc", "typ": "JWT"}
+    )
+
+    info = _describe_token(token)
+
+    assert "alg='RS256'" in info
+    assert "kid='abc'" in info
+    assert "typ='JWT'" in info
+    assert "segments=3" in info
+    assert "length=" in info
+    assert token not in info
+
+
+def test_describe_token_marks_unparseable_input():
+    """Non-JWT bearer tokens are logged as <unparseable> without leaking content."""
+    info = _describe_token("not-a-jwt")
+
+    assert "header=<unparseable>" in info
+    assert "length=9" in info
+    assert "segments=1" in info
+    assert "not-a-jwt" not in info
+
+
+def test_describe_token_handles_empty():
+    """Empty tokens don't blow up the diagnostic helper."""
+    assert _describe_token("") == "token=<empty>"
+
+
+def test_invalid_alg_failure_logs_actual_alg(mock_hass_with_keys, caplog):
+    """An HS256 token presented for RS256 validation logs its alg header."""
+    hass, _ = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    # Sign with HS256 so PyJWT raises InvalidAlgorithmError before signature checks.
+    token = jwt.encode(
+        {
+            "sub": "u",
+            "iss": "http://localhost/oidc",
+            "aud": "test_client",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 3600,
+        },
+        "shared-secret",
+        algorithm="HS256",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.oidc_provider.token_validator"):
+        result = validate_access_token(hass, token, "http://localhost")
+
+    assert result is None
+    assert any(
+        "alg='HS256'" in record.getMessage() and "Invalid token" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_malformed_token_failure_logs_unparseable(mock_hass_with_keys, caplog):
+    """A non-JWT bearer surfaces as unparseable in the warning."""
+    hass, _ = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.oidc_provider.token_validator"):
+        result = validate_access_token(hass, "definitely-not-a-jwt", "http://localhost")
+
+    assert result is None
+    assert any("header=<unparseable>" in record.getMessage() for record in caplog.records)
