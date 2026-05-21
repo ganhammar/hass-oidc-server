@@ -260,10 +260,12 @@ async def test_id_token_issued_with_required_claims():
 
     claims = _decode_id_token(body["id_token"], public_pem)
 
-    # Required claims (OIDC Core §2)
+    # Required claims (OIDC Core §2). The /oidc suffix on iss is required by
+    # RFC 8414 so it matches authorization_servers entries advertised by
+    # paired protected-resource servers (e.g. hass-mcp-server).
     assert claims["sub"] == "user123"
     assert claims["aud"] == "test_client"
-    assert claims["iss"]
+    assert claims["iss"] == f"{_FIXED_ISSUER}/oidc"
     assert claims["iat"] <= int(time.time())
     assert claims["exp"] > claims["iat"]
 

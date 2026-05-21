@@ -196,8 +196,9 @@ async def test_oidc_discovery_endpoint():
     body = response.body.decode("utf-8")
     data = json.loads(body)
 
-    # Verify required OIDC fields
-    assert data["issuer"] == "https://homeassistant.local"
+    # Verify required OIDC fields. The issuer carries the /oidc suffix per
+    # RFC 8414 so it resolves to /oidc/.well-known/openid-configuration.
+    assert data["issuer"] == "https://homeassistant.local/oidc"
     assert data["authorization_endpoint"] == "https://homeassistant.local/oidc/authorize"
     assert data["token_endpoint"] == "https://homeassistant.local/oidc/token"
     assert data["userinfo_endpoint"] == "https://homeassistant.local/oidc/userinfo"
@@ -236,7 +237,7 @@ async def test_oidc_discovery_with_proxy():
     data = json.loads(body)
 
     # Verify URLs use the proxy host
-    assert data["issuer"] == "https://ha.example.com"
+    assert data["issuer"] == "https://ha.example.com/oidc"
     assert data["authorization_endpoint"] == "https://ha.example.com/oidc/authorize"
     assert data["token_endpoint"] == "https://ha.example.com/oidc/token"
 
@@ -256,7 +257,7 @@ async def test_oauth2_authorization_server_metadata():
     data = json.loads(body)
 
     # Verify required fields
-    assert data["issuer"] == "https://homeassistant.local"
+    assert data["issuer"] == "https://homeassistant.local/oidc"
     assert data["authorization_endpoint"] == "https://homeassistant.local/oidc/authorize"
     assert data["token_endpoint"] == "https://homeassistant.local/oidc/token"
     assert data["registration_endpoint"] == "https://homeassistant.local/oidc/register"
@@ -281,7 +282,7 @@ async def test_oauth2_authorization_server_metadata_alternate_path():
     data = json.loads(body)
 
     # Should return the same metadata as the primary endpoint
-    assert data["issuer"] == "https://homeassistant.local"
+    assert data["issuer"] == "https://homeassistant.local/oidc"
     assert data["authorization_endpoint"] == "https://homeassistant.local/oidc/authorize"
     assert data["token_endpoint"] == "https://homeassistant.local/oidc/token"
     assert data["registration_endpoint"] == "https://homeassistant.local/oidc/register"
@@ -1708,7 +1709,7 @@ async def test_oidc_userinfo_endpoint():
         "sub": "user123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid profile email",
     }
@@ -1785,7 +1786,7 @@ async def test_oidc_userinfo_includes_groups_when_scope_requested():
         "sub": "user123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid profile groups",
     }
@@ -1854,7 +1855,7 @@ async def test_oidc_userinfo_groups_for_owner():
         "sub": "owner123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid groups",
     }
@@ -1923,7 +1924,7 @@ async def test_oidc_userinfo_groups_for_regular_user():
         "sub": "regular123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid groups",
     }
@@ -1991,7 +1992,7 @@ async def test_oidc_userinfo_groups_for_read_only_user():
         "sub": "readonly123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid groups",
     }
@@ -2059,7 +2060,7 @@ async def test_oidc_userinfo_only_returns_sub_without_scopes():
         "sub": "user123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid",
     }
@@ -2130,7 +2131,7 @@ async def test_oidc_userinfo_returns_email_when_username_is_email():
         "sub": "user123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",
         "scope": "openid email",
     }

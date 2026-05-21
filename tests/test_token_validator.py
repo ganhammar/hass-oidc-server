@@ -42,7 +42,7 @@ def test_validate_access_token_valid(mock_hass_with_keys):
         "sub": "test_user",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",  # Required audience
     }
 
@@ -60,7 +60,7 @@ def test_validate_access_token_valid(mock_hass_with_keys):
 
     assert result is not None
     assert result["sub"] == "test_user"
-    assert result["iss"] == "http://localhost"
+    assert result["iss"] == "http://localhost/oidc"
 
 
 def test_validate_access_token_expired(mock_hass_with_keys):
@@ -72,7 +72,7 @@ def test_validate_access_token_expired(mock_hass_with_keys):
         "sub": "test_user",
         "iat": int(time.time()) - 7200,
         "exp": int(time.time()) - 3600,  # Expired 1 hour ago
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
     }
 
     private_key_pem = private_key.private_bytes(
@@ -102,7 +102,7 @@ def test_validate_access_token_invalid_signature(mock_hass_with_keys):
         "sub": "test_user",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
     }
 
     different_key_pem = different_key.private_bytes(
@@ -160,7 +160,7 @@ def test_validate_access_token_with_custom_claims(mock_hass_with_keys):
         "email": "test@example.com",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",  # Required audience
         "custom_claim": "custom_value",
     }
@@ -253,7 +253,7 @@ async def test_validate_access_token_accepts_valid_audience(mock_hass_with_keys)
         "sub": "user123",
         "iat": int(time.time()),
         "exp": int(time.time()) + 3600,
-        "iss": "http://localhost",
+        "iss": "http://localhost/oidc",
         "aud": "test_client",  # Registered client
     }
     token = jwt.encode(payload, private_pem, algorithm="RS256")
@@ -316,3 +316,61 @@ async def test_validate_access_token_rejects_invalid_issuer(mock_hass_with_keys)
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is None
+
+
+async def test_validate_access_token_accepts_issuer_without_oidc_suffix(mock_hass_with_keys):
+    """Callers may pass the base URL with or without the /oidc suffix.
+
+    Tokens carry iss=base_url/oidc (RFC 8414). Sibling integrations like
+    hass-mcp-server pass the unsuffixed base URL; validate_access_token
+    normalizes it before checking.
+    """
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "https://ha.example.com/oidc",
+        "aud": "test_client",
+    }
+    token = jwt.encode(payload, private_pem, algorithm="RS256")
+
+    # Caller passes the base URL (no /oidc suffix). Validation still succeeds.
+    result = validate_access_token(hass, token, "https://ha.example.com")
+    assert result is not None
+    assert result["sub"] == "user123"
+
+    # And the canonical /oidc-suffixed form works identically.
+    result = validate_access_token(hass, token, "https://ha.example.com/oidc")
+    assert result is not None
+    assert result["sub"] == "user123"
+
+
+async def test_validate_access_token_rejects_unsuffixed_iss(mock_hass_with_keys):
+    """Tokens whose iss lacks the /oidc suffix are rejected."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "https://ha.example.com",  # missing /oidc suffix
+        "aud": "test_client",
+    }
+    token = jwt.encode(payload, private_pem, algorithm="RS256")
+
+    assert validate_access_token(hass, token, "https://ha.example.com") is None
+    assert validate_access_token(hass, token, "https://ha.example.com/oidc") is None

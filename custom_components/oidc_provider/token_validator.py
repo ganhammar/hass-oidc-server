@@ -92,6 +92,13 @@ def validate_access_token(
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
 
+        # The issuer signed into tokens always has the /oidc suffix (RFC 8414).
+        # External callers (e.g. hass-mcp-server) typically pass the base URL
+        # without the suffix; tolerate both forms so they don't have to change
+        # in lockstep.
+        if not expected_issuer.rstrip("/").endswith("/oidc"):
+            expected_issuer = expected_issuer.rstrip("/") + "/oidc"
+
         # Verify and decode the token with issuer verification
         payload = jwt.decode(
             token,

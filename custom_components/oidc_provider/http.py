@@ -237,7 +237,7 @@ class OIDCDiscoveryView(HomeAssistantView):
         base_url = get_issuer_from_request(request)
 
         discovery = {
-            "issuer": base_url,
+            "issuer": f"{base_url}/oidc",
             "authorization_endpoint": f"{base_url}/oidc/authorize",
             "token_endpoint": f"{base_url}/oidc/token",
             "userinfo_endpoint": f"{base_url}/oidc/userinfo",
@@ -283,7 +283,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
         base_url = get_issuer_from_request(request)
 
         metadata = {
-            "issuer": base_url,
+            "issuer": f"{base_url}/oidc",
             "authorization_endpoint": f"{base_url}/oidc/authorize",
             "token_endpoint": f"{base_url}/oidc/token",
             "registration_endpoint": f"{base_url}/oidc/register",
@@ -319,7 +319,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
         base_url = get_issuer_from_request(request)
 
         metadata = {
-            "issuer": base_url,
+            "issuer": f"{base_url}/oidc",
             "authorization_endpoint": f"{base_url}/oidc/authorize",
             "token_endpoint": f"{base_url}/oidc/token",
             "registration_endpoint": f"{base_url}/oidc/register",
@@ -764,14 +764,18 @@ class OIDCTokenView(HomeAssistantView):
         """Generate JWT access token."""
         now = int(time.time())
 
-        # Use dynamic issuer based on the actual base URL
+        # Use dynamic issuer based on the actual base URL. The /oidc suffix is
+        # required by RFC 8414: the issuer URL concatenated with
+        # /.well-known/oauth-authorization-server must return the auth-server
+        # metadata, and that metadata lives under /oidc.
         base_url = get_issuer_from_request(request)
+        issuer = f"{base_url}/oidc"
 
         payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
-            "iss": base_url,
+            "iss": issuer,
             "aud": client_id,
             "scope": scope,
             "token_use": TOKEN_USE_ACCESS,
@@ -809,9 +813,10 @@ class OIDCTokenView(HomeAssistantView):
         """Generate an OIDC ID Token (OIDC Core 1.0 §2)."""
         now = int(time.time())
         base_url = get_issuer_from_request(request)
+        issuer = f"{base_url}/oidc"
 
         payload: dict[str, Any] = {
-            "iss": base_url,
+            "iss": issuer,
             "sub": user_id,
             "aud": client_id,
             "iat": now,
@@ -896,9 +901,10 @@ class OIDCUserInfoView(HomeAssistantView):
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
 
-            # Decode and verify the JWT with issuer verification
-            # Get expected issuer from request base URL
-            expected_issuer = get_issuer_from_request(request)
+            # Decode and verify the JWT with issuer verification. The /oidc
+            # suffix matches what the token endpoint signs into the iss claim
+            # (RFC 8414).
+            expected_issuer = f"{get_issuer_from_request(request)}/oidc"
 
             payload = jwt.decode(
                 access_token,
