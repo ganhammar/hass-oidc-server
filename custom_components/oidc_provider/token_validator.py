@@ -12,6 +12,29 @@ _LOGGER = logging.getLogger(__name__)
 DOMAIN = "oidc_provider"
 
 
+def _describe_token(token: str) -> str:
+    """Return safe-to-log metadata about a bearer token.
+
+    Logs structural shape (length, segment count) and the unverified JWS header
+    fields (alg, kid, typ). The signing key is not used and the payload is never
+    decoded, so this is safe to call on tokens that fail validation. The token
+    string itself is never logged.
+    """
+    if not token:
+        return "token=<empty>"
+    parts: list[str] = [f"length={len(token)}", f"segments={token.count('.') + 1}"]
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        parts.append("header=<unparseable>")
+        return " ".join(parts)
+    for key in ("alg", "kid", "typ"):
+        value = header.get(key)
+        if value is not None:
+            parts.append(f"{key}={value!r}")
+    return " ".join(parts)
+
+
 def get_issuer_from_request(request: web.Request) -> str:
     """
     Get the expected issuer URL from a request.
@@ -124,11 +147,11 @@ def validate_access_token(
 
         return payload
     except jwt.ExpiredSignatureError:
-        _LOGGER.warning("Token expired")
+        _LOGGER.warning("Token expired (%s)", _describe_token(token))
         return None
     except jwt.InvalidTokenError as e:
-        _LOGGER.warning("Invalid token: %s", e)
+        _LOGGER.warning("Invalid token: %s (%s)", e, _describe_token(token))
         return None
     except Exception as e:
-        _LOGGER.error("Error validating token: %s", e)
+        _LOGGER.error("Error validating token: %s (%s)", e, _describe_token(token))
         return None
