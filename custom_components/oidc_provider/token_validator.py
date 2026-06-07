@@ -49,23 +49,24 @@ def get_issuer_from_request(request: web.Request) -> str:
     Returns:
         The base URL for this server
     """
-    # Check for X-Forwarded headers (proxy setup)
-    forwarded_proto = request.headers.get("X-Forwarded-Proto")
-    forwarded_host = request.headers.get("X-Forwarded-Host")
+    # Derive the host the client actually used. X-Forwarded-Host is preferred,
+    # but some proxies (e.g. Cloudflare Tunnel) forward the original Host header
+    # and X-Forwarded-Proto without setting X-Forwarded-Host, so fall back to the
+    # Host header. The protocol comes from X-Forwarded-Proto when the proxy
+    # terminates TLS, otherwise from the request scheme.
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host")
+    proto = request.headers.get("X-Forwarded-Proto") or request.url.scheme
 
-    if forwarded_proto and forwarded_host:
-        # Use forwarded headers from proxy
-        base_url = f"{forwarded_proto}://{forwarded_host}"
-    else:
-        # Try Home Assistant's configured external URL
-        external_url = _get_ha_external_url(request)
-        if external_url:
-            base_url = external_url.rstrip("/")
-        else:
-            # Direct connection, use request URL
-            base_url = str(request.url.origin())
+    if host:
+        return f"{proto}://{host}"
 
-    return base_url
+    # No usable host header: fall back to HA's configured external URL, then the
+    # raw request origin.
+    external_url = _get_ha_external_url(request)
+    if external_url:
+        return external_url.rstrip("/")
+
+    return str(request.url.origin())
 
 
 def _get_ha_external_url(request: web.Request) -> str | None:
@@ -86,7 +87,10 @@ def _get_ha_external_url(request: web.Request) -> str | None:
 
 
 def validate_access_token(
-    hass: HomeAssistant, token: str, expected_issuer: str
+    hass: HomeAssistant,
+    token: str,
+    expected_issuer: str,
+    expected_audience: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Validate an OAuth access token issued by this OIDC provider.
@@ -95,6 +99,11 @@ def validate_access_token(
         hass: Home Assistant instance
         token: The access token to validate
         expected_issuer: Expected issuer URL
+        expected_audience: The resource this token must be bound to (RFC 8707).
+            When provided, the token is accepted if its aud contains this value.
+            Tokens whose aud is a registered client_id are also accepted, so
+            tokens issued before resource binding (or by clients that don't send
+            a resource indicator) keep working.
 
     Returns:
         Token payload if valid, None otherwise
@@ -133,19 +142,25 @@ def validate_access_token(
             },
         )
 
-        # Verify the audience claim exists and matches a registered client
+        # Verify the audience claim exists.
         aud = payload.get("aud")
         if not aud:
             _LOGGER.warning("Token missing audience claim")
             return None
 
-        clients = hass.data[DOMAIN].get("clients", {})
-        if aud not in clients:
-            # Token audience doesn't match any registered client
-            _LOGGER.warning("Token with invalid audience: %s", aud)
-            return None
+        audiences = aud if isinstance(aud, list) else [aud]
 
-        return payload
+        # Accept the token when its audience is bound to the expected resource
+        # (RFC 8707) or, for backward compatibility, to a registered client_id.
+        if expected_audience is not None and expected_audience in audiences:
+            return payload
+
+        clients = hass.data[DOMAIN].get("clients", {})
+        if any(audience in clients for audience in audiences):
+            return payload
+
+        _LOGGER.warning("Token with invalid audience: %s", aud)
+        return None
     except jwt.ExpiredSignatureError:
         _LOGGER.warning("Token expired (%s)", _describe_token(token))
         return None

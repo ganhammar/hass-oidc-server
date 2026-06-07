@@ -457,3 +457,90 @@ def test_malformed_token_failure_logs_unparseable(mock_hass_with_keys, caplog):
 
     assert result is None
     assert any("header=<unparseable>" in record.getMessage() for record in caplog.records)
+
+
+def _encode(private_key, payload):
+    """Sign a JWT payload with the given RSA private key (RS256)."""
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return jwt.encode(payload, private_pem, algorithm="RS256")
+
+
+def _resource_token_payload(aud):
+    """Build an access-token payload bound to the given audience."""
+    return {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "https://ha.example.com/oidc",
+        "aud": aud,
+    }
+
+
+def test_validate_access_token_accepts_matching_resource_audience(mock_hass_with_keys):
+    """A token bound to the expected resource (RFC 8707) is accepted."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {}  # resource is not a registered client
+
+    resource = "https://ha.example.com/api/mcp"
+    token = _encode(private_key, _resource_token_payload(resource))
+
+    result = validate_access_token(
+        hass, token, "https://ha.example.com", expected_audience=resource
+    )
+    assert result is not None
+    assert result["sub"] == "user123"
+
+
+def test_validate_access_token_rejects_resource_audience_mismatch(mock_hass_with_keys):
+    """A token for a different resource is rejected (confused deputy)."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {}
+
+    token = _encode(private_key, _resource_token_payload("https://other.example.com/api/mcp"))
+
+    result = validate_access_token(
+        hass,
+        token,
+        "https://ha.example.com",
+        expected_audience="https://ha.example.com/api/mcp",
+    )
+    assert result is None
+
+
+def test_validate_access_token_accepts_audience_list(mock_hass_with_keys):
+    """An aud array containing the expected resource is accepted."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {}
+
+    resource = "https://ha.example.com/api/mcp"
+    token = _encode(
+        private_key,
+        _resource_token_payload([resource, "https://ha.example.com/other"]),
+    )
+
+    result = validate_access_token(
+        hass, token, "https://ha.example.com", expected_audience=resource
+    )
+    assert result is not None
+
+
+def test_validate_access_token_legacy_client_audience_accepted(mock_hass_with_keys):
+    """A token with aud=client_id is still accepted even when a resource is
+    expected, so tokens issued before resource binding keep working."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    token = _encode(private_key, _resource_token_payload("test_client"))
+
+    result = validate_access_token(
+        hass,
+        token,
+        "https://ha.example.com",
+        expected_audience="https://ha.example.com/api/mcp",
+    )
+    assert result is not None
+    assert result["sub"] == "user123"
