@@ -8,6 +8,7 @@ import secrets
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 import jwt
 from aiohttp import web
@@ -51,6 +52,21 @@ from .security import verify_client_secret
 from .token_validator import get_issuer_from_request
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_resource(resource: str | None) -> str | None:
+    """Validate an RFC 8707 resource indicator and return it, or None.
+
+    The resource must be an absolute URI without a fragment (RFC 8707 §2).
+    Malformed values are dropped so they can never end up as a token audience.
+    """
+    if not resource:
+        return None
+    parsed = urlparse(resource)
+    if not parsed.scheme or not parsed.netloc or parsed.fragment:
+        _LOGGER.warning("Ignoring malformed resource indicator: %s", resource)
+        return None
+    return resource
 
 
 async def _save_refresh_tokens(hass: HomeAssistant) -> None:
@@ -190,6 +206,7 @@ class OIDCContinueView(HomeAssistantView):
         nonce = stored_request.get("nonce")
         code_challenge = stored_request.get("code_challenge")
         code_challenge_method = stored_request.get("code_challenge_method")
+        resource = stored_request.get("resource")
 
         # Clean up
         del pending_requests[request_id]
@@ -212,6 +229,7 @@ class OIDCContinueView(HomeAssistantView):
             "auth_time": int(time.time()),
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
+            "resource": resource,
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
 
@@ -359,6 +377,9 @@ class OIDCAuthorizationView(HomeAssistantView):
         code_challenge_method = request.query.get(
             "code_challenge_method", CODE_CHALLENGE_METHOD_S256
         )
+        # RFC 8707 resource indicator. Identifies the protected resource (e.g. the
+        # MCP server) the access token will be used at; bound into the token aud.
+        resource = _normalize_resource(request.query.get("resource"))
 
         # Validate parameters
         if not client_id or not redirect_uri or response_type != RESPONSE_TYPE_CODE:
@@ -433,6 +454,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             "nonce": nonce,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
+            "resource": resource,
             "expires_at": time.time() + 600,  # 10 minutes
         }
 
@@ -660,17 +682,26 @@ class OIDCTokenView(HomeAssistantView):
         nonce = auth_data.get("nonce")
         auth_time = auth_data.get("auth_time")
 
-        access_token = await self._generate_access_token(_request, hass, user_id, scope, client_id)
+        # The token audience is bound to the resource requested at the authorize
+        # step (RFC 8707). A token request MAY also carry a resource indicator;
+        # honor it only when the authorize step didn't specify one.
+        resource = auth_data.get("resource") or _normalize_resource(data.get("resource"))
+
+        access_token = await self._generate_access_token(
+            _request, hass, user_id, scope, client_id, audience=resource
+        )
         refresh_token = secrets.token_urlsafe(32)
 
         # Store refresh token (nonce + auth_time persisted so future refreshes
-        # produce spec-correct id_tokens after Home Assistant restarts).
+        # produce spec-correct id_tokens after Home Assistant restarts; resource
+        # persisted so refreshed access tokens keep the same audience binding).
         hass.data[DOMAIN]["refresh_tokens"][refresh_token] = {
             "user_id": user_id,
             "client_id": client_id,
             "scope": scope,
             "nonce": nonce,
             "auth_time": auth_time,
+            "resource": resource,
             "expires_at": time.time() + REFRESH_TOKEN_EXPIRY,
         }
 
@@ -727,9 +758,15 @@ class OIDCTokenView(HomeAssistantView):
         if token_data["client_id"] != data.get("client_id"):
             return web.json_response({"error": "invalid_grant"}, status=400)
 
-        # Generate new access token
+        # Generate new access token, preserving the original resource binding
+        # (RFC 8707) so refreshed tokens stay valid at the same resource.
         access_token = await self._generate_access_token(
-            _request, hass, token_data["user_id"], token_data["scope"], token_data["client_id"]
+            _request,
+            hass,
+            token_data["user_id"],
+            token_data["scope"],
+            token_data["client_id"],
+            audience=token_data.get("resource"),
         )
 
         # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
@@ -759,7 +796,13 @@ class OIDCTokenView(HomeAssistantView):
         return web.json_response(response_body)
 
     async def _generate_access_token(
-        self, request: web.Request, hass: HomeAssistant, user_id: str, scope: str, client_id: str
+        self,
+        request: web.Request,
+        hass: HomeAssistant,
+        user_id: str,
+        scope: str,
+        client_id: str,
+        audience: str | None = None,
     ) -> str:
         """Generate JWT access token."""
         now = int(time.time())
@@ -771,15 +814,20 @@ class OIDCTokenView(HomeAssistantView):
         base_url = get_issuer_from_request(request)
         issuer = f"{base_url}/oidc"
 
+        # When a resource indicator was supplied (RFC 8707), bind aud to that
+        # resource and record the client in azp. Otherwise fall back to the
+        # client_id as the audience for backward compatibility.
         payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
             "iss": issuer,
-            "aud": client_id,
+            "aud": audience or client_id,
             "scope": scope,
             "token_use": TOKEN_USE_ACCESS,
         }
+        if audience:
+            payload["azp"] = client_id
 
         # Include groups claim when the groups scope is requested
         requested_scopes = scope.split() if scope else []
@@ -926,15 +974,13 @@ class OIDCUserInfoView(HomeAssistantView):
                 _LOGGER.warning("ID token presented at userinfo endpoint")
                 return web.json_response({"error": "invalid_token"}, status=401)
 
-            # Verify the audience claim exists and matches a registered client
+            # Verify the audience claim exists. Access tokens are audience-bound
+            # either to a registered client_id (legacy) or to a protected
+            # resource URI (RFC 8707). Both are minted and signed by this
+            # provider, which the decode above already verified, so either form
+            # is accepted for returning the user's own profile.
             aud = payload.get("aud")
             if not aud:
-                return web.json_response({"error": "invalid_token"}, status=401)
-
-            clients = hass.data[DOMAIN].get("clients", {})
-            if aud not in clients:
-                # Token audience doesn't match any registered client (confused deputy attack)
-                _LOGGER.warning("Token with invalid audience: %s", aud)
                 return web.json_response({"error": "invalid_token"}, status=401)
 
             # Extract user info from JWT

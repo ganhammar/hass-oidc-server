@@ -69,20 +69,36 @@ def test_get_base_url_with_partial_forwarded_headers():
     request.url.origin.assert_called_once()
 
 
-def test_get_base_url_with_only_host_header():
-    """Test get_issuer_from_request with only X-Forwarded-Host (should use fallback)."""
-    # Create a mock request with only X-Forwarded-Host
+def test_get_base_url_with_only_forwarded_host():
+    """X-Forwarded-Host without X-Forwarded-Proto uses the request scheme."""
     request = Mock()
     request.headers = {
         "X-Forwarded-Host": "example.com",
     }
+    request.url.scheme = "https"
     request.url.origin.return_value = "http://localhost:8123"
 
     result = get_issuer_from_request(request)
 
-    assert result == "http://localhost:8123"
-    # Should fall back to origin() when both headers aren't present
-    request.url.origin.assert_called_once()
+    assert result == "https://example.com"
+    request.url.origin.assert_not_called()
+
+
+def test_get_base_url_with_host_header_and_forwarded_proto():
+    """A proxy that forwards the Host header and X-Forwarded-Proto (e.g. a
+    Cloudflare Tunnel) but omits X-Forwarded-Host still yields the client host."""
+    request = Mock()
+    request.headers = {
+        "X-Forwarded-Proto": "https",
+        "Host": "hem.example.com",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://localhost:8123"
+
+    result = get_issuer_from_request(request)
+
+    assert result == "https://hem.example.com"
+    request.url.origin.assert_not_called()
 
 
 def test_get_base_url_uses_ha_external_url():
@@ -905,6 +921,77 @@ async def test_oidc_token_view_basic_auth():
     mock_token_store.async_save.assert_called_once()
     saved_data = mock_token_store.async_save.call_args[0][0]
     assert "refresh_tokens" in saved_data
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_binds_aud_to_resource():
+    """Access token aud is bound to the requested resource (RFC 8707)."""
+    import base64
+
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
+
+    resource = "https://ha.example.com/api/mcp"
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"test_client": {"client_secret_hash": hash_client_secret("test_secret")}},
+            "authorization_codes": {
+                "valid_code": {
+                    "client_id": "test_client",
+                    "redirect_uri": "https://example.com/callback",
+                    "user_id": "user123",
+                    "scope": "openid",
+                    "resource": resource,
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "refresh_tokens": {},
+            "rate_limit_attempts": {},
+            "jwt_private_key": private_key,
+            "jwt_kid": "test-kid-1",
+            "token_store": mock_token_store,
+        }
+    }
+
+    credentials = base64.b64encode(b"test_client:test_secret").decode("utf-8")
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {"Authorization": f"Basic {credentials}"}
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "authorization_code",
+            "code": "valid_code",
+            "redirect_uri": "https://example.com/callback",
+        }
+    )
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    view = OIDCTokenView()
+    response = await view.post(request)
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+
+    claims = jwt.decode(data["access_token"], options={"verify_signature": False})
+    assert claims["aud"] == resource
+    assert claims["azp"] == "test_client"
+
+    # The resource is persisted on the refresh token so refreshed access tokens
+    # keep the same audience binding.
+    saved = mock_token_store.async_save.call_args[0][0]["refresh_tokens"]
+    assert saved
+    assert all(rt["resource"] == resource for rt in saved.values())
 
 
 @pytest.mark.asyncio
@@ -1766,6 +1853,69 @@ async def test_oidc_userinfo_endpoint():
     assert data["name"] == "Test User"
     assert "email" not in data  # "Test User" doesn't look like an email
     assert "groups" not in data
+
+
+@pytest.mark.asyncio
+async def test_oidc_userinfo_accepts_resource_bound_token():
+    """UserInfo accepts a token whose aud is a resource URI (RFC 8707), not a
+    registered client_id."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "http://localhost/oidc",
+        "aud": "http://localhost/api/mcp",  # resource, not a client_id
+        "azp": "test_client",
+        "scope": "openid profile",
+    }
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+
+    mock_user = Mock()
+    mock_user.id = "user123"
+    mock_user.name = "Test User"
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=mock_user)
+
+    hass = Mock()
+    hass.auth = mock_auth
+    hass.data = {
+        DOMAIN: {
+            "jwt_public_key": public_key,
+            "jwt_kid": "test-kid-1",
+            "clients": {},  # resource aud is intentionally not a registered client
+        }
+    }
+
+    mock_url = Mock()
+    mock_url.origin.return_value = "http://localhost"
+    request = Mock()
+    request.app = {"hass": hass}
+    request.headers = {"Authorization": f"Bearer {token}"}
+    request.url = mock_url
+
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    view = OIDCUserInfoView()
+    response = await view.get(request)
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["sub"] == "user123"
+    assert data["name"] == "Test User"
 
 
 @pytest.mark.asyncio
