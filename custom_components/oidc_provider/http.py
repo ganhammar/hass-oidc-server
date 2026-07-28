@@ -33,6 +33,7 @@ from .const import (
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
     MAX_TOKEN_ATTEMPTS,
+    PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
     RATE_LIMIT_WINDOW,
     REFRESH_TOKEN_EXPIRY,
@@ -468,7 +469,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             <p>Redirecting to login...</p>
             <script>
                 sessionStorage.setItem('oidc_request_id', '{escaped_request_id}');
-                window.location.href = '/oidc_login';
+                window.location.href = '/{PANEL_URL_PATH}';
             </script>
         </body>
         </html>

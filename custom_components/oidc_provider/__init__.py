@@ -285,8 +285,8 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     # Home Assistant rejects a duplicate panel registration, so the panel has to
-    # go for the next setup to succeed. warn_if_unknown stays off because unload
-    # also runs on setups that failed before reaching the registration.
+    # go for the next setup to succeed. It is absent when unload runs against a
+    # setup that never registered one.
     async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
     hass.data[DOMAIN].clear()
     return True
