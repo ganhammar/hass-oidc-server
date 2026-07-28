@@ -3,7 +3,10 @@
 import logging
 import time
 
-from homeassistant.components.frontend import async_register_built_in_panel
+from homeassistant.components.frontend import (
+    async_register_built_in_panel,
+    async_remove_panel,
+)
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -11,7 +14,13 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
 from .client_manager import create_client
-from .const import CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE, DOMAIN, STORAGE_KEY_TOKENS
+from .const import (
+    CONF_REQUIRE_PKCE,
+    DEFAULT_REQUIRE_PKCE,
+    DOMAIN,
+    PANEL_URL_PATH,
+    STORAGE_KEY_TOKENS,
+)
 from .http import setup_http_endpoints
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,7 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         component_name="custom",
         sidebar_title=None,  # Hidden from sidebar
         sidebar_icon=None,
-        frontend_url_path="oidc_login",
+        frontend_url_path=PANEL_URL_PATH,
         config={
             "_panel_custom": {
                 "name": "oidc-auth-panel",
@@ -275,5 +284,9 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # Home Assistant rejects a duplicate panel registration, so the panel has to
+    # go for the next setup to succeed. It is absent when unload runs against a
+    # setup that never registered one.
+    async_remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
     hass.data[DOMAIN].clear()
     return True
