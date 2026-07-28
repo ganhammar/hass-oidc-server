@@ -4,6 +4,7 @@ import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from homeassistant.components.frontend import DATA_PANELS
 
 from custom_components.oidc_provider import (
     DOMAIN,
@@ -11,6 +12,7 @@ from custom_components.oidc_provider import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.oidc_provider.const import PANEL_URL_PATH
 
 
 @pytest.fixture
@@ -264,6 +266,47 @@ class TestAsyncUnloadEntry:
 
         assert result is True
         assert len(mock_hass.data[DOMAIN]) == 0
+
+    async def test_async_unload_entry_without_panel(self, mock_hass, mock_config_entry):
+        """Test async_unload_entry succeeds when the panel was never registered."""
+        mock_hass.data[DOMAIN] = {}
+
+        result = await async_unload_entry(mock_hass, mock_config_entry)
+
+        assert result is True
+
+
+class TestReload:
+    """Test the unload/setup cycle that a config entry reload performs."""
+
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    async def test_reload_re_registers_panel(
+        self,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+    ):
+        """Test reloading does not trip Home Assistant's duplicate-panel guard.
+
+        The frontend panel helpers are deliberately left unmocked so the real
+        "Overwriting panel" guard runs against the real panel registry.
+        """
+        mock_store_class.side_effect = lambda *args, **kwargs: Mock(
+            async_load=AsyncMock(return_value=None), async_save=AsyncMock()
+        )
+
+        assert await async_setup_entry(mock_hass, mock_config_entry) is True
+        assert PANEL_URL_PATH in mock_hass.data[DATA_PANELS]
+
+        assert await async_unload_entry(mock_hass, mock_config_entry) is True
+        assert PANEL_URL_PATH not in mock_hass.data[DATA_PANELS]
+
+        # Raises ValueError("Overwriting panel oidc_login") if unload leaves the
+        # panel registered.
+        assert await async_setup_entry(mock_hass, mock_config_entry) is True
+        assert PANEL_URL_PATH in mock_hass.data[DATA_PANELS]
 
 
 class TestRegisterClientService:

@@ -63,3 +63,6 @@ RATE_LIMIT_PENALTY = 60  # Lockout period in seconds after max attempts
 # PKCE enforcement
 DEFAULT_REQUIRE_PKCE = True  # Default to required for security (OAuth 2.1 compliance)
 CONF_REQUIRE_PKCE = "require_pkce"
+
+# Frontend panel serving the login flow (hidden from the sidebar)
+PANEL_URL_PATH = "oidc_login"
