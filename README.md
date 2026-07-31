@@ -56,7 +56,7 @@ Example action call:
 action: oidc_provider.register_client
 data:
   client_name: "Claude Connector"
-  redirect_uris: "https://claude.ai/callback,https://app.claude.com/callback"
+  redirect_uris: "https://claude.ai/callback,https://app.claude.com/callback,https://claude.ai/api/mcp/auth_callback"
 ```
 
 The logs will display:
