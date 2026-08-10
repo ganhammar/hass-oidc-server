@@ -50,9 +50,10 @@ def get_issuer_from_request(request: web.Request) -> str:
     """
     Get the expected issuer URL from a request.
 
-    Respects X-Forwarded headers if present (for reverse proxy setups).
-    Falls back to Home Assistant's configured external URL when headers
-    are absent, before using the raw request origin.
+    Resolution order: a domain host from X-Forwarded-Host or Host wins
+    (for reverse proxy setups). When the host is missing or a bare IP
+    address, Home Assistant's configured external URL is preferred,
+    followed by the IP host and finally the raw request origin.
 
     Args:
         request: The aiohttp web request
