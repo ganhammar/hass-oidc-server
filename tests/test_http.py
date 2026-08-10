@@ -132,6 +132,103 @@ def test_get_base_url_strips_trailing_slash_from_external_url():
     assert result == "https://my-ha.example.com"
 
 
+def test_get_base_url_ip_host_prefers_external_url():
+    """A proxy that rewrites Host to the internal IP (no X-Forwarded-Host)
+    must not leak the internal address; the configured external URL wins."""
+    request = Mock()
+    request.headers = {
+        "Host": "192.168.2.20:8123",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://192.168.2.20:8123"
+
+    with patch(
+        "custom_components.oidc_provider.token_validator._get_ha_external_url",
+        return_value="https://ha.example.com",
+    ):
+        result = get_issuer_from_request(request)
+
+    assert result == "https://ha.example.com"
+    request.url.origin.assert_not_called()
+
+
+def test_get_base_url_forwarded_ip_host_prefers_external_url():
+    """X-Forwarded-Host set to an IP is treated the same as a rewritten Host."""
+    request = Mock()
+    request.headers = {
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "192.168.2.20",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://192.168.2.20:8123"
+
+    with patch(
+        "custom_components.oidc_provider.token_validator._get_ha_external_url",
+        return_value="https://ha.example.com",
+    ):
+        result = get_issuer_from_request(request)
+
+    assert result == "https://ha.example.com"
+
+
+def test_get_base_url_ip_host_kept_without_external_url():
+    """LAN-only installs with no external URL keep the IP host as issuer."""
+    request = Mock()
+    request.headers = {
+        "Host": "192.168.2.20:8123",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://192.168.2.20:8123"
+
+    with patch(
+        "custom_components.oidc_provider.token_validator._get_ha_external_url",
+        return_value=None,
+    ):
+        result = get_issuer_from_request(request)
+
+    assert result == "http://192.168.2.20:8123"
+    request.url.origin.assert_not_called()
+
+
+def test_get_base_url_ipv6_host_prefers_external_url():
+    """Bracketed IPv6 hosts are recognized as IP addresses."""
+    request = Mock()
+    request.headers = {
+        "Host": "[fd00::20]:8123",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://[fd00::20]:8123"
+
+    with patch(
+        "custom_components.oidc_provider.token_validator._get_ha_external_url",
+        return_value="https://ha.example.com",
+    ):
+        result = get_issuer_from_request(request)
+
+    assert result == "https://ha.example.com"
+
+
+def test_get_base_url_domain_host_ignores_external_url():
+    """A real domain in Host keeps winning over the external URL (no behavior
+    change for tunnels that forward the original Host)."""
+    request = Mock()
+    request.headers = {
+        "X-Forwarded-Proto": "https",
+        "Host": "hem.example.com",
+    }
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://localhost:8123"
+
+    with patch(
+        "custom_components.oidc_provider.token_validator._get_ha_external_url",
+        return_value="https://other.example.com",
+    ) as mock_external:
+        result = get_issuer_from_request(request)
+
+    assert result == "https://hem.example.com"
+    mock_external.assert_not_called()
+
+
 def test_get_base_url_falls_back_to_origin_when_no_external_url():
     """Test fallback to request origin when HA external URL is not configured."""
     request = Mock()
