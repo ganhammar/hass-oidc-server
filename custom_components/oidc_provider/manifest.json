@@ -1,6 +1,7 @@
 {
   "domain": "oidc_provider",
   "name": "OIDC Provider",
+  "categories": ["computers_network.cloud_developer_tools"],
   "codeowners": ["@ganhammar"],
   "config_flow": true,
   "documentation": "https://github.com/ganhammar/hass-oidc-server",
