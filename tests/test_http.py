@@ -593,15 +593,53 @@ async def test_oidc_continue_view_get_shows_hostname_not_netloc():
 
 
 @pytest.mark.asyncio
-async def test_oidc_continue_view_get_defaults_consent_to_not_required():
-    """Clients stored before the flag existed are treated as first-party."""
+async def test_oidc_continue_view_get_defaults_consent_to_required():
+    """A client stored without the flag may have come from dynamic registration,
+    so it prompts until an operator clears the flag."""
     hass = _continue_hass(pending={"req123": _pending()})
     view = OIDCContinueView()
 
     response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
 
     data = json.loads(response.body.decode("utf-8"))
-    assert data["consent_required"] is False
+    assert data["consent_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_get_tolerates_bad_stored_port():
+    """A stored redirect URI with an out-of-range port does not break the consent screen."""
+    hass = _continue_hass(pending={"req123": _pending(redirect_uri="https://example.com:99999/cb")})
+    view = OIDCContinueView()
+
+    response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["redirect_host"] == "example.com"
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_url_encodes_state():
+    """State is encoded on both the approve and deny redirects."""
+    state = "a&b=c#d+e"
+    view = OIDCContinueView()
+
+    hass = _continue_hass(pending={"req123": _pending(state=state)})
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "req123", "approve": True})
+    )
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["redirect_url"].endswith("&state=a%26b%3Dc%23d%2Be")
+    assert data["redirect_url"].startswith("https://example.com/callback?code=")
+
+    hass = _continue_hass(pending={"req123": _pending(state=state)})
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "req123", "approve": False})
+    )
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["redirect_url"] == (
+        "https://example.com/callback?error=access_denied&state=a%26b%3Dc%23d%2Be"
+    )
 
 
 @pytest.mark.asyncio
@@ -708,6 +746,34 @@ async def test_oidc_register_view_success():
     assert data["client_id"] == "test_client_id"
     assert data["client_secret"] == "test_client_secret"
     assert data["client_name"] == "Test Client"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_name",
+    [{"name": "dict"}, "", "x" * 101],
+    ids=["not-a-string", "blank", "too-long"],
+)
+async def test_oidc_register_view_rejects_bad_client_name(client_name):
+    """The name is shown on the consent screen, so it must be a bounded string."""
+    hass = Mock()
+    hass.data = {DOMAIN: {"clients": {}, "store": Mock()}}
+
+    request = Mock()
+    request.app = {"hass": hass}
+    request.json = AsyncMock(
+        return_value={
+            "client_name": client_name,
+            "redirect_uris": ["https://example.com/callback"],
+        }
+    )
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 400
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["error"] == "invalid_client_metadata"
+    assert hass.data[DOMAIN]["clients"] == {}
 
 
 @pytest.mark.asyncio
@@ -2744,6 +2810,37 @@ async def test_oidc_authorize_rejects_missing_openid_scope():
 
     assert response.status == 400
     assert b"openid scope is required" in response.body
+
+
+@pytest.mark.asyncio
+async def test_oidc_authorize_rejects_unsupported_scope():
+    """Scopes outside the supported list are rejected rather than echoed to the user."""
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"test_client": {"redirect_uris": ["https://example.com/callback"]}},
+            "pending_auth_requests": {},
+        }
+    }
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.query = {
+        "response_type": "code",
+        "client_id": "test_client",
+        "redirect_uri": "https://example.com/callback",
+        "scope": "openid constructor",
+        "code_challenge": "abc",
+        "code_challenge_method": "S256",
+    }
+
+    from custom_components.oidc_provider.http import OIDCAuthorizationView
+
+    response = await OIDCAuthorizationView().get(request)
+
+    assert response.status == 400
+    assert b"Unsupported scope: constructor" in response.body
+    assert hass.data[DOMAIN]["pending_auth_requests"] == {}
 
 
 @pytest.mark.asyncio

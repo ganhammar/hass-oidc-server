@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import jwt
 from aiohttp import web
@@ -19,7 +19,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .client_manager import create_client
+from .client_manager import create_client, validate_client_name
 from .const import (
     ACCESS_TOKEN_EXPIRY,
     AUTHORIZATION_CODE_EXPIRY,
@@ -222,15 +222,22 @@ class OIDCContinueView(HomeAssistantView):
         # hostname rather than netloc so userinfo can never dress up the host
         parsed = urlparse(stored_request["redirect_uri"])
         redirect_host = parsed.hostname or ""
-        if parsed.port:
-            redirect_host = f"{redirect_host}:{parsed.port}"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port:
+            redirect_host = f"{redirect_host}:{port}"
 
         return web.json_response(
             {
                 "client_name": client.get("client_name", stored_request["client_id"]),
                 "redirect_host": redirect_host,
                 "scopes": stored_request["scope"].split(),
-                "consent_required": bool(client.get("consent_required", False)),
+                # A client with no recorded setting predates the flag and may
+                # have come from dynamic registration, so it prompts until an
+                # operator clears the flag.
+                "consent_required": bool(client.get("consent_required", True)),
             }
         )
 
@@ -267,12 +274,14 @@ class OIDCContinueView(HomeAssistantView):
 
         separator = "&" if "?" in redirect_uri else "?"
 
+        def build_redirect(**params: str) -> str:
+            if state:
+                params["state"] = state
+            return f"{redirect_uri}{separator}{urlencode(params)}"
+
         if body.get("approve") is not True:
             _LOGGER.info("User %s denied authorization for client %s", user.id, client_id)
-            redirect_url = f"{redirect_uri}{separator}error=access_denied"
-            if state:
-                redirect_url += f"&state={state}"
-            return web.json_response({"redirect_url": redirect_url})
+            return web.json_response({"redirect_url": build_redirect(error="access_denied")})
 
         # Generate authorization code
         auth_code = secrets.token_urlsafe(32)
@@ -296,12 +305,8 @@ class OIDCContinueView(HomeAssistantView):
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
 
-        redirect_url = f"{redirect_uri}{separator}code={auth_code}"
-        if state:
-            redirect_url += f"&state={state}"
-
         # Return JSON with redirect URL (since fetch can't follow external redirects)
-        return web.json_response({"redirect_url": redirect_url})
+        return web.json_response({"redirect_url": build_redirect(code=auth_code)})
 
 
 class OIDCDiscoveryView(HomeAssistantView):
@@ -451,6 +456,16 @@ class OIDCAuthorizationView(HomeAssistantView):
         if SCOPE_OPENID not in requested_scopes:
             return web.Response(
                 text="The openid scope is required for OIDC requests.",
+                status=400,
+            )
+
+        # Only known scopes are accepted; they are shown to the user on the
+        # consent screen and must map to something the provider can grant.
+        unsupported_scopes = [sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES]
+        if unsupported_scopes:
+            supported = ", ".join(SUPPORTED_SCOPES)
+            return web.Response(
+                text=f"Unsupported scope: {' '.join(unsupported_scopes)}. Supported: {supported}",
                 status=400,
             )
 
@@ -1233,7 +1248,15 @@ class OIDCRegisterView(HomeAssistantView):
             )
 
         # Extract client metadata
-        client_name = data.get("client_name", "Dynamically Registered Client")
+        try:
+            client_name = validate_client_name(
+                data.get("client_name", "Dynamically Registered Client")
+            )
+        except ValueError as e:
+            return web.json_response(
+                {"error": "invalid_client_metadata", "error_description": str(e)},
+                status=400,
+            )
         grant_types = data.get("grant_types", ["authorization_code", "refresh_token"])
         response_types = data.get("response_types", ["code"])
         token_endpoint_auth_method = data.get("token_endpoint_auth_method", "client_secret_basic")

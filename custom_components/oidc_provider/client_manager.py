@@ -13,6 +13,61 @@ _LOGGER = logging.getLogger(__name__)
 DOMAIN = "oidc_provider"
 
 
+MAX_CLIENT_NAME_LENGTH = 100
+
+
+def validate_client_name(client_name: Any) -> str:
+    """Return the client name if it is a usable display string.
+
+    The name is shown on the consent screen, so it must be a non-empty string
+    of bounded length.
+
+    Raises:
+        ValueError: If the name is not a string, is blank, or is too long
+    """
+    if not isinstance(client_name, str) or not client_name.strip():
+        raise ValueError("client_name must be a non-empty string")
+    if len(client_name) > MAX_CLIENT_NAME_LENGTH:
+        raise ValueError(f"client_name must be at most {MAX_CLIENT_NAME_LENGTH} characters")
+    return client_name.strip()
+
+
+def validate_redirect_uris(redirect_uris: list[Any]) -> None:
+    """Check that every redirect URI is an absolute http(s) URL we can display safely.
+
+    Raises:
+        ValueError: If any URI is malformed, uses a disallowed scheme, carries
+            userinfo, or has an out-of-range port
+    """
+    for uri in redirect_uris:
+        if not isinstance(uri, str):
+            raise ValueError("Each redirect_uri must be a string")
+        try:
+            parsed = urlparse(uri)
+        except Exception as e:
+            raise ValueError(f"Invalid redirect_uri: {uri}") from e
+        # Must have scheme and netloc (host)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid redirect_uri: {uri}")
+        # Enforce HTTPS except for localhost (RFC 8252 §8.3)
+        if parsed.scheme == "http":
+            if parsed.hostname not in ["localhost", "127.0.0.1", "::1"]:
+                raise ValueError(
+                    f"Redirect URI must use HTTPS (HTTP only allowed for localhost): {uri}"
+                )
+        elif parsed.scheme != "https":
+            raise ValueError(f"Redirect URI must use http or https: {uri}")
+        # Userinfo has no place in a redirect URI and lets the authority
+        # masquerade as another host on the consent screen.
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(f"Redirect URI must not contain userinfo: {uri}")
+        # Accessing .port raises for a port outside 0-65535
+        try:
+            parsed.port
+        except ValueError as e:
+            raise ValueError(f"Redirect URI has an invalid port: {uri}") from e
+
+
 async def create_client(
     hass: HomeAssistant,
     client_name: str = "OIDC Client",
@@ -40,7 +95,7 @@ async def create_client(
         Dictionary with client_id, client_secret, and other metadata
 
     Raises:
-        ValueError: If redirect URIs are invalid
+        ValueError: If the client name or redirect URIs are invalid
     """
     if redirect_uris is None:
         redirect_uris = []
@@ -51,31 +106,8 @@ async def create_client(
     if response_types is None:
         response_types = ["code"]
 
-    # Validate each redirect URI is a valid URL
-    for uri in redirect_uris:
-        if not isinstance(uri, str):
-            raise ValueError("Each redirect_uri must be a string")
-        try:
-            parsed = urlparse(uri)
-            # Must have scheme and netloc (host)
-            if not parsed.scheme or not parsed.netloc:
-                raise ValueError(f"Invalid redirect_uri: {uri}")
-            # Userinfo has no place in a redirect URI and lets the authority
-            # masquerade as another host on the consent screen.
-            if parsed.username is not None or parsed.password is not None:
-                raise ValueError(f"Redirect URI must not contain userinfo: {uri}")
-            # Enforce HTTPS except for localhost (RFC 8252 §8.3)
-            if parsed.scheme == "http":
-                if parsed.hostname not in ["localhost", "127.0.0.1", "::1"]:
-                    raise ValueError(
-                        f"Redirect URI must use HTTPS (HTTP only allowed for localhost): {uri}"
-                    )
-            elif parsed.scheme != "https":
-                raise ValueError(f"Redirect URI must use http or https: {uri}")
-        except Exception as e:
-            if isinstance(e, ValueError):
-                raise
-            raise ValueError(f"Invalid redirect_uri: {uri}") from e
+    client_name = validate_client_name(client_name)
+    validate_redirect_uris(redirect_uris)
 
     # Generate client credentials
     client_id = secrets.token_urlsafe(32)

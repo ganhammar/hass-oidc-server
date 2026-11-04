@@ -344,3 +344,36 @@ async def test_create_client_rejects_userinfo_in_redirect_uri(mock_hass):
             client_name="Spoof",
             redirect_uris=["https://ha.example.com@attacker.example/callback"],
         )
+
+
+async def test_create_client_rejects_out_of_range_port(mock_hass):
+    """An out-of-range port would raise later when the host is displayed."""
+    with pytest.raises(ValueError, match="invalid port"):
+        await create_client(
+            mock_hass,
+            client_name="Bad Port",
+            redirect_uris=["https://example.com:99999/callback"],
+        )
+
+
+@pytest.mark.parametrize(
+    "client_name",
+    [None, 42, "", "   ", "x" * 101],
+    ids=["none", "int", "empty", "blank", "too-long"],
+)
+async def test_create_client_rejects_bad_client_name(mock_hass, client_name):
+    """The client name is rendered on the consent screen and must be a bounded string."""
+    with pytest.raises(ValueError, match="client_name"):
+        await create_client(
+            mock_hass,
+            client_name=client_name,
+            redirect_uris=["https://example.com/callback"],
+        )
+
+
+async def test_create_client_strips_client_name(mock_hass):
+    """Surrounding whitespace is not part of the display name."""
+    result = await create_client(
+        mock_hass, client_name="  Padded  ", redirect_uris=["https://example.com/callback"]
+    )
+    assert result["client_name"] == "Padded"

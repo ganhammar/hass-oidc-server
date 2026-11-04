@@ -137,7 +137,7 @@ class OidcLoginPanel extends HTMLElement {
 
   _renderConsent(details) {
     const scopes = (details.scopes || []).map((scope) => {
-      const description = SCOPE_DESCRIPTIONS[scope] || scope;
+      const description = Object.hasOwn(SCOPE_DESCRIPTIONS, scope) ? SCOPE_DESCRIPTIONS[scope] : scope;
       return `<li>${escapeHtml(description)}</li>`;
     });
 
@@ -165,12 +165,18 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   async _onDecision(approve) {
+    // One decision per request, even if the buttons have not upgraded yet
+    if (this._deciding) {
+      return;
+    }
+    this._deciding = true;
     for (const button of this.querySelectorAll('ha-button')) {
       button.disabled = true;
     }
     try {
       await this._decide(approve);
     } catch (error) {
+      this._deciding = false;
       this._renderError(error);
     }
   }

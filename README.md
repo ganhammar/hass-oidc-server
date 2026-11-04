@@ -76,7 +76,7 @@ Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
 
 Clients registered through the dynamic registration endpoint (`/oidc/register`) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
 
-Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and are treated as trusted; re-register any that came from dynamic registration if you want them to prompt.
+Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Use the `update_client` action with `consent_required: false` for the ones you registered yourself.
 
 ### Updating a Client
 
@@ -85,13 +85,14 @@ To update redirect URIs for an existing client:
 1. Use **"List OIDC Clients"** to find the client ID
 2. Go to **Developer Tools** → **Actions**
 3. Select **"Update OIDC Client"**
-4. Enter the client ID and new redirect URIs
+4. Enter the client ID and new redirect URIs, and optionally whether consent is required
 
 ```yaml
 action: oidc_provider.update_client
 data:
   client_id: "client_xxxxxxxxxxxxx"
   redirect_uris: "https://new-app.example.com/callback,http://localhost:8080/auth"
+  consent_required: false
 ```
 
 ### Revoking a Client
