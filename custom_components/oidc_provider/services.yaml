@@ -16,6 +16,13 @@ register_client:
       example: "https://app.example.com/callback"
       selector:
         text:
+    consent_required:
+      name: Require consent
+      description: Ask the user to approve each authorization on a consent screen. Off by default for clients you register yourself; dynamically registered clients always ask.
+      required: false
+      default: false
+      selector:
+        boolean:
 
 revoke_client:
   name: Revoke OIDC Client
@@ -31,7 +38,7 @@ revoke_client:
 
 update_client:
   name: Update OIDC Client
-  description: Update redirect URIs for an existing OIDC client. Use "List OIDC Clients" to see all client IDs.
+  description: Update redirect URIs and the consent setting for an existing OIDC client. Use "List OIDC Clients" to see all client IDs.
   fields:
     client_id:
       name: Client ID
@@ -47,6 +54,12 @@ update_client:
       example: "https://app.example.com/callback,http://localhost:3000/auth"
       selector:
         text:
+    consent_required:
+      name: Require consent
+      description: Ask the user to approve each authorization on a consent screen. Leave unset to keep the current setting. Clients registered before 1.6.0 require consent until this is turned off.
+      required: false
+      selector:
+        boolean:
 
 list_clients:
   name: List OIDC Clients

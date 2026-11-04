@@ -6,7 +6,7 @@ config-entry machinery and every request made over the real aiohttp test client:
 
 * Dynamic Client Registration (RFC 7591) at ``/oidc/register``.
 * The full authorization-code + PKCE flow: ``/oidc/authorize`` ->
-  ``/oidc/continue`` -> ``/oidc/token``, ending in a signed access token.
+  ``/oidc/continue`` (approve) -> ``/oidc/token``, ending in a signed access token.
 * RFC 8707 audience binding: the issued token's ``aud`` is the requested
   resource, verified through the very ``validate_access_token`` helper that
   hass-mcp-server imports.
@@ -113,7 +113,12 @@ async def _authorize_and_get_code(
     request_id = match.group(1)
 
     # /oidc/continue requires an authenticated HA user; hass_client carries one.
-    resp = await client.get("/oidc/continue", params={"request_id": request_id}, headers=FORWARDED)
+    # Approving is what the consent screen posts.
+    resp = await client.post(
+        "/oidc/continue",
+        json={"request_id": request_id, "approve": True},
+        headers=FORWARDED,
+    )
     assert resp.status == 200, await resp.text()
     redirect_url = (await resp.json())["redirect_url"]
 

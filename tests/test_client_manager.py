@@ -49,6 +49,23 @@ async def test_create_client_with_defaults(mock_hass):
     assert stored_client["redirect_uris"] == ["http://localhost/callback"]
     assert "client_secret_hash" in stored_client
     assert "client_secret" not in stored_client  # Plain text not stored
+    # Operator-registered clients are first-party and skip the consent screen
+    assert stored_client["consent_required"] is False
+    assert result["consent_required"] is False
+
+
+async def test_create_client_with_consent_required(mock_hass):
+    """consent_required is stored and returned when set."""
+    result = await create_client(
+        mock_hass,
+        client_name="Third Party",
+        redirect_uris=["https://example.com/callback"],
+        consent_required=True,
+    )
+
+    assert result["consent_required"] is True
+    stored_client = mock_hass.data[DOMAIN]["clients"][result["client_id"]]
+    assert stored_client["consent_required"] is True
 
 
 async def test_create_client_generates_unique_id(mock_hass):
@@ -317,3 +334,46 @@ async def test_create_client_http_production_domain_rejected(mock_hass):
             client_name="HTTP Production Client",
             redirect_uris=["http://app.example.com/callback"],
         )
+
+
+async def test_create_client_rejects_userinfo_in_redirect_uri(mock_hass):
+    """A redirect URI with userinfo could spoof the host shown on the consent screen."""
+    with pytest.raises(ValueError, match="userinfo"):
+        await create_client(
+            mock_hass,
+            client_name="Spoof",
+            redirect_uris=["https://ha.example.com@attacker.example/callback"],
+        )
+
+
+async def test_create_client_rejects_out_of_range_port(mock_hass):
+    """An out-of-range port would raise later when the host is displayed."""
+    with pytest.raises(ValueError, match="invalid port"):
+        await create_client(
+            mock_hass,
+            client_name="Bad Port",
+            redirect_uris=["https://example.com:99999/callback"],
+        )
+
+
+@pytest.mark.parametrize(
+    "client_name",
+    [None, 42, "", "   ", "x" * 101],
+    ids=["none", "int", "empty", "blank", "too-long"],
+)
+async def test_create_client_rejects_bad_client_name(mock_hass, client_name):
+    """The client name is rendered on the consent screen and must be a bounded string."""
+    with pytest.raises(ValueError, match="client_name"):
+        await create_client(
+            mock_hass,
+            client_name=client_name,
+            redirect_uris=["https://example.com/callback"],
+        )
+
+
+async def test_create_client_strips_client_name(mock_hass):
+    """Surrounding whitespace is not part of the display name."""
+    result = await create_client(
+        mock_hass, client_name="  Padded  ", redirect_uris=["https://example.com/callback"]
+    )
+    assert result["client_name"] == "Padded"

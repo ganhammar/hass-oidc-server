@@ -118,10 +118,9 @@ def validate_access_token(
         token: The access token to validate
         expected_issuer: Expected issuer URL
         expected_audience: The resource this token must be bound to (RFC 8707).
-            When provided, the token is accepted if its aud contains this value.
-            Tokens whose aud is a registered client_id are also accepted, so
-            tokens issued before resource binding (or by clients that don't send
-            a resource indicator) keep working.
+            When provided, the token is accepted only if its aud contains this
+            value; a token bound to a client_id or another resource is rejected.
+            When omitted, any registered client_id is accepted as the audience.
 
     Returns:
         Token payload if valid, None otherwise
@@ -168,10 +167,15 @@ def validate_access_token(
 
         audiences = aud if isinstance(aud, list) else [aud]
 
-        # Accept the token when its audience is bound to the expected resource
-        # (RFC 8707) or, for backward compatibility, to a registered client_id.
-        if expected_audience is not None and expected_audience in audiences:
-            return payload
+        # A resource server that names itself only accepts tokens bound to it
+        # (RFC 8707). A client_id audience is not a substitute: any registered
+        # client can obtain one, so accepting it would let a token minted for
+        # one client pass at every resource server.
+        if expected_audience is not None:
+            if expected_audience in audiences:
+                return payload
+            _LOGGER.warning("Token audience %s is not bound to resource %s", aud, expected_audience)
+            return None
 
         clients = hass.data[DOMAIN].get("clients", {})
         if any(audience in clients for audience in audiences):

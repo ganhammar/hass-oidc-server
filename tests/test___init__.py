@@ -392,6 +392,38 @@ class TestRegisterClientService:
         notification_call = mock_hass.services.async_call.call_args
         assert "Failed" in notification_call[0][2]["title"]
 
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_register_client_invalid_redirect_uri(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """A validation error from create_client surfaces as a failure notification."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+
+        await async_setup_entry(mock_hass, mock_config_entry)
+
+        register_handler = mock_hass.services.async_register.call_args_list[0][0][2]
+
+        call = Mock()
+        call.data = {
+            "client_name": "Spoof",
+            "redirect_uris": "https://ha.example.com@attacker.example/callback",
+        }
+        await register_handler(call)
+
+        notification_call = mock_hass.services.async_call.call_args
+        assert "Failed" in notification_call[0][2]["title"]
+        assert "userinfo" in notification_call[0][2]["message"]
+        assert mock_hass.data[DOMAIN]["clients"] == {}
+
 
 class TestRevokeClientService:
     """Test revoke_client service handler."""
@@ -529,6 +561,99 @@ class TestUpdateClientService:
         notification_call = mock_hass.services.async_call.call_args
         assert "Failed" in notification_call[0][2]["title"]
         mock_store.async_save.assert_not_called()
+
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_update_client_rejects_invalid_redirect_uri(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """Updated redirect URIs get the same validation as registration."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+        mock_store.async_load = AsyncMock(
+            return_value={
+                "clients": {
+                    "test_id": {
+                        "client_name": "Test Client",
+                        "redirect_uris": ["https://app.example.com/callback"],
+                    }
+                }
+            }
+        )
+
+        await async_setup_entry(mock_hass, mock_config_entry)
+
+        update_handler = mock_hass.services.async_register.call_args_list[2][0][2]
+
+        call = Mock()
+        call.data = {
+            "client_id": "test_id",
+            "redirect_uris": "https://app.example.com@attacker.example/callback",
+        }
+        await update_handler(call)
+
+        notification_call = mock_hass.services.async_call.call_args
+        assert "Failed" in notification_call[0][2]["title"]
+        assert "userinfo" in notification_call[0][2]["message"]
+        assert mock_hass.data[DOMAIN]["clients"]["test_id"]["redirect_uris"] == [
+            "https://app.example.com/callback"
+        ]
+        mock_store.async_save.assert_not_called()
+
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_update_client_sets_consent_required(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """Operators clear the consent flag on clients they trust without re-registering."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+        mock_store.async_load = AsyncMock(
+            return_value={
+                "clients": {
+                    "test_id": {
+                        "client_name": "Test Client",
+                        "redirect_uris": ["https://app.example.com/callback"],
+                    }
+                }
+            }
+        )
+
+        await async_setup_entry(mock_hass, mock_config_entry)
+
+        update_handler = mock_hass.services.async_register.call_args_list[2][0][2]
+
+        call = Mock()
+        call.data = {
+            "client_id": "test_id",
+            "redirect_uris": "https://app.example.com/callback",
+            "consent_required": False,
+        }
+        await update_handler(call)
+
+        assert mock_hass.data[DOMAIN]["clients"]["test_id"]["consent_required"] is False
+        mock_store.async_save.assert_called_once()
+        notification_call = mock_hass.services.async_call.call_args
+        assert "Consent required:** no" in notification_call[0][2]["message"]
+
+        # Leaving the field out keeps the stored setting
+        call.data = {"client_id": "test_id", "redirect_uris": "https://app.example.com/callback"}
+        await update_handler(call)
+        assert mock_hass.data[DOMAIN]["clients"]["test_id"]["consent_required"] is False
 
 
 class TestListClientsService:

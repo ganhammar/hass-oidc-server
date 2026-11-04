@@ -13,7 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
-from .client_manager import create_client
+from .client_manager import create_client, validate_redirect_uris
 from .const import (
     CONF_REQUIRE_PKCE,
     DEFAULT_REQUIRE_PKCE,
@@ -112,6 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             client_name = call.data.get("client_name")
             redirect_uris = call.data.get("redirect_uris", "").split(",")
             redirect_uris = [uri.strip() for uri in redirect_uris if uri.strip()]
+            consent_required = bool(call.data.get("consent_required", False))
 
             # Check if client with same name already exists
             existing_clients = hass.data[DOMAIN].get("clients", {})
@@ -135,6 +136,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass,
                 client_name=client_name,
                 redirect_uris=redirect_uris,
+                consent_required=consent_required,
             )
             client_id = client_info["client_id"]
             client_secret = client_info["client_secret"]
@@ -167,6 +169,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 client_id,
                 redirect_uris,
             )
+        except ValueError as e:
+            _LOGGER.error("Error registering OIDC client: %s", e)
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "OIDC Client Registration Failed",
+                    "message": f"❌ {e}",
+                    "notification_id": "oidc_client_error_invalid",
+                },
+            )
         except Exception as e:
             _LOGGER.error("Error registering OIDC client: %s", e, exc_info=True)
 
@@ -190,9 +203,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         client_id = call.data.get("client_id")
         redirect_uris_input = call.data.get("redirect_uris", "")
         redirect_uris = [uri.strip() for uri in redirect_uris_input.split(",") if uri.strip()]
+        consent_required = call.data.get("consent_required")
 
-        if client_id not in hass.data[DOMAIN]["clients"]:
-            error_msg = f"Client ID '{client_id}' not found"
+        async def fail(error_msg: str) -> None:
             _LOGGER.error(error_msg)
             await hass.services.async_call(
                 "persistent_notification",
@@ -203,10 +216,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "notification_id": f"oidc_update_error_{client_id}",
                 },
             )
+
+        if client_id not in hass.data[DOMAIN]["clients"]:
+            await fail(f"Client ID '{client_id}' not found")
             return
 
-        # Update redirect URIs
-        hass.data[DOMAIN]["clients"][client_id]["redirect_uris"] = redirect_uris
+        # The redirect host is shown on the consent screen, so updated URIs
+        # get the same validation as registration.
+        try:
+            validate_redirect_uris(redirect_uris)
+        except ValueError as e:
+            await fail(str(e))
+            return
+
+        # Update redirect URIs and, when given, the consent setting
+        client = hass.data[DOMAIN]["clients"][client_id]
+        client["redirect_uris"] = redirect_uris
+        if consent_required is not None:
+            client["consent_required"] = bool(consent_required)
+        consent_label = "yes" if client.get("consent_required", True) else "no"
 
         # Save to storage
         store = hass.data[DOMAIN]["store"]
@@ -222,7 +250,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "message": (
                     f"**Updated Client: {client_name}**\n\n"
                     f"**Client ID:** `{client_id}`\n\n"
-                    f"**New Redirect URIs:** {', '.join(redirect_uris)}"
+                    f"**New Redirect URIs:** {', '.join(redirect_uris)}\n\n"
+                    f"**Consent required:** {consent_label}"
                 ),
                 "notification_id": f"oidc_update_{client_id}",
             },
@@ -247,10 +276,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         message_parts = ["**Registered OIDC Clients:**\n"]
         for client_id, client_data in clients.items():
+            consent_label = "yes" if client_data.get("consent_required", True) else "no"
             message_parts.append(
                 f"\n**{client_data['client_name']}**\n"
                 f"- Client ID: `{client_id}`\n"
                 f"- Redirect URIs: {', '.join(client_data['redirect_uris'])}\n"
+                f"- Consent required: {consent_label}\n"
                 f"- ⚠️ Client Secret: Hidden (cannot be retrieved)\n"
             )
 

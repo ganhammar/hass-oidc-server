@@ -9,6 +9,7 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 - **JWT-based access tokens** with RSA signing
 - **Support for authorization code flow** with refresh tokens
 - **Easy client registration** via Home Assistant services
+- **Consent screen** for dynamically registered clients, styled like the Home Assistant login
 - **No external dependencies** - runs entirely within Home Assistant
 
 This integration acts as an OIDC abstraction layer on top of Home Assistant's built-in authentication system. It does not create new user accounts or add additional login methods—users authenticate with their existing Home Assistant credentials through the standard login interface.
@@ -47,6 +48,7 @@ To register a new OIDC client (e.g., for Claude Connectors):
 3. Fill in the fields:
    - **Client Name**: A friendly name (e.g., "Claude Connector")
    - **Redirect URIs**: Comma-separated list of allowed redirect URIs
+   - **Require consent** (optional): Ask the user to approve each authorization. Off by default, since a client you register yourself is trusted
 4. Click **"Perform Action"**
 5. Check the Home Assistant logs for the generated **Client ID** and **Client Secret**
 
@@ -70,6 +72,12 @@ Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
 
 **Important**: Save these credentials securely. The client secret cannot be retrieved later.
 
+### Consent Screen
+
+Clients registered through the dynamic registration endpoint (`/oidc/register`) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
+
+Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Use the `update_client` action with `consent_required: false` for the ones you registered yourself.
+
 ### Updating a Client
 
 To update redirect URIs for an existing client:
@@ -77,13 +85,14 @@ To update redirect URIs for an existing client:
 1. Use **"List OIDC Clients"** to find the client ID
 2. Go to **Developer Tools** → **Actions**
 3. Select **"Update OIDC Client"**
-4. Enter the client ID and new redirect URIs
+4. Enter the client ID and new redirect URIs, and optionally whether consent is required
 
 ```yaml
 action: oidc_provider.update_client
 data:
   client_id: "client_xxxxxxxxxxxxx"
   redirect_uris: "https://new-app.example.com/callback,http://localhost:8080/auth"
+  consent_required: false
 ```
 
 ### Revoking a Client
@@ -128,6 +137,8 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts, valid for 30 days by default
 - **Access Tokens**: Valid for 1 hour by default
+- **Dynamic Registration**: Anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
+- **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes
 

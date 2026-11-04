@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import jwt
 from aiohttp import web
@@ -19,7 +19,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .client_manager import create_client
+from .client_manager import create_client, validate_client_name
 from .const import (
     ACCESS_TOKEN_EXPIRY,
     AUTHORIZATION_CODE_EXPIRY,
@@ -174,19 +174,23 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
 
 
 class OIDCContinueView(HomeAssistantView):
-    """OIDC Continue view - requires auth, retrieves stored request, generates code."""
+    """Consent step of the authorization flow.
+
+    GET describes a pending authorization request so the login panel can show
+    a consent screen. POST records the user's decision: an approval mints an
+    authorization code, a denial sends the client an access_denied error.
+    Both require an authenticated Home Assistant user.
+    """
 
     url = "/oidc/continue"
     name = "api:oidc:continue"
     requires_auth = True
 
-    async def get(self, request: web.Request) -> web.Response:
-        """Handle continuation after authentication."""
-        hass = request.app["hass"]
-        user = request["hass_user"]
-
-        # Get request ID from query or session storage will pass it
-        request_id = request.query.get("request_id")
+    @staticmethod
+    def _get_pending_request(
+        hass: HomeAssistant, request_id: str | None
+    ) -> tuple[dict[str, Any], dict[str, Any]] | web.Response:
+        """Return the pending request and its client, or the error response."""
         if not request_id:
             return web.Response(text="Missing request_id", status=400)
 
@@ -199,6 +203,62 @@ class OIDCContinueView(HomeAssistantView):
             del pending_requests[request_id]
             return web.Response(text="Request expired", status=400)
 
+        client = hass.data[DOMAIN].get("clients", {}).get(stored_request["client_id"])
+        if client is None:
+            del pending_requests[request_id]
+            return web.Response(text="Client no longer registered", status=400)
+
+        return stored_request, client
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Describe the pending request for the consent screen."""
+        hass = request.app["hass"]
+
+        result = self._get_pending_request(hass, request.query.get("request_id"))
+        if isinstance(result, web.Response):
+            return result
+        stored_request, client = result
+
+        # hostname rather than netloc so userinfo can never dress up the host
+        parsed = urlparse(stored_request["redirect_uri"])
+        redirect_host = parsed.hostname or ""
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port:
+            redirect_host = f"{redirect_host}:{port}"
+
+        return web.json_response(
+            {
+                "client_name": client.get("client_name", stored_request["client_id"]),
+                "redirect_host": redirect_host,
+                "scopes": stored_request["scope"].split(),
+                # A client with no recorded setting predates the flag and may
+                # have come from dynamic registration, so it prompts until an
+                # operator clears the flag.
+                "consent_required": bool(client.get("consent_required", True)),
+            }
+        )
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Record the user's decision on the pending request."""
+        hass = request.app["hass"]
+        user = request["hass_user"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.Response(text="Invalid JSON body", status=400)
+        if not isinstance(body, dict):
+            return web.Response(text="Invalid JSON body", status=400)
+
+        result = self._get_pending_request(hass, body.get("request_id"))
+        if isinstance(result, web.Response):
+            return result
+        stored_request, _client = result
+        request_id = body["request_id"]
+
         # Extract parameters
         client_id = stored_request["client_id"]
         redirect_uri = stored_request["redirect_uri"]
@@ -209,8 +269,19 @@ class OIDCContinueView(HomeAssistantView):
         code_challenge_method = stored_request.get("code_challenge_method")
         resource = stored_request.get("resource")
 
-        # Clean up
-        del pending_requests[request_id]
+        # A decision either way consumes the pending request
+        del hass.data[DOMAIN]["pending_auth_requests"][request_id]
+
+        separator = "&" if "?" in redirect_uri else "?"
+
+        def build_redirect(**params: str) -> str:
+            if state:
+                params["state"] = state
+            return f"{redirect_uri}{separator}{urlencode(params)}"
+
+        if body.get("approve") is not True:
+            _LOGGER.info("User %s denied authorization for client %s", user.id, client_id)
+            return web.json_response({"redirect_url": build_redirect(error="access_denied")})
 
         # Generate authorization code
         auth_code = secrets.token_urlsafe(32)
@@ -234,14 +305,8 @@ class OIDCContinueView(HomeAssistantView):
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
 
-        # Build redirect URL
-        separator = "&" if "?" in redirect_uri else "?"
-        redirect_url = f"{redirect_uri}{separator}code={auth_code}"
-        if state:
-            redirect_url += f"&state={state}"
-
         # Return JSON with redirect URL (since fetch can't follow external redirects)
-        return web.json_response({"redirect_url": redirect_url})
+        return web.json_response({"redirect_url": build_redirect(code=auth_code)})
 
 
 class OIDCDiscoveryView(HomeAssistantView):
@@ -394,6 +459,18 @@ class OIDCAuthorizationView(HomeAssistantView):
                 status=400,
             )
 
+        # Unrecognised scope values are ignored (OIDC Core §3.1.2.1). Only the
+        # granted scopes are stored, shown on the consent screen, and returned
+        # with the token.
+        granted_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
+        if len(granted_scopes) != len(requested_scopes):
+            _LOGGER.debug(
+                "Ignoring unsupported scopes for client %s: %s",
+                client_id,
+                " ".join(sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES),
+            )
+        scope = " ".join(granted_scopes)
+
         # NOTE: max_age (OIDC Core §3.1.2.1) is intentionally not honored here.
         # The auth_time claim emitted in the id_token is stamped at the
         # /oidc/continue step, which approximates "authentication occurred"
@@ -459,21 +536,62 @@ class OIDCAuthorizationView(HomeAssistantView):
             "expires_at": time.time() + 600,  # 10 minutes
         }
 
-        # Return HTML that stores request ID in sessionStorage and redirects to panel
+        # Return HTML that stores request ID in sessionStorage and redirects to panel.
+        # Styled like Home Assistant's own login page shell so the bounce does not
+        # flash an unstyled page, and reads well if JavaScript is unavailable.
         # Note: auth_request_id is a cryptographically secure token, but we still escape it
         escaped_request_id = html.escape(auth_request_id)
-        redirect_script = f"""
-        <html>
-        <head><title>OIDC Authorization</title></head>
-        <body>
-            <p>Redirecting to login...</p>
-            <script>
-                sessionStorage.setItem('oidc_request_id', '{escaped_request_id}');
-                window.location.href = '/{PANEL_URL_PATH}';
-            </script>
-        </body>
-        </html>
-        """
+        redirect_script = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home Assistant</title>
+<link rel="icon" href="/static/icons/favicon.ico">
+<style>
+  html {{
+    background-color: #fafafa;
+    color: #212121;
+    font-family: Roboto, Noto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }}
+  body {{ margin: 0; padding: 32px 0; display: flex; flex-wrap: wrap; align-items: center; }}
+  .content {{ width: 100%; max-width: 400px; margin: 0 auto; padding: 0 16px; }}
+  .header {{ display: flex; align-items: center; justify-content: center; margin-bottom: 32px; }}
+  .header img {{ height: 56px; width: 56px; }}
+  .card {{
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 12px;
+    padding: 16px;
+    box-sizing: border-box;
+  }}
+  h1 {{ font-size: 28px; font-weight: 400; margin: 16px 0; }}
+  p {{ font-size: 14px; line-height: 20px; }}
+  @media (prefers-color-scheme: dark) {{
+    html {{ background-color: #111111; color: #e1e1e1; }}
+    .card {{ background: #1c1c1c; border-color: #333333; }}
+  }}
+</style>
+</head>
+<body>
+<div class="content">
+  <div class="header">
+    <img src="/static/icons/favicon-192x192.png" alt="Home Assistant">
+  </div>
+  <div class="card">
+    <h1>Redirecting to login</h1>
+    <p>Taking you to Home Assistant to sign in and approve this request.</p>
+    <noscript><p>JavaScript is required to continue.</p></noscript>
+  </div>
+</div>
+<script>
+  sessionStorage.setItem('oidc_request_id', '{escaped_request_id}');
+  window.location.replace('/{PANEL_URL_PATH}');
+</script>
+</body>
+</html>
+"""
         return web.Response(
             text=redirect_script,
             content_type="text/html",
@@ -1132,7 +1250,15 @@ class OIDCRegisterView(HomeAssistantView):
             )
 
         # Extract client metadata
-        client_name = data.get("client_name", "Dynamically Registered Client")
+        try:
+            client_name = validate_client_name(
+                data.get("client_name", "Dynamically Registered Client")
+            )
+        except ValueError as e:
+            return web.json_response(
+                {"error": "invalid_client_metadata", "error_description": str(e)},
+                status=400,
+            )
         grant_types = data.get("grant_types", ["authorization_code", "refresh_token"])
         response_types = data.get("response_types", ["code"])
         token_endpoint_auth_method = data.get("token_endpoint_auth_method", "client_secret_basic")
@@ -1168,6 +1294,9 @@ class OIDCRegisterView(HomeAssistantView):
                 grant_types=grant_types,
                 response_types=response_types,
                 token_endpoint_auth_method=token_endpoint_auth_method,
+                # Anyone can reach this endpoint, so the registrant is not
+                # vouched for by the operator and the user decides per login.
+                consent_required=True,
             )
         except ValueError as e:
             return web.json_response(

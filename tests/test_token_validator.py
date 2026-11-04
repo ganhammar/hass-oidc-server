@@ -528,9 +528,11 @@ def test_validate_access_token_accepts_audience_list(mock_hass_with_keys):
     assert result is not None
 
 
-def test_validate_access_token_legacy_client_audience_accepted(mock_hass_with_keys):
-    """A token with aud=client_id is still accepted even when a resource is
-    expected, so tokens issued before resource binding keep working."""
+def test_validate_access_token_rejects_client_audience_when_resource_expected(
+    mock_hass_with_keys,
+):
+    """A token with aud=client_id is not accepted at a resource server that
+    names itself, even though the client is registered."""
     hass, private_key = mock_hass_with_keys
     hass.data[DOMAIN]["clients"] = {"test_client": {}}
 
@@ -542,5 +544,18 @@ def test_validate_access_token_legacy_client_audience_accepted(mock_hass_with_ke
         "https://ha.example.com",
         expected_audience="https://ha.example.com/api/mcp",
     )
+    assert result is None
+
+
+def test_validate_access_token_accepts_client_audience_without_expected_resource(
+    mock_hass_with_keys,
+):
+    """Without an expected resource, a registered client_id is a valid audience."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    token = _encode(private_key, _resource_token_payload("test_client"))
+
+    result = validate_access_token(hass, token, "https://ha.example.com")
     assert result is not None
     assert result["sub"] == "user123"
