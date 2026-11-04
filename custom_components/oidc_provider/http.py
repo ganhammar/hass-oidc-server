@@ -495,7 +495,8 @@ class OIDCTokenView(HomeAssistantView):
         grant_type = data.get("grant_type")
 
         # Extract client credentials from either POST data or Authorization header
-        client_id = data.get("client_id")
+        body_client_id = data.get("client_id")
+        client_id = body_client_id
         client_secret = data.get("client_secret")
 
         # Check for HTTP Basic authentication
@@ -511,8 +512,7 @@ class OIDCTokenView(HomeAssistantView):
 
             # A body client_id that disagrees with the Basic credentials is an
             # attempt to authenticate as one client while acting for another.
-            body_client_id = data.get("client_id")
-            if body_client_id is not None and body_client_id != client_id:
+            if body_client_id and body_client_id != client_id:
                 _LOGGER.warning(
                     "client_id mismatch between Basic auth (%s) and request body (%s)",
                     client_id,
@@ -782,9 +782,13 @@ class OIDCTokenView(HomeAssistantView):
 
         # The refresh token is bound to the client it was issued to
         # (RFC 6749 §6); the body client_id is caller-controlled and not used.
+        # Presentation by another client indicates the token has leaked, so it
+        # is revoked (RFC 9700 §4.14).
         if token_data["client_id"] != client_id:
+            del refresh_tokens[refresh_token]
+            await _save_refresh_tokens(hass)
             _LOGGER.warning(
-                "Refresh token issued to client %s used by client %s",
+                "Refresh token issued to client %s used by client %s; token revoked",
                 token_data["client_id"],
                 client_id,
             )

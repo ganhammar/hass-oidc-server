@@ -996,6 +996,7 @@ async def test_oidc_token_view_basic_auth():
     request.post = AsyncMock(
         return_value={
             "grant_type": "authorization_code",
+            "client_id": "",
             "code": "valid_code",
             "redirect_uri": "https://example.com/callback",
         }
@@ -1873,10 +1874,11 @@ async def test_oidc_token_view_rejects_code_issued_to_other_client():
 
 @pytest.mark.asyncio
 async def test_oidc_token_view_rejects_refresh_token_issued_to_other_client():
-    """A refresh token is bound to the authenticated client, not the body client_id."""
-    import base64
-
+    """A refresh token presented by another client is rejected and revoked."""
     from custom_components.oidc_provider.security import hash_client_secret
+
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
 
     hass = Mock()
     hass.data = {
@@ -1898,18 +1900,19 @@ async def test_oidc_token_view_rejects_refresh_token_issued_to_other_client():
                 }
             },
             "rate_limit_attempts": {},
+            "token_store": mock_token_store,
         }
     }
-
-    credentials = base64.b64encode(b"evil_client:evil_secret").decode("utf-8")
 
     request = MagicMock()
     request.app = {"hass": hass}
     request.remote = "127.0.0.1"
-    request.headers = {"Authorization": f"Basic {credentials}"}
+    request.headers = {}
     request.post = AsyncMock(
         return_value={
             "grant_type": "refresh_token",
+            "client_id": "evil_client",
+            "client_secret": "evil_secret",
             "refresh_token": "victim_refresh_token",
         }
     )
@@ -1922,6 +1925,9 @@ async def test_oidc_token_view_rejects_refresh_token_issued_to_other_client():
     assert response.status == 400
     data = json.loads(response.body.decode("utf-8"))
     assert data["error"] == "invalid_grant"
+    # Presentation by the wrong client revokes the token and persists the change
+    assert "victim_refresh_token" not in hass.data[DOMAIN]["refresh_tokens"]
+    mock_token_store.async_save.assert_called_once()
 
 
 @pytest.mark.asyncio
