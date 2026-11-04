@@ -996,6 +996,7 @@ async def test_oidc_token_view_basic_auth():
     request.post = AsyncMock(
         return_value={
             "grant_type": "authorization_code",
+            "client_id": "",
             "code": "valid_code",
             "redirect_uri": "https://example.com/callback",
         }
@@ -1812,6 +1813,175 @@ async def test_oidc_token_view_invalid_refresh_token():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert data["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_rejects_code_issued_to_other_client():
+    """An authorization code is bound to the client it was issued to."""
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {
+                "victim_client": {
+                    "client_secret_hash": hash_client_secret("victim_secret"),
+                },
+                "evil_client": {
+                    "client_secret_hash": hash_client_secret("evil_secret"),
+                },
+            },
+            "authorization_codes": {
+                "victim_code": {
+                    "client_id": "victim_client",
+                    "redirect_uri": "https://example.com/callback",
+                    "user_id": "user123",
+                    "scope": "openid",
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "refresh_tokens": {},
+            "rate_limit_attempts": {},
+        }
+    }
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "authorization_code",
+            "client_id": "evil_client",
+            "client_secret": "evil_secret",
+            "code": "victim_code",
+            "redirect_uri": "https://example.com/callback",
+        }
+    )
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    view = OIDCTokenView()
+    response = await view.post(request)
+
+    assert response.status == 400
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["error"] == "invalid_grant"
+    # A cross-client redemption attempt consumes the code
+    assert "victim_code" not in hass.data[DOMAIN]["authorization_codes"]
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_rejects_refresh_token_issued_to_other_client():
+    """A refresh token presented by another client is rejected and revoked."""
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {
+                "victim_client": {
+                    "client_secret_hash": hash_client_secret("victim_secret"),
+                },
+                "evil_client": {
+                    "client_secret_hash": hash_client_secret("evil_secret"),
+                },
+            },
+            "refresh_tokens": {
+                "victim_refresh_token": {
+                    "client_id": "victim_client",
+                    "user_id": "user123",
+                    "scope": "openid",
+                    "expires_at": time.time() + 3600,
+                }
+            },
+            "rate_limit_attempts": {},
+            "token_store": mock_token_store,
+        }
+    }
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "refresh_token",
+            "client_id": "evil_client",
+            "client_secret": "evil_secret",
+            "refresh_token": "victim_refresh_token",
+        }
+    )
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    view = OIDCTokenView()
+    response = await view.post(request)
+
+    assert response.status == 400
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["error"] == "invalid_grant"
+    # Presentation by the wrong client revokes the token and persists the change
+    assert "victim_refresh_token" not in hass.data[DOMAIN]["refresh_tokens"]
+    mock_token_store.async_save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_rejects_basic_auth_body_client_id_mismatch():
+    """Basic auth credentials and a body client_id naming another client are rejected."""
+    import base64
+
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {
+                "victim_client": {
+                    "client_secret_hash": hash_client_secret("victim_secret"),
+                },
+                "evil_client": {
+                    "client_secret_hash": hash_client_secret("evil_secret"),
+                },
+            },
+            "refresh_tokens": {
+                "victim_refresh_token": {
+                    "client_id": "victim_client",
+                    "user_id": "user123",
+                    "scope": "openid",
+                    "expires_at": time.time() + 3600,
+                }
+            },
+            "rate_limit_attempts": {},
+        }
+    }
+
+    credentials = base64.b64encode(b"evil_client:evil_secret").decode("utf-8")
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {"Authorization": f"Basic {credentials}"}
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "refresh_token",
+            "client_id": "victim_client",
+            "refresh_token": "victim_refresh_token",
+        }
+    )
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    view = OIDCTokenView()
+    response = await view.post(request)
+
+    assert response.status == 401
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["error"] == "invalid_client"
 
 
 @pytest.mark.asyncio
