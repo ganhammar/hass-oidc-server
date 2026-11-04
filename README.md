@@ -137,6 +137,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Refresh Tokens**: Persisted across restarts, valid for 30 days by default
 - **Access Tokens**: Valid for 1 hour by default
 - **Dynamic Registration**: Anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
+- **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes
 
