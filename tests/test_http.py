@@ -2813,8 +2813,9 @@ async def test_oidc_authorize_rejects_missing_openid_scope():
 
 
 @pytest.mark.asyncio
-async def test_oidc_authorize_rejects_unsupported_scope():
-    """Scopes outside the supported list are rejected rather than echoed to the user."""
+async def test_oidc_authorize_ignores_unsupported_scope():
+    """Scopes outside the supported list are dropped (OIDC Core §3.1.2.1), so they
+    never reach the consent screen or the token."""
     hass = Mock()
     hass.data = {
         DOMAIN: {
@@ -2829,7 +2830,7 @@ async def test_oidc_authorize_rejects_unsupported_scope():
         "response_type": "code",
         "client_id": "test_client",
         "redirect_uri": "https://example.com/callback",
-        "scope": "openid constructor",
+        "scope": "openid constructor offline_access profile",
         "code_challenge": "abc",
         "code_challenge_method": "S256",
     }
@@ -2838,9 +2839,9 @@ async def test_oidc_authorize_rejects_unsupported_scope():
 
     response = await OIDCAuthorizationView().get(request)
 
-    assert response.status == 400
-    assert b"Unsupported scope: constructor" in response.body
-    assert hass.data[DOMAIN]["pending_auth_requests"] == {}
+    assert response.status == 200
+    [pending] = hass.data[DOMAIN]["pending_auth_requests"].values()
+    assert pending["scope"] == "openid profile"
 
 
 @pytest.mark.asyncio

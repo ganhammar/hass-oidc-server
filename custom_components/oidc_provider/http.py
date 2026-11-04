@@ -459,15 +459,17 @@ class OIDCAuthorizationView(HomeAssistantView):
                 status=400,
             )
 
-        # Only known scopes are accepted; they are shown to the user on the
-        # consent screen and must map to something the provider can grant.
-        unsupported_scopes = [sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES]
-        if unsupported_scopes:
-            supported = ", ".join(SUPPORTED_SCOPES)
-            return web.Response(
-                text=f"Unsupported scope: {' '.join(unsupported_scopes)}. Supported: {supported}",
-                status=400,
+        # Unrecognised scope values are ignored (OIDC Core §3.1.2.1). Only the
+        # granted scopes are stored, shown on the consent screen, and returned
+        # with the token.
+        granted_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
+        if len(granted_scopes) != len(requested_scopes):
+            _LOGGER.debug(
+                "Ignoring unsupported scopes for client %s: %s",
+                client_id,
+                " ".join(sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES),
             )
+        scope = " ".join(granted_scopes)
 
         # NOTE: max_age (OIDC Core §3.1.2.1) is intentionally not honored here.
         # The auth_time claim emitted in the id_token is stamped at the
