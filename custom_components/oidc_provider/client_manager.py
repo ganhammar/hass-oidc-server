@@ -20,6 +20,7 @@ async def create_client(
     grant_types: list[str] = None,
     response_types: list[str] = None,
     token_endpoint_auth_method: str = "client_secret_basic",
+    consent_required: bool = False,
 ) -> dict[str, Any]:
     """
     Create and register a new OAuth client.
@@ -31,6 +32,9 @@ async def create_client(
         grant_types: List of allowed grant types
         response_types: List of allowed response types
         token_endpoint_auth_method: Token endpoint authentication method
+        consent_required: Whether the user must approve each authorization on a
+            consent screen. Clients the operator registered are first-party and
+            default to no prompt; dynamically registered clients always prompt.
 
     Returns:
         Dictionary with client_id, client_secret, and other metadata
@@ -56,6 +60,10 @@ async def create_client(
             # Must have scheme and netloc (host)
             if not parsed.scheme or not parsed.netloc:
                 raise ValueError(f"Invalid redirect_uri: {uri}")
+            # Userinfo has no place in a redirect URI and lets the authority
+            # masquerade as another host on the consent screen.
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError(f"Redirect URI must not contain userinfo: {uri}")
             # Enforce HTTPS except for localhost (RFC 8252 §8.3)
             if parsed.scheme == "http":
                 if parsed.hostname not in ["localhost", "127.0.0.1", "::1"]:
@@ -85,6 +93,7 @@ async def create_client(
         "grant_types": grant_types,
         "response_types": response_types,
         "token_endpoint_auth_method": token_endpoint_auth_method,
+        "consent_required": consent_required,
     }
 
     # Persist to storage
@@ -103,4 +112,5 @@ async def create_client(
         "grant_types": grant_types,
         "response_types": response_types,
         "token_endpoint_auth_method": token_endpoint_auth_method,
+        "consent_required": consent_required,
     }

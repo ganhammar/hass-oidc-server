@@ -112,6 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             client_name = call.data.get("client_name")
             redirect_uris = call.data.get("redirect_uris", "").split(",")
             redirect_uris = [uri.strip() for uri in redirect_uris if uri.strip()]
+            consent_required = bool(call.data.get("consent_required", False))
 
             # Check if client with same name already exists
             existing_clients = hass.data[DOMAIN].get("clients", {})
@@ -135,6 +136,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass,
                 client_name=client_name,
                 redirect_uris=redirect_uris,
+                consent_required=consent_required,
             )
             client_id = client_info["client_id"]
             client_secret = client_info["client_secret"]
@@ -251,6 +253,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 f"\n**{client_data['client_name']}**\n"
                 f"- Client ID: `{client_id}`\n"
                 f"- Redirect URIs: {', '.join(client_data['redirect_uris'])}\n"
+                f"- Consent required: {'yes' if client_data.get('consent_required') else 'no'}\n"
                 f"- ⚠️ Client Secret: Hidden (cannot be retrieved)\n"
             )
 

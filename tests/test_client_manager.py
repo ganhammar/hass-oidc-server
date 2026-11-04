@@ -49,6 +49,23 @@ async def test_create_client_with_defaults(mock_hass):
     assert stored_client["redirect_uris"] == ["http://localhost/callback"]
     assert "client_secret_hash" in stored_client
     assert "client_secret" not in stored_client  # Plain text not stored
+    # Operator-registered clients are first-party and skip the consent screen
+    assert stored_client["consent_required"] is False
+    assert result["consent_required"] is False
+
+
+async def test_create_client_with_consent_required(mock_hass):
+    """consent_required is stored and returned when set."""
+    result = await create_client(
+        mock_hass,
+        client_name="Third Party",
+        redirect_uris=["https://example.com/callback"],
+        consent_required=True,
+    )
+
+    assert result["consent_required"] is True
+    stored_client = mock_hass.data[DOMAIN]["clients"][result["client_id"]]
+    assert stored_client["consent_required"] is True
 
 
 async def test_create_client_generates_unique_id(mock_hass):
@@ -316,4 +333,14 @@ async def test_create_client_http_production_domain_rejected(mock_hass):
             mock_hass,
             client_name="HTTP Production Client",
             redirect_uris=["http://app.example.com/callback"],
+        )
+
+
+async def test_create_client_rejects_userinfo_in_redirect_uri(mock_hass):
+    """A redirect URI with userinfo could spoof the host shown on the consent screen."""
+    with pytest.raises(ValueError, match="userinfo"):
+        await create_client(
+            mock_hass,
+            client_name="Spoof",
+            redirect_uris=["https://ha.example.com@attacker.example/callback"],
         )

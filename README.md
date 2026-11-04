@@ -9,6 +9,7 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 - **JWT-based access tokens** with RSA signing
 - **Support for authorization code flow** with refresh tokens
 - **Easy client registration** via Home Assistant services
+- **Consent screen** for dynamically registered clients, styled like the Home Assistant login
 - **No external dependencies** - runs entirely within Home Assistant
 
 This integration acts as an OIDC abstraction layer on top of Home Assistant's built-in authentication system. It does not create new user accounts or add additional login methods—users authenticate with their existing Home Assistant credentials through the standard login interface.
@@ -47,6 +48,7 @@ To register a new OIDC client (e.g., for Claude Connectors):
 3. Fill in the fields:
    - **Client Name**: A friendly name (e.g., "Claude Connector")
    - **Redirect URIs**: Comma-separated list of allowed redirect URIs
+   - **Require consent** (optional): Ask the user to approve each authorization. Off by default, since a client you register yourself is trusted
 4. Click **"Perform Action"**
 5. Check the Home Assistant logs for the generated **Client ID** and **Client Secret**
 
@@ -69,6 +71,12 @@ Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
 ```
 
 **Important**: Save these credentials securely. The client secret cannot be retrieved later.
+
+### Consent Screen
+
+Clients registered through the dynamic registration endpoint (`/oidc/register`) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
+
+Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and are treated as trusted; re-register any that came from dynamic registration if you want them to prompt.
 
 ### Updating a Client
 
@@ -128,6 +136,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts, valid for 30 days by default
 - **Access Tokens**: Valid for 1 hour by default
+- **Dynamic Registration**: Anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
 
 ## Supported Scopes
 

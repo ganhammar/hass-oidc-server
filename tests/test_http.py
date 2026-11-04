@@ -443,16 +443,54 @@ async def test_oidc_jwks_endpoint():
     assert "e" in key  # exponent
 
 
+def _continue_hass(pending=None, clients=None):
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "pending_auth_requests": pending or {},
+            "clients": (
+                clients if clients is not None else {"client123": {"client_name": "Test App"}}
+            ),
+            "authorization_codes": {},
+        }
+    }
+    return hass
+
+
+def _continue_request(hass, *, query=None, body=None):
+    request = MagicMock()
+    request.query = query or {}
+    request.app = {"hass": hass}
+    request.__getitem__.return_value = Mock(id="user123")
+    request.json = AsyncMock(return_value=body if body is not None else {})
+    return request
+
+
+def _pending(**overrides):
+    data = {
+        "client_id": "client123",
+        "redirect_uri": "https://example.com/callback",
+        "scope": "openid profile",
+        "state": "state123",
+        "code_challenge": "challenge123",
+        "code_challenge_method": "S256",
+        "expires_at": time.time() + 600,
+    }
+    data.update(overrides)
+    return data
+
+
 @pytest.mark.asyncio
 async def test_oidc_continue_view_missing_request_id():
-    """Test continue view with missing request_id."""
-    request = MagicMock()
-    request.query = {}
-    request.app = {"hass": Mock()}
-
+    """Both GET and POST reject a missing request_id."""
+    hass = _continue_hass()
     view = OIDCContinueView()
-    response = await view.get(request)
 
+    response = await view.get(_continue_request(hass))
+    assert response.status == 400
+    assert b"Missing request_id" in response.body
+
+    response = await view.post(_continue_request(hass, body={"approve": True}))
     assert response.status == 400
     assert b"Missing request_id" in response.body
 
@@ -460,16 +498,12 @@ async def test_oidc_continue_view_missing_request_id():
 @pytest.mark.asyncio
 async def test_oidc_continue_view_invalid_request_id():
     """Test continue view with invalid request_id."""
-    hass = Mock()
-    hass.data = {DOMAIN: {"pending_auth_requests": {}}}
-
-    request = MagicMock()
-    request.query = {"request_id": "invalid"}
-    request.app = {"hass": hass}
-    request.__getitem__.return_value = Mock(id="user123")
-
+    hass = _continue_hass()
     view = OIDCContinueView()
-    response = await view.get(request)
+
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "invalid", "approve": True})
+    )
 
     assert response.status == 400
     assert b"Invalid or expired request" in response.body
@@ -478,29 +512,12 @@ async def test_oidc_continue_view_invalid_request_id():
 @pytest.mark.asyncio
 async def test_oidc_continue_view_expired_request():
     """Test continue view with expired request."""
-    hass = Mock()
-    hass.data = {
-        DOMAIN: {
-            "pending_auth_requests": {
-                "req123": {
-                    "client_id": "client123",
-                    "redirect_uri": "https://example.com/callback",
-                    "scope": "openid",
-                    "state": "state123",
-                    "expires_at": time.time() - 100,  # Expired
-                }
-            },
-            "authorization_codes": {},
-        }
-    }
-
-    request = MagicMock()
-    request.query = {"request_id": "req123"}
-    request.app = {"hass": hass}
-    request.__getitem__.return_value = Mock(id="user123")
-
+    hass = _continue_hass(pending={"req123": _pending(expires_at=time.time() - 100)})
     view = OIDCContinueView()
-    response = await view.get(request)
+
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "req123", "approve": True})
+    )
 
     assert response.status == 400
     assert b"Request expired" in response.body
@@ -509,48 +526,142 @@ async def test_oidc_continue_view_expired_request():
 
 
 @pytest.mark.asyncio
-async def test_oidc_continue_view_success():
-    """Test successful continue flow."""
-    hass = Mock()
-    hass.data = {
-        DOMAIN: {
-            "pending_auth_requests": {
-                "req123": {
-                    "client_id": "client123",
-                    "redirect_uri": "https://example.com/callback",
-                    "scope": "openid profile",
-                    "state": "state123",
-                    "code_challenge": "challenge123",
-                    "code_challenge_method": "S256",
-                    "expires_at": time.time() + 600,
-                }
-            },
-            "authorization_codes": {},
-        }
-    }
-
-    request = MagicMock()
-    request.query = {"request_id": "req123"}
-    request.app = {"hass": hass}
-    request.__getitem__.return_value = Mock(id="user123")
-
+async def test_oidc_continue_view_rejects_revoked_client():
+    """A pending request for a client that was revoked meanwhile is dropped."""
+    hass = _continue_hass(pending={"req123": _pending()}, clients={})
     view = OIDCContinueView()
-    response = await view.get(request)
+
+    response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
+
+    assert response.status == 400
+    assert b"Client no longer registered" in response.body
+    assert "req123" not in hass.data[DOMAIN]["pending_auth_requests"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_rejects_invalid_json():
+    """POST without a JSON object body is rejected."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    view = OIDCContinueView()
+
+    request = _continue_request(hass)
+    request.json = AsyncMock(side_effect=ValueError("bad json"))
+    response = await view.post(request)
+    assert response.status == 400
+
+    response = await view.post(_continue_request(hass, body=["not", "a", "dict"]))
+    assert response.status == 400
+    # Nothing was consumed
+    assert "req123" in hass.data[DOMAIN]["pending_auth_requests"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_get_describes_request():
+    """GET returns what the consent screen shows and has no side effects."""
+    hass = _continue_hass(
+        pending={"req123": _pending()},
+        clients={"client123": {"client_name": "Test App", "consent_required": True}},
+    )
+    view = OIDCContinueView()
+
+    response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
 
     assert response.status == 200
-    body = response.body.decode("utf-8")
-    data = json.loads(body)
+    data = json.loads(response.body.decode("utf-8"))
+    assert data == {
+        "client_name": "Test App",
+        "redirect_host": "example.com",
+        "scopes": ["openid", "profile"],
+        "consent_required": True,
+    }
+    assert "req123" in hass.data[DOMAIN]["pending_auth_requests"]
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_get_shows_hostname_not_netloc():
+    """The displayed host is the parsed hostname and port, never raw netloc."""
+    hass = _continue_hass(
+        pending={"req123": _pending(redirect_uri="https://ha.example.com@attacker.example:8443/cb")}
+    )
+    view = OIDCContinueView()
+
+    response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
+
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["redirect_host"] == "attacker.example:8443"
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_get_defaults_consent_to_not_required():
+    """Clients stored before the flag existed are treated as first-party."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    view = OIDCContinueView()
+
+    response = await view.get(_continue_request(hass, query={"request_id": "req123"}))
+
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["consent_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_success():
+    """Approving mints an authorization code and consumes the request."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    view = OIDCContinueView()
+
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "req123", "approve": True})
+    )
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
 
     # Verify redirect URL
-    assert "redirect_url" in data
     assert data["redirect_url"].startswith("https://example.com/callback?code=")
     assert "state=state123" in data["redirect_url"]
 
-    # Verify authorization code was created
-    assert len(hass.data[DOMAIN]["authorization_codes"]) == 1
+    # Verify authorization code was created for the authenticated user
+    codes = hass.data[DOMAIN]["authorization_codes"]
+    assert len(codes) == 1
+    auth_data = next(iter(codes.values()))
+    assert auth_data["user_id"] == "user123"
+    assert auth_data["client_id"] == "client123"
+    assert auth_data["code_challenge"] == "challenge123"
 
     # Verify pending request was cleaned up
     assert "req123" not in hass.data[DOMAIN]["pending_auth_requests"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_deny():
+    """Denying consumes the request and sends access_denied to the client."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    view = OIDCContinueView()
+
+    response = await view.post(
+        _continue_request(hass, body={"request_id": "req123", "approve": False})
+    )
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["redirect_url"] == "https://example.com/callback?error=access_denied&state=state123"
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
+    assert "req123" not in hass.data[DOMAIN]["pending_auth_requests"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_continue_view_requires_explicit_approval():
+    """Anything other than approve=true is a denial, so a missing field cannot mint a code."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    view = OIDCContinueView()
+
+    response = await view.post(_continue_request(hass, body={"request_id": "req123"}))
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+    assert "error=access_denied" in data["redirect_url"]
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
 
 
 @pytest.mark.asyncio
@@ -592,6 +703,8 @@ async def test_oidc_register_view_success():
         print(f"Status: {response.status}, Body: {data}")
 
     assert response.status == 201
+    # A dynamically registered client always goes through the consent screen
+    assert mock_create.call_args.kwargs["consent_required"] is True
     assert data["client_id"] == "test_client_id"
     assert data["client_secret"] == "test_client_secret"
     assert data["client_name"] == "Test Client"

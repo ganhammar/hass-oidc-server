@@ -209,16 +209,17 @@ async def test_continue_propagates_nonce_and_stamps_auth_time():
                 }
             },
             "authorization_codes": {},
+            "clients": {"test_client": {"client_name": "Test"}},
         }
     }
     before = int(time.time())
 
     request = MagicMock()
-    request.query = {"request_id": "req123"}
     request.app = {"hass": hass}
     request.__getitem__.return_value = Mock(id="user123")
+    request.json = AsyncMock(return_value={"request_id": "req123", "approve": True})
 
-    response = await OIDCContinueView().get(request)
+    response = await OIDCContinueView().post(request)
     assert response.status == 200
 
     [code_data] = hass.data[DOMAIN]["authorization_codes"].values()
