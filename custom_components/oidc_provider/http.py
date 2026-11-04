@@ -509,6 +509,17 @@ class OIDCTokenView(HomeAssistantView):
                 _LOGGER.warning("Invalid Basic auth header: %s", e)
                 return web.json_response({"error": "invalid_client"}, status=401)
 
+            # A body client_id that disagrees with the Basic credentials is an
+            # attempt to authenticate as one client while acting for another.
+            body_client_id = data.get("client_id")
+            if body_client_id is not None and body_client_id != client_id:
+                _LOGGER.warning(
+                    "client_id mismatch between Basic auth (%s) and request body (%s)",
+                    client_id,
+                    body_client_id,
+                )
+                return web.json_response({"error": "invalid_client"}, status=401)
+
         # Check rate limiting
         rate_limit_key = f"{client_id}:{request.remote}"
         rate_limits = hass.data[DOMAIN]["rate_limit_attempts"]
@@ -568,10 +579,12 @@ class OIDCTokenView(HomeAssistantView):
         if rate_limit_key in rate_limits:
             del rate_limits[rate_limit_key]
 
+        # Grants are bound to the client that authenticated above, never to a
+        # client_id taken from the request body.
         if grant_type == GRANT_TYPE_AUTHORIZATION_CODE:
-            return await self._handle_authorization_code(request, hass, data)
+            return await self._handle_authorization_code(request, hass, data, client_id)
         elif grant_type == GRANT_TYPE_REFRESH_TOKEN:
-            return await self._handle_refresh_token(request, hass, data)
+            return await self._handle_refresh_token(request, hass, data, client_id)
         else:
             return web.json_response({"error": "unsupported_grant_type"}, status=400)
 
@@ -599,9 +612,9 @@ class OIDCTokenView(HomeAssistantView):
             )
 
     async def _handle_authorization_code(
-        self, _request: web.Request, hass: HomeAssistant, data: Any
+        self, _request: web.Request, hass: HomeAssistant, data: Any, client_id: str
     ) -> web.Response:
-        """Handle authorization code grant."""
+        """Handle authorization code grant for the authenticated client."""
         code = data.get("code")
         redirect_uri = data.get("redirect_uri")
         code_verifier = data.get("code_verifier")
@@ -615,6 +628,18 @@ class OIDCTokenView(HomeAssistantView):
         # Validate authorization code
         if auth_data["expires_at"] < time.time():
             del auth_codes[code]
+            return web.json_response({"error": "invalid_grant"}, status=400)
+
+        # The code may only be redeemed by the client it was issued to
+        # (RFC 6749 §4.1.3). A redemption attempt by another client consumes
+        # the code so it cannot be retried.
+        if auth_data["client_id"] != client_id:
+            del auth_codes[code]
+            _LOGGER.warning(
+                "Authorization code issued to client %s redeemed by client %s",
+                auth_data["client_id"],
+                client_id,
+            )
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         if auth_data["redirect_uri"] != redirect_uri:
@@ -677,7 +702,6 @@ class OIDCTokenView(HomeAssistantView):
 
         # Generate tokens
         user_id = auth_data["user_id"]
-        client_id = auth_data["client_id"]
         scope = auth_data["scope"]
 
         nonce = auth_data.get("nonce")
@@ -739,9 +763,9 @@ class OIDCTokenView(HomeAssistantView):
         return web.json_response(response_body)
 
     async def _handle_refresh_token(
-        self, _request: web.Request, hass: HomeAssistant, data: Any
+        self, _request: web.Request, hass: HomeAssistant, data: Any, client_id: str
     ) -> web.Response:
-        """Handle refresh token grant."""
+        """Handle refresh token grant for the authenticated client."""
         refresh_token = data.get("refresh_token")
 
         refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
@@ -756,7 +780,14 @@ class OIDCTokenView(HomeAssistantView):
             await _save_refresh_tokens(hass)
             return web.json_response({"error": "invalid_grant"}, status=400)
 
-        if token_data["client_id"] != data.get("client_id"):
+        # The refresh token is bound to the client it was issued to
+        # (RFC 6749 §6); the body client_id is caller-controlled and not used.
+        if token_data["client_id"] != client_id:
+            _LOGGER.warning(
+                "Refresh token issued to client %s used by client %s",
+                token_data["client_id"],
+                client_id,
+            )
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         # Generate new access token, preserving the original resource binding
