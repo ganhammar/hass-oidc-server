@@ -28,7 +28,7 @@ jobs:
     strategy:
       matrix:
         python-version:
-          - "3.13"
+          - "3.14"
 
     steps:
     - uses: actions/checkout@v7
@@ -74,6 +74,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - python-version: "3.14"
+            ha-version: "2026.10.4"
+            ha-test-helper: "0.13.375"
           - python-version: "3.14"
             ha-version: "2026.4.2"
             ha-test-helper: "0.13.323"
