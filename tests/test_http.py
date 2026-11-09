@@ -679,6 +679,25 @@ async def test_oidc_continue_view_url_encodes_state():
 
 
 @pytest.mark.asyncio
+async def test_oidc_continue_view_prunes_expired_codes():
+    """Issuing a code drops expired codes and expired redemption records."""
+    hass = _continue_hass(pending={"req123": _pending()})
+    live = {"expires_at": time.time() + 600}
+    stale = {"expires_at": time.time() - 1}
+    hass.data[DOMAIN]["authorization_codes"] = {"stale": stale, "live": live}
+    hass.data[DOMAIN]["redeemed_codes"] = {"stale": stale, "live": live}
+    view = OIDCContinueView()
+
+    await view.post(_continue_request(hass, body={"request_id": "req123", "approve": True}))
+
+    codes = hass.data[DOMAIN]["authorization_codes"]
+    assert "stale" not in codes
+    assert codes["live"] is live
+    assert len(codes) == 2  # the live code and the one just issued
+    assert hass.data[DOMAIN]["redeemed_codes"] == {"live": live}
+
+
+@pytest.mark.asyncio
 async def test_oidc_continue_view_success():
     """Approving mints an authorization code and consumes the request."""
     hass = _continue_hass(pending={"req123": _pending()})
@@ -1432,6 +1451,54 @@ async def test_oidc_token_view_rate_limiting():
     data = json.loads(body)
     assert data["error"] == "invalid_client"
     assert "Too many failed attempts" in data["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_replayed_code_revokes_its_refresh_token():
+    """A code that already issued tokens is refused and its refresh token revoked."""
+    from custom_components.oidc_provider.http import OIDCTokenView
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"test_client": {"client_secret_hash": hash_client_secret("test_secret")}},
+            "authorization_codes": {},
+            "redeemed_codes": {
+                "used_code": {
+                    "client_id": "test_client",
+                    "refresh_token": "issued_refresh",
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "refresh_tokens": {
+                "issued_refresh": {"client_id": "test_client"},
+                "other_refresh": {"client_id": "test_client"},
+            },
+            "rate_limit_attempts": {},
+        }
+    }
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "authorization_code",
+            "client_id": "test_client",
+            "client_secret": "test_secret",
+            "code": "used_code",
+            "redirect_uri": "https://example.com/callback",
+        }
+    )
+
+    response = await OIDCTokenView().post(request)
+
+    assert response.status == 400
+    assert json.loads(response.body.decode("utf-8"))["error"] == "invalid_grant"
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other_refresh"]
+    assert hass.data[DOMAIN]["redeemed_codes"] == {}
 
 
 @pytest.mark.asyncio

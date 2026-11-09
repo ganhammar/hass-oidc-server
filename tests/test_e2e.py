@@ -308,10 +308,29 @@ async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tup
     return code, verifier
 
 
-async def test_authorization_code_is_single_use(
+async def _refresh(client: ClientSessionGenerator, registration: dict, refresh_token: str) -> int:
+    """Use a refresh token at /oidc/token. Returns the response status."""
+    resp = await client.post(
+        "/oidc/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+        },
+        headers=FORWARDED,
+    )
+    return resp.status
+
+
+async def test_replayed_code_is_refused_and_revokes_its_refresh_token(
     setup_provider: None, hass_client: ClientSessionGenerator
 ) -> None:
-    """A redeemed authorization code cannot be redeemed again (RFC 6749 §4.1.2)."""
+    """A redeemed code presented again is refused, and what it issued is revoked.
+
+    RFC 6749 §4.1.2: the server must deny the request and should revoke the
+    tokens previously issued with that code.
+    """
     client = await hass_client()
     registration = await _register_client(client)
     code, verifier = await _issue_code(client, registration)
@@ -322,24 +341,28 @@ async def test_authorization_code_is_single_use(
         "code_verifier": verifier,
     }
 
-    first_status, _ = await _exchange_code(client, **exchange)
+    first_status, first_body = await _exchange_code(client, **exchange)
+    assert first_status == 200
+    assert await _refresh(client, registration, first_body["refresh_token"]) == 200
+
     second_status, second_body = await _exchange_code(client, **exchange)
 
-    assert first_status == 200
     assert second_status == 400
     assert second_body["error"] == "invalid_grant"
+    assert await _refresh(client, registration, first_body["refresh_token"]) == 400
 
 
-async def test_redemption_during_a_pending_one_is_refused(
+async def test_code_presented_during_its_redemption_issues_nothing(
     setup_provider: None,
     hass: HomeAssistant,
     hass_client: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A code presented again while its first redemption is still in flight is refused.
+    """A code presented again while its first redemption is in flight voids both.
 
     The first request is held inside its refresh token write, where a real store
-    yields to the disk, while the second request with the same code runs.
+    yields to the disk, while the second request with the same code runs. The
+    second is refused, and the first gives up the tokens it was issuing.
     """
     client = await hass_client()
     registration = await _register_client(client)
@@ -365,16 +388,18 @@ async def test_redemption_during_a_pending_one_is_refused(
     monkeypatch.setattr(store, "async_save", held_save)
 
     first = asyncio.create_task(_exchange_code(client, **exchange))
-    await asyncio.wait_for(parked.wait(), timeout=5)
-    second_status, second_body = await _exchange_code(client, **exchange)
-    release.set()
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        second_status, second_body = await _exchange_code(client, **exchange)
+    finally:
+        # Let the held request finish even when an assertion above fails, so
+        # teardown does not hang on it and hide the failure.
+        release.set()
     first_status, first_body = await first
 
-    assert first_status == 200
-    assert second_status == 400
-    assert second_body["error"] == "invalid_grant"
-    # Only the redemption that was answered with tokens left a refresh token.
-    assert list(hass.data[DOMAIN]["refresh_tokens"]) == [first_body["refresh_token"]]
+    assert (first_status, first_body["error"]) == (400, "invalid_grant")
+    assert (second_status, second_body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
 
 
 async def test_failed_redemption_consumes_code(
