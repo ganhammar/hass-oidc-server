@@ -1239,7 +1239,7 @@ class OIDCRegisterView(HomeAssistantView):
         hass = request.app["hass"]
 
         if not _dynamic_registration_enabled(hass):
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Refused dynamic client registration from %s: it is turned off in the "
                 "OIDC Provider options",
                 request.remote,
