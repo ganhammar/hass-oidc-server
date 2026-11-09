@@ -46,15 +46,15 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if entry.minor_version < 2:
         # Minor version 1 entries come from releases where dynamic registration
-        # was always on. It stays on so clients that register themselves keep
-        # connecting after an upgrade; the options flow can turn it off.
-        hass.config_entries.async_update_entry(
-            entry,
-            options={**entry.options, CONF_ALLOW_DYNAMIC_REGISTRATION: True},
-            minor_version=2,
-        )
+        # was always on, so an entry without a saved choice keeps it on and
+        # clients that register themselves keep connecting after an upgrade.
+        # A saved choice wins: forks of this integration store the same option
+        # in minor version 1 entries.
+        options = {CONF_ALLOW_DYNAMIC_REGISTRATION: True, **entry.options}
+        hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
         _LOGGER.info(
-            "Migrated config entry to minor version 2; dynamic client registration stays enabled"
+            "Migrated config entry to minor version 2; dynamic client registration %s",
+            "enabled" if options[CONF_ALLOW_DYNAMIC_REGISTRATION] else "disabled",
         )
 
     return True

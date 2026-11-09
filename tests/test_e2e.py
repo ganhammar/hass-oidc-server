@@ -464,6 +464,21 @@ async def test_entry_from_earlier_release_keeps_registration_on(
     assert (await resp.json())["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
 
 
+async def test_entry_with_saved_choice_keeps_it_on_migration(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """A minor version 1 entry that saved registration off, as forks do, stays off."""
+    entry = await _setup_entry(
+        hass, minor_version=1, options={CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+    )
+
+    assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
+    assert entry.options == {CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+    await _assert_registration_refused(await hass_client())
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_setup_flow_records_registration_choice(
     enable_custom_integrations: None, hass: HomeAssistant, enabled: bool

@@ -831,6 +831,20 @@ class TestMigrateEntry:
             minor_version=2,
         )
 
+    @pytest.mark.parametrize("saved", [True, False])
+    async def test_minor_version_1_keeps_a_saved_choice(self, mock_hass, saved):
+        """A minor version 1 entry that already saved the option, as forks do, keeps it."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(1, 1, {CONF_ALLOW_DYNAMIC_REGISTRATION: saved})
+
+        assert await async_migrate_entry(mock_hass, entry) is True
+
+        mock_hass.config_entries.async_update_entry.assert_called_once_with(
+            entry,
+            options={CONF_ALLOW_DYNAMIC_REGISTRATION: saved},
+            minor_version=2,
+        )
+
     async def test_current_entry_is_left_alone(self, mock_hass):
         """An entry already at minor version 2 keeps its recorded choice."""
         mock_hass.config_entries = Mock()

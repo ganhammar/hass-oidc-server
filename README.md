@@ -48,6 +48,8 @@ While dynamic client registration is off, `/oidc/register` answers `403` with `a
 
 Installs set up before version 1.7.0 keep dynamic client registration on, since it was always on before, so clients that register themselves keep connecting after the upgrade. Turn it off in the options if you do not need it.
 
+If you switch from a fork of this integration that stores the same setting, a value you saved there is kept. An entry where it was never saved looks the same as an install from before 1.7.0, so registration is turned on; check the setting after switching.
+
 ## Usage
 
 ### Registering a Client
