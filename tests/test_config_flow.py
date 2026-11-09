@@ -8,6 +8,28 @@ from custom_components.oidc_provider.config_flow import (
     OIDCProviderConfigFlow,
     OIDCProviderOptionsFlow,
 )
+from custom_components.oidc_provider.const import CONF_ALLOW_DYNAMIC_REGISTRATION
+
+
+def _schema_default(schema, key):
+    """Return the default a voluptuous form schema gives the named field."""
+    marker = next(marker for marker in schema.schema if marker == key)
+    return marker.default()
+
+
+def _options_flow(options):
+    """Return an options flow bound to a config entry with the given options.
+
+    The flow resolves its entry through hass by the handler id, the way Home
+    Assistant wires it up when the options dialog opens.
+    """
+    entry = Mock()
+    entry.options = options
+    flow = OIDCProviderOptionsFlow()
+    flow.hass = Mock()
+    flow.hass.config_entries.async_get_known_entry.return_value = entry
+    flow.handler = "entry_id"
+    return flow
 
 
 class TestOIDCProviderConfigFlow:
@@ -28,6 +50,22 @@ class TestOIDCProviderConfigFlow:
         assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
         assert result["title"] == "OIDC Provider"
         assert result["data"] == {}
+        assert result["options"] == {CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+
+    async def test_user_flow_records_dynamic_registration_choice(self):
+        """The setup choice for dynamic registration lands in the entry options."""
+        mock_hass = Mock()
+        mock_hass.config_entries = Mock()
+        mock_hass.config_entries.async_entries = Mock(return_value=[])
+
+        flow = OIDCProviderConfigFlow()
+        flow.hass = mock_hass
+
+        result = await flow.async_step_user(user_input={CONF_ALLOW_DYNAMIC_REGISTRATION: True})
+
+        assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert result["data"] == {}
+        assert result["options"] == {CONF_ALLOW_DYNAMIC_REGISTRATION: True}
 
     async def test_user_flow_shows_form_when_no_input(self):
         """Test user flow shows form when no input provided."""
@@ -65,6 +103,7 @@ class TestOIDCProviderConfigFlow:
         """Test config flow version is set."""
         flow = OIDCProviderConfigFlow()
         assert flow.VERSION == 1
+        assert flow.MINOR_VERSION == 2
 
     def test_async_get_options_flow_returns_options_flow(self):
         """Test async_get_options_flow returns options flow instance."""
@@ -74,9 +113,8 @@ class TestOIDCProviderConfigFlow:
 
             assert isinstance(options_flow, OIDCProviderOptionsFlow)
 
-    async def test_user_flow_form_has_empty_schema(self):
-        """Test user flow form has empty data schema."""
-        # Create mock hass
+    async def test_user_flow_form_offers_dynamic_registration_off(self):
+        """The setup form asks about dynamic registration and defaults it to off."""
         mock_hass = Mock()
         mock_hass.config_entries = Mock()
         mock_hass.config_entries.async_entries = Mock(return_value=[])
@@ -86,8 +124,8 @@ class TestOIDCProviderConfigFlow:
 
         result = await flow.async_step_user(user_input=None)
 
-        # Verify the schema is empty (no user input required)
-        assert result["data_schema"].schema == {}
+        assert list(result["data_schema"].schema) == [CONF_ALLOW_DYNAMIC_REGISTRATION]
+        assert _schema_default(result["data_schema"], CONF_ALLOW_DYNAMIC_REGISTRATION) is False
 
 
 class TestOIDCProviderOptionsFlow:
@@ -95,10 +133,7 @@ class TestOIDCProviderOptionsFlow:
 
     async def test_init_step_shows_form(self):
         """Test init step shows form."""
-        mock_config_entry = Mock()
-        # Use internal _config_entry attribute to avoid deprecated setter
-        flow = OIDCProviderOptionsFlow.__new__(OIDCProviderOptionsFlow)
-        flow._config_entry = mock_config_entry
+        flow = _options_flow({})
 
         result = await flow.async_step_init(user_input=None)
 
@@ -107,11 +142,7 @@ class TestOIDCProviderOptionsFlow:
 
     async def test_init_step_with_user_input_creates_entry(self):
         """Test init step with user input creates entry."""
-        mock_config_entry = Mock()
-        mock_config_entry.options = {}
-        # Use internal _config_entry attribute to avoid deprecated setter
-        flow = OIDCProviderOptionsFlow.__new__(OIDCProviderOptionsFlow)
-        flow._config_entry = mock_config_entry
+        flow = _options_flow({})
 
         result = await flow.async_step_init(user_input={"require_pkce": True})
 
@@ -120,11 +151,7 @@ class TestOIDCProviderOptionsFlow:
 
     async def test_init_step_shows_pkce_option(self):
         """Test init step shows PKCE enforcement option."""
-        mock_config_entry = Mock()
-        mock_config_entry.options = {}
-        # Use internal _config_entry attribute to avoid deprecated setter
-        flow = OIDCProviderOptionsFlow.__new__(OIDCProviderOptionsFlow)
-        flow._config_entry = mock_config_entry
+        flow = _options_flow({})
 
         result = await flow.async_step_init(user_input=None)
 
@@ -136,11 +163,7 @@ class TestOIDCProviderOptionsFlow:
         """Test init step defaults PKCE to True."""
         from custom_components.oidc_provider.const import DEFAULT_REQUIRE_PKCE
 
-        mock_config_entry = Mock()
-        mock_config_entry.options = {}
-        # Use internal _config_entry attribute to avoid deprecated setter
-        flow = OIDCProviderOptionsFlow.__new__(OIDCProviderOptionsFlow)
-        flow._config_entry = mock_config_entry
+        flow = _options_flow({})
 
         result = await flow.async_step_init(user_input=None)
 
@@ -148,3 +171,31 @@ class TestOIDCProviderOptionsFlow:
         assert result["type"] == data_entry_flow.FlowResultType.FORM
         # The default should be True (from DEFAULT_REQUIRE_PKCE constant)
         assert DEFAULT_REQUIRE_PKCE is True
+
+    async def test_init_step_defaults_dynamic_registration_to_current_option(self):
+        """The options form starts from the entry's current registration setting."""
+        flow = _options_flow({CONF_ALLOW_DYNAMIC_REGISTRATION: True})
+
+        result = await flow.async_step_init(user_input=None)
+
+        assert result["type"] == data_entry_flow.FlowResultType.FORM
+        assert _schema_default(result["data_schema"], CONF_ALLOW_DYNAMIC_REGISTRATION) is True
+
+    async def test_init_step_defaults_dynamic_registration_off_without_option(self):
+        """An entry with no recorded setting shows dynamic registration as off."""
+        flow = _options_flow({})
+
+        result = await flow.async_step_init(user_input=None)
+
+        assert _schema_default(result["data_schema"], CONF_ALLOW_DYNAMIC_REGISTRATION) is False
+
+    async def test_init_step_saves_dynamic_registration_choice(self):
+        """Submitting the options form stores both settings."""
+        flow = _options_flow({})
+
+        result = await flow.async_step_init(
+            user_input={"require_pkce": True, CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+        )
+
+        assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert result["data"] == {"require_pkce": True, CONF_ALLOW_DYNAMIC_REGISTRATION: False}

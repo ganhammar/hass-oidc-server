@@ -35,7 +35,18 @@ This integration acts as an OIDC abstraction layer on top of Home Assistant's bu
 1. Go to **Settings** → **Devices & Services**
 1. Click **Add Integration**
 1. Search for "OIDC Provider"
-1. Click to install
+1. Choose whether to **Allow dynamic client registration** (see below), then click **Submit**
+
+### Options
+
+Change these later under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**. Changes apply immediately, without a restart.
+
+- **Require PKCE** (default: on): authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires.
+- **Allow dynamic client registration** (default: off for new installs): lets clients register themselves at `/oidc/register` (RFC 7591). MCP clients such as Claude use this to connect without a client you created for them. Every sign-in through a dynamically registered client stops on the [consent screen](#consent-screen).
+
+While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
+
+Installs set up before version 1.7.0 keep dynamic client registration on, since it was always on before, so clients that register themselves keep connecting after the upgrade. Turn it off in the options if you do not need it.
 
 ## Usage
 
@@ -74,7 +85,7 @@ Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
 
 ### Consent Screen
 
-Clients registered through the dynamic registration endpoint (`/oidc/register`) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
+Clients registered through the dynamic registration endpoint (`/oidc/register`, when [enabled](#options)) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
 
 Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Use the `update_client` action with `consent_required: false` for the ones you registered yourself.
 
@@ -120,7 +131,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Token**: `https://your-ha-instance/oidc/token`
 - **UserInfo**: `https://your-ha-instance/oidc/userinfo`
 - **JWKS**: `https://your-ha-instance/oidc/jwks`
-- **Dynamic Client Registration**: `https://your-ha-instance/oidc/register`
+- **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
 
 ### Using with Claude Connectors
 
@@ -131,13 +142,15 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
    - **Client Secret**: The generated client secret
 3. When prompted, log in with your Home Assistant credentials (TOTP/2FA supported)
 
+With [dynamic client registration](#options) on, Claude can register itself instead, so you can skip step 1 and leave the client ID and secret empty. You then approve it on the consent screen when you sign in.
+
 ## Security Considerations
 
 - **HTTPS Required**: Your Home Assistant instance must be accessible via HTTPS with a valid certificate for OIDC to work with external services
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts, valid for 30 days by default
 - **Access Tokens**: Valid for 1 hour by default
-- **Dynamic Registration**: Anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
+- **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
 - **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes
