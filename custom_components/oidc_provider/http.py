@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlsplit
 
 import jwt
 from aiohttp import web
@@ -19,13 +19,16 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
+from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import create_client, validate_client_name
 from .const import (
     ACCESS_TOKEN_EXPIRY,
     AUTHORIZATION_CODE_EXPIRY,
     CODE_CHALLENGE_METHOD_S256,
+    CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
     CONF_REQUIRE_PKCE,
+    DEFAULT_ALLOW_CLIENT_METADATA_DOCUMENTS,
     DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
@@ -34,6 +37,7 @@ from .const import (
     GROUP_OWNER,
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
+    MAX_PENDING_AUTH_REQUESTS,
     MAX_TOKEN_ATTEMPTS,
     PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
@@ -83,6 +87,113 @@ def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
     return bool(
         hass.data[DOMAIN].get(CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION)
     )
+
+
+def _client_metadata_documents_enabled(hass: HomeAssistant) -> bool:
+    """Return whether an HTTPS URL client_id is resolved through its metadata document."""
+    return bool(
+        hass.data[DOMAIN].get(
+            CONF_ALLOW_CLIENT_METADATA_DOCUMENTS, DEFAULT_ALLOW_CLIENT_METADATA_DOCUMENTS
+        )
+    )
+
+
+def _client_authentication_metadata(hass: HomeAssistant) -> dict[str, Any]:
+    """Return the discovery entries that describe how clients authenticate.
+
+    Public clients (token_endpoint_auth_method none) come from dynamic
+    registration and from metadata documents, so none is listed only while one
+    of them is on. Claude uses a metadata document only when the server lists
+    both none and client_id_metadata_document_supported.
+    """
+    methods = ["client_secret_post", "client_secret_basic"]
+    if _dynamic_registration_enabled(hass) or _client_metadata_documents_enabled(hass):
+        methods.append("none")
+    metadata: dict[str, Any] = {"token_endpoint_auth_methods_supported": methods}
+    if _client_metadata_documents_enabled(hass):
+        metadata["client_id_metadata_document_supported"] = True
+    return metadata
+
+
+def _is_public_client(client: dict[str, Any]) -> bool:
+    """Return whether a client authenticates without a secret.
+
+    A client is public when it uses token_endpoint_auth_method none and holds
+    no secret. A client stored with a secret stays confidential whatever method
+    it asked for.
+    """
+    return (
+        client.get("token_endpoint_auth_method") == "none"
+        and "client_secret_hash" not in client
+        and "client_secret" not in client
+    )
+
+
+def _token_endpoint_client(hass: HomeAssistant, client_id: str | None) -> dict[str, Any] | None:
+    """Return the client a token request names, or None when there is none.
+
+    A metadata document client is not fetched here. Its grants are bound to its
+    client_id and to the PKCE verifier of the authorization that created them.
+    """
+    client = hass.data[DOMAIN].get("clients", {}).get(client_id)
+    if client is None and is_client_id_url(client_id) and _client_metadata_documents_enabled(hass):
+        return {"token_endpoint_auth_method": "none", "metadata_document": True}
+    return client
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _ascii_host(host: str) -> str:
+    """Return a host as the consent screen shows it.
+
+    International names are shown in punycode, so a Unicode look-alike cannot
+    pass for the domain it imitates. Clients stored before redirect URIs had to
+    be ASCII can still carry one.
+    """
+    if host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _redirect_uri_allowed(redirect_uri: str, registered: list[str]) -> bool:
+    """Return whether a requested redirect URI matches a registered one.
+
+    Matching is exact, except that a loopback redirect URI matches on any port
+    (RFC 8252 §7.3). Native clients such as Claude Code listen on a port picked
+    for each sign-in and register the URI without it.
+    """
+    if redirect_uri in registered:
+        return True
+    try:
+        requested = urlsplit(redirect_uri)
+        requested.port
+    except ValueError:
+        return False
+    if (
+        requested.scheme != "http"
+        or requested.hostname not in _LOOPBACK_HOSTS
+        or requested.username is not None
+        or requested.fragment
+    ):
+        return False
+    for uri in registered:
+        try:
+            candidate = urlsplit(uri)
+            candidate.port
+        except ValueError:
+            continue
+        if candidate.username is None and (
+            candidate.scheme,
+            candidate.hostname,
+            candidate.path,
+            candidate.query,
+        ) == (requested.scheme, requested.hostname, requested.path, requested.query):
+            return True
+    return False
 
 
 async def _save_refresh_tokens(hass: HomeAssistant) -> None:
@@ -256,7 +367,9 @@ class OIDCContinueView(HomeAssistantView):
             del pending_requests[request_id]
             return web.Response(text="Request expired", status=400)
 
-        client = hass.data[DOMAIN].get("clients", {}).get(stored_request["client_id"])
+        client = hass.data[DOMAIN].get("clients", {}).get(
+            stored_request["client_id"]
+        ) or stored_request.get("metadata_client")
         if client is None:
             del pending_requests[request_id]
             return web.Response(text="Client no longer registered", status=400)
@@ -274,7 +387,7 @@ class OIDCContinueView(HomeAssistantView):
 
         # hostname rather than netloc so userinfo can never dress up the host
         parsed = urlparse(stored_request["redirect_uri"])
-        redirect_host = parsed.hostname or ""
+        redirect_host = _ascii_host(parsed.hostname or "")
         try:
             port = parsed.port
         except ValueError:
@@ -291,6 +404,14 @@ class OIDCContinueView(HomeAssistantView):
                 # have come from dynamic registration, so it prompts until an
                 # operator clears the flag.
                 "consent_required": bool(client.get("consent_required", True)),
+                # A metadata document client is identified by the host serving
+                # its document, which the draft says to show (§8.5).
+                "client_host": (
+                    client_id_host(stored_request["client_id"])
+                    if client.get("metadata_document")
+                    else None
+                ),
+                "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
             }
         )
 
@@ -388,10 +509,7 @@ class OIDCDiscoveryView(HomeAssistantView):
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
             "scopes_supported": SUPPORTED_SCOPES,
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-            ],
+            **_client_authentication_metadata(request.app["hass"]),
             "claims_supported": [
                 "sub",
                 "name",
@@ -432,10 +550,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             "jwks_uri": f"{base_url}/oidc/jwks",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-            ],
+            **_client_authentication_metadata(request.app["hass"]),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
@@ -469,10 +584,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             "jwks_uri": f"{base_url}/oidc/jwks",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-            ],
+            **_client_authentication_metadata(request.app["hass"]),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
@@ -558,14 +670,34 @@ class OIDCAuthorizationView(HomeAssistantView):
                     status=400,
                 )
 
-        clients = hass.data[DOMAIN].get("clients", {})
+        client = hass.data[DOMAIN].get("clients", {}).get(client_id)
+        metadata_client = None
+        if (
+            client is None
+            and is_client_id_url(client_id)
+            and _client_metadata_documents_enabled(hass)
+        ):
+            try:
+                client = metadata_client = await async_resolve_client(
+                    hass, client_id, request.remote
+                )
+            except ClientMetadataError as err:
+                _LOGGER.debug("Refused client metadata document %s: %s", client_id, err)
+                return web.Response(text=f"Invalid client_id: {err}", status=400)
 
-        if client_id not in clients:
+        if client is None:
             return web.Response(text="Invalid client_id", status=400)
 
-        client = clients[client_id]
-        if redirect_uri not in client["redirect_uris"]:
+        if not _redirect_uri_allowed(redirect_uri, client["redirect_uris"]):
             return web.Response(text="Invalid redirect_uri", status=400)
+
+        # A public client has no secret, so PKCE is what binds the code to the
+        # client that asked for it (OAuth 2.1 §7.5.1), whatever the PKCE option.
+        if _is_public_client(client) and not code_challenge:
+            return web.Response(
+                text="PKCE is required for public clients. Please provide code_challenge.",
+                status=400,
+            )
 
         # Store request and redirect to frontend panel (which requires auth)
         auth_request_id = secrets.token_urlsafe(16)
@@ -574,8 +706,12 @@ class OIDCAuthorizationView(HomeAssistantView):
         if "pending_auth_requests" not in hass.data[DOMAIN]:
             hass.data[DOMAIN]["pending_auth_requests"] = {}
 
-        # Clean up expired pending requests
-        _prune_expired(hass.data[DOMAIN]["pending_auth_requests"])
+        # Clean up expired pending requests. Anyone can start one, so beyond
+        # the cap the oldest are dropped to keep memory bounded.
+        pending = hass.data[DOMAIN]["pending_auth_requests"]
+        _prune_expired(pending)
+        while len(pending) >= MAX_PENDING_AUTH_REQUESTS:
+            del pending[next(iter(pending))]
 
         hass.data[DOMAIN]["pending_auth_requests"][auth_request_id] = {
             "client_id": client_id,
@@ -587,6 +723,9 @@ class OIDCAuthorizationView(HomeAssistantView):
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "resource": resource,
+            # A metadata document client is not stored, so the consent step
+            # reads the client the document described from here.
+            "metadata_client": metadata_client,
             "expires_at": time.time() + 600,  # 10 minutes
         }
 
@@ -722,15 +861,21 @@ class OIDCTokenView(HomeAssistantView):
                 )
 
         # Validate client
-        clients = hass.data[DOMAIN].get("clients", {})
-        if client_id not in clients:
+        client = _token_endpoint_client(hass, client_id)
+        if client is None:
             self._record_failed_attempt(hass, rate_limit_key, current_time)
             return web.json_response({"error": "invalid_client"}, status=401)
 
-        client = clients[client_id]
         # Verify client secret using constant-time comparison
         # Support both old (plain) and new (hashed) client secrets for backward compatibility
-        if "client_secret_hash" in client:
+        if _is_public_client(client):
+            # A public client has no secret to present; its grants are bound to
+            # it by PKCE instead.
+            if client_secret:
+                _LOGGER.warning("Public client %s presented a client secret", client_id)
+                self._record_failed_attempt(hass, rate_limit_key, current_time)
+                return web.json_response({"error": "invalid_client"}, status=401)
+        elif "client_secret_hash" in client:
             # New hashed format
             if not verify_client_secret(client_secret, client["client_secret_hash"]):
                 _LOGGER.warning("Invalid client secret for client %s", client_id)
@@ -825,6 +970,14 @@ class OIDCTokenView(HomeAssistantView):
 
         if auth_data["redirect_uri"] != redirect_uri:
             return web.json_response({"error": "invalid_grant"}, status=400)
+
+        if not auth_data.get("code_challenge") and _is_public_client(
+            _token_endpoint_client(hass, client_id) or {}
+        ):
+            return web.json_response(
+                {"error": "invalid_grant", "error_description": "code_verifier required"},
+                status=400,
+            )
 
         # Validate PKCE code_verifier if code_challenge was provided
         code_challenge = auth_data.get("code_challenge")
@@ -1424,7 +1577,12 @@ class OIDCRegisterView(HomeAssistantView):
             )
         grant_types = data.get("grant_types", ["authorization_code", "refresh_token"])
         response_types = data.get("response_types", ["code"])
+        # A client asking for none registers as a public client without a
+        # secret. Any other method this server does not support is replaced by
+        # client_secret_basic, and the response says so (RFC 7591 §3.2.1).
         token_endpoint_auth_method = data.get("token_endpoint_auth_method", "client_secret_basic")
+        if token_endpoint_auth_method not in ("none", "client_secret_post", "client_secret_basic"):
+            token_endpoint_auth_method = "client_secret_basic"
 
         # Validate grant types
         supported_grant_types = ["authorization_code", "refresh_token"]

@@ -141,11 +141,23 @@ class OidcLoginPanel extends HTMLElement {
       return `<li>${escapeHtml(description)}</li>`;
     });
 
+    // A client identified by a metadata document is vouched for only by the
+    // host serving that document, so the host is shown next to its name.
+    const clientLabel = details.client_host
+      ? `<b>${escapeHtml(details.client_name)}</b> from <b>${escapeHtml(details.client_host)}</b>`
+      : `<b>${escapeHtml(details.client_name)}</b>`;
+    // Any program on a computer can listen on a loopback address, so a sign-in
+    // that returns there is only safe when the user started it themselves.
+    const loopbackNote = details.redirect_is_loopback
+      ? '<p>This sends you back to an application on your own computer. Only approve if you started this sign-in yourself.</p>'
+      : '';
+
     this._renderCard(
       `
         <h1>Approve access?</h1>
         <p>If you continue, you will be sent to <b>${escapeHtml(details.redirect_host)}</b>. The application will be able to see:</p>
         <ul>${scopes.join('')}</ul>
+        ${loopbackNote}
         <div class="action">
           <ha-button id="oidc-approve">Approve</ha-button>
         </div>
@@ -155,7 +167,7 @@ class OidcLoginPanel extends HTMLElement {
       `,
       `
         <ha-alert alert-type="warning">
-          You're about to give <b>${escapeHtml(details.client_name)}</b> access to your Home Assistant instance.
+          You're about to give ${clientLabel} access to your Home Assistant instance.
         </ha-alert>
       `
     );

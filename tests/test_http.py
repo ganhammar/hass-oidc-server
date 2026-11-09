@@ -609,6 +609,8 @@ async def test_oidc_continue_view_get_describes_request():
         "redirect_host": "example.com",
         "scopes": ["openid", "profile"],
         "consent_required": True,
+        "client_host": None,
+        "redirect_is_loopback": False,
     }
     assert "req123" in hass.data[DOMAIN]["pending_auth_requests"]
     assert hass.data[DOMAIN]["authorization_codes"] == {}
@@ -3479,3 +3481,190 @@ async def test_oidc_userinfo_rejects_token_with_invalid_audience():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert data["error"] == "invalid_token"
+
+
+CIMD_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
+
+
+@pytest.mark.parametrize(
+    ("requested", "registered", "allowed"),
+    [
+        ("https://app.example.com/cb", ["https://app.example.com/cb"], True),
+        ("https://app.example.com:8443/cb", ["https://app.example.com/cb"], False),
+        ("http://localhost:53682/callback", ["http://localhost/callback"], True),
+        ("http://127.0.0.1:53682/callback", ["http://127.0.0.1/callback"], True),
+        ("http://[::1]:53682/callback", ["http://[::1]:1234/callback"], True),
+        ("http://localhost:53682/other", ["http://localhost/callback"], False),
+        ("http://localhost:53682/callback?x=1", ["http://localhost/callback"], False),
+        ("http://127.0.0.1:53682/callback", ["http://localhost/callback"], False),
+        ("https://localhost:53682/callback", ["https://localhost/callback"], False),
+        ("http://evil@localhost:53682/callback", ["http://localhost/callback"], False),
+        ("http://localhost:99999/callback", ["http://localhost/callback"], False),
+    ],
+)
+def test_redirect_uri_matching(requested, registered, allowed):
+    """Redirect URIs match exactly, except loopback ones on any port (RFC 8252 §7.3)."""
+    from custom_components.oidc_provider.http import _redirect_uri_allowed
+
+    assert _redirect_uri_allowed(requested, registered) is allowed
+
+
+@pytest.mark.parametrize(
+    ("dcr", "cimd", "methods", "flag"),
+    [
+        (False, False, ["client_secret_post", "client_secret_basic"], None),
+        (True, False, ["client_secret_post", "client_secret_basic", "none"], None),
+        (False, True, ["client_secret_post", "client_secret_basic", "none"], True),
+    ],
+)
+def test_client_authentication_metadata(dcr, cimd, methods, flag):
+    """Public clients and metadata documents are advertised only while possible."""
+    from custom_components.oidc_provider.const import CONF_ALLOW_CLIENT_METADATA_DOCUMENTS
+    from custom_components.oidc_provider.http import _client_authentication_metadata
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            CONF_ALLOW_DYNAMIC_REGISTRATION: dcr,
+            CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: cimd,
+        }
+    }
+
+    metadata = _client_authentication_metadata(hass)
+
+    assert metadata["token_endpoint_auth_methods_supported"] == methods
+    assert metadata.get("client_id_metadata_document_supported") is flag
+
+
+@pytest.mark.asyncio
+async def test_metadata_document_client_refreshes_without_a_secret():
+    """A metadata document client is public and authenticates with its client_id alone."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id=CIMD_CLIENT_ID)})
+
+    status, body = await _post_refresh_grant(hass, "fam1.a", CIMD_CLIENT_ID, "")
+
+    assert status == 200
+    assert body["refresh_token"].startswith("fam1.")
+
+
+@pytest.mark.asyncio
+async def test_public_client_presenting_a_secret_is_refused():
+    """A public client has no secret, so presenting one is refused."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id=CIMD_CLIENT_ID)})
+
+    status, body = await _post_refresh_grant(hass, "fam1.a", CIMD_CLIENT_ID, "guess")
+
+    assert (status, body["error"]) == (401, "invalid_client")
+
+
+@pytest.mark.asyncio
+async def test_metadata_document_client_is_refused_when_turned_off():
+    """Turning metadata documents off ends those clients' sessions at the next refresh."""
+    from custom_components.oidc_provider.const import CONF_ALLOW_CLIENT_METADATA_DOCUMENTS
+
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id=CIMD_CLIENT_ID)})
+    hass.data[DOMAIN][CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] = False
+
+    status, body = await _post_refresh_grant(hass, "fam1.a", CIMD_CLIENT_ID, "")
+
+    assert (status, body["error"]) == (401, "invalid_client")
+
+
+@pytest.mark.asyncio
+async def test_registered_public_client_refreshes_without_a_secret():
+    """A client registered with auth method none authenticates without a secret."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id="public_client")})
+    hass.data[DOMAIN]["clients"]["public_client"] = {"token_endpoint_auth_method": "none"}
+
+    status, _ = await _post_refresh_grant(hass, "fam1.a", "public_client", "")
+
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_client_with_a_secret_stays_confidential_whatever_its_method():
+    """A stored client holding a secret must present it, even if it asked for none."""
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id="dcr_client")})
+    hass.data[DOMAIN]["clients"]["dcr_client"] = {
+        "token_endpoint_auth_method": "none",
+        "client_secret_hash": hash_client_secret("dcr_secret"),
+    }
+
+    status, _ = await _post_refresh_grant(hass, "fam1.a", "dcr_client", "")
+    assert status == 401
+    status, _ = await _post_refresh_grant(hass, "fam1.a", "dcr_client", "dcr_secret")
+    assert status == 200
+
+
+def _register_hass():
+    store = Mock()
+    store.async_save = AsyncMock()
+    hass = Mock()
+    hass.data = {DOMAIN: {"clients": {}, "store": store, CONF_ALLOW_DYNAMIC_REGISTRATION: True}}
+    return hass
+
+
+async def _register(hass, body):
+    request = Mock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.json = AsyncMock(return_value=body)
+    response = await OIDCRegisterView().post(request)
+    return response.status, json.loads(response.body.decode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_register_public_client_gets_no_secret():
+    """Registering with auth method none creates a public client without a secret."""
+    hass = _register_hass()
+
+    status, body = await _register(
+        hass,
+        {
+            "client_name": "Public",
+            "redirect_uris": ["http://localhost/callback"],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+
+    assert status == 201
+    assert "client_secret" not in body
+    assert body["token_endpoint_auth_method"] == "none"
+    stored = hass.data[DOMAIN]["clients"][body["client_id"]]
+    assert "client_secret_hash" not in stored
+
+
+@pytest.mark.asyncio
+async def test_register_unsupported_auth_method_falls_back_to_basic():
+    """An auth method this server lacks is replaced, and the response says which applies."""
+    hass = _register_hass()
+
+    status, body = await _register(
+        hass,
+        {
+            "client_name": "JWT",
+            "redirect_uris": ["https://app.example.com/cb"],
+            "token_endpoint_auth_method": "private_key_jwt",
+        },
+    )
+
+    assert status == 201
+    assert body["token_endpoint_auth_method"] == "client_secret_basic"
+    assert body["client_secret"]
+
+
+@pytest.mark.parametrize(
+    ("host", "shown"),
+    [
+        ("claude.ai", "claude.ai"),
+        ("сlaude.ai", "xn--laude-0ye.ai"),
+        ("bücher.example", "xn--bcher-kva.example"),
+    ],
+)
+def test_consent_screen_shows_hosts_in_ascii(host, shown):
+    """A Unicode look-alike is shown in punycode, so it cannot pass for the real domain."""
+    from custom_components.oidc_provider.http import _ascii_host
+
+    assert _ascii_host(host) == shown

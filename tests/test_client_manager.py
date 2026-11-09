@@ -377,3 +377,19 @@ async def test_create_client_strips_client_name(mock_hass):
         mock_hass, client_name="  Padded  ", redirect_uris=["https://example.com/callback"]
     )
     assert result["client_name"] == "Padded"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://сlaude.ai/callback",
+        "https://app.example.com/callback#section",
+        "http://localhost/callback#",
+    ],
+)
+def test_redirect_uris_must_be_ascii_without_fragment(uri):
+    """Look-alike hosts would mislead the consent screen; fragments are not allowed (RFC 6749)."""
+    from custom_components.oidc_provider.client_manager import validate_redirect_uris
+
+    with pytest.raises(ValueError):
+        validate_redirect_uris([uri])

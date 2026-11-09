@@ -15,8 +15,10 @@ from homeassistant.helpers.storage import Store
 
 from .client_manager import create_client, validate_redirect_uris
 from .const import (
+    CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
     CONF_REQUIRE_PKCE,
+    DEFAULT_ALLOW_CLIENT_METADATA_DOCUMENTS,
     DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
@@ -44,18 +46,34 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Written by a newer release whose schema this one cannot read
         return False
 
+    if entry.minor_version >= 3:
+        return True
+
+    options = dict(entry.options)
     if entry.minor_version < 2:
         # Minor version 1 entries come from releases where dynamic registration
         # was always on, so an entry without a saved choice keeps it on and
         # clients that register themselves keep connecting after an upgrade.
         # A saved choice wins: forks of this integration store the same option
         # in minor version 1 entries.
-        options = {CONF_ALLOW_DYNAMIC_REGISTRATION: True, **entry.options}
-        hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
-        _LOGGER.info(
-            "Migrated config entry to minor version 2; dynamic client registration %s",
-            "enabled" if options[CONF_ALLOW_DYNAMIC_REGISTRATION] else "disabled",
-        )
+        options = {CONF_ALLOW_DYNAMIC_REGISTRATION: True, **options}
+    # Minor version 2 entries come from releases without client metadata
+    # documents. They follow the entry's dynamic registration choice, so an
+    # install that admitted only clients its operator registered keeps doing
+    # so until the operator turns metadata documents on.
+    options = {
+        CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: options.get(
+            CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION
+        ),
+        **options,
+    }
+    hass.config_entries.async_update_entry(entry, options=options, minor_version=3)
+    _LOGGER.info(
+        "Migrated config entry to minor version 3; dynamic client registration %s, "
+        "client metadata documents %s",
+        "enabled" if options[CONF_ALLOW_DYNAMIC_REGISTRATION] else "disabled",
+        "enabled" if options[CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] else "disabled",
+    )
 
     return True
 
@@ -67,6 +85,9 @@ def _apply_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     )
     hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] = entry.options.get(
         CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION
+    )
+    hass.data[DOMAIN][CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] = entry.options.get(
+        CONF_ALLOW_CLIENT_METADATA_DOCUMENTS, DEFAULT_ALLOW_CLIENT_METADATA_DOCUMENTS
     )
 
 
@@ -341,9 +362,11 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
     _apply_options(hass, entry)
     _LOGGER.info(
-        "Options updated: PKCE required %s, dynamic client registration %s",
+        "Options updated: PKCE required %s, dynamic client registration %s, "
+        "client metadata documents %s",
         hass.data[DOMAIN][CONF_REQUIRE_PKCE],
         hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION],
+        hass.data[DOMAIN][CONF_ALLOW_CLIENT_METADATA_DOCUMENTS],
     )
 
 

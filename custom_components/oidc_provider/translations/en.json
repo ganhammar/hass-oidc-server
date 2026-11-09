@@ -5,10 +5,12 @@
         "title": "OIDC Provider Setup",
         "description": "Set up OIDC Provider for Home Assistant. This will enable your Home Assistant instance to act as an OpenID Connect provider for external applications. You can change this later with the integration's Configure button.",
         "data": {
+          "allow_client_metadata_documents": "Allow client metadata documents",
           "allow_dynamic_registration": "Allow dynamic client registration"
         },
         "data_description": {
-          "allow_dynamic_registration": "Let clients register themselves at /oidc/register (RFC 7591). MCP clients such as Claude use this to connect without a client ID you created for them. Anyone who can reach Home Assistant can then register a client, and every sign-in through such a client stops on a consent screen. Leave this off if you register clients yourself with the Register OIDC Client action."
+          "allow_client_metadata_documents": "Accept clients that identify themselves with an HTTPS URL serving their metadata (Client ID Metadata Documents). Claude, Claude Code and other MCP clients sign in this way without registering first. Home Assistant fetches the document from the public internet when a sign-in starts, and every sign-in through such a client stops on a consent screen showing the client's host.",
+          "allow_dynamic_registration": "Let clients register themselves at /oidc/register (RFC 7591). Only needed for clients that support neither client metadata documents nor a client ID you create for them. Anyone who can reach Home Assistant can then register a client, and every sign-in through such a client stops on a consent screen."
         }
       }
     },
@@ -22,10 +24,12 @@
         "title": "OIDC Provider Options",
         "data": {
           "require_pkce": "Require PKCE",
+          "allow_client_metadata_documents": "Allow client metadata documents",
           "allow_dynamic_registration": "Allow dynamic client registration"
         },
         "data_description": {
           "require_pkce": "Authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires.",
+          "allow_client_metadata_documents": "Accept clients that identify themselves with an HTTPS URL serving their metadata (Client ID Metadata Documents). Claude, Claude Code and other MCP clients sign in this way without registering first. Home Assistant fetches the document from the public internet when a sign-in starts, and every sign-in through such a client stops on a consent screen showing the client's host. Turning this off ends the sessions of these clients at their next token refresh.",
           "allow_dynamic_registration": "Let clients register themselves at /oidc/register (RFC 7591). Anyone who can reach Home Assistant can then register a client, and every sign-in through such a client stops on a consent screen. Turning this off stops new registrations; clients that already registered keep working until you revoke them."
         }
       }
