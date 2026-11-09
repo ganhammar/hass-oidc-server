@@ -1467,6 +1467,8 @@ async def test_oidc_token_view_wrong_redirect_uri():
     body = response.body.decode("utf-8")
     data = json.loads(body)
     assert data["error"] == "invalid_grant"
+    # The failed attempt consumed the code
+    assert "valid_code" not in hass.data[DOMAIN]["authorization_codes"]
 
 
 @pytest.mark.asyncio

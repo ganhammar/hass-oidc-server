@@ -21,6 +21,7 @@ entry, HTTP views, frontend panel, static paths) and that DCR and issuance keep
 working, catching HA runtime/API drift before it reaches users.
 """
 
+import asyncio
 import base64
 import hashlib
 import re
@@ -135,6 +136,7 @@ async def _exchange_code(
     client_id: str,
     client_secret: str,
     code_verifier: str,
+    redirect_uri: str = REDIRECT_URI,
 ) -> tuple[int, dict]:
     """Exchange an authorization code at /oidc/token. Returns (status, json body)."""
     resp = await client.post(
@@ -142,7 +144,7 @@ async def _exchange_code(
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "client_id": client_id,
             "client_secret": client_secret,
             "code_verifier": code_verifier,
@@ -273,6 +275,111 @@ async def test_pkce_rejects_wrong_verifier(
 
     assert status == 400
     assert body["error"] == "invalid_grant"
+
+
+async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tuple[str, str]:
+    """Run the authorize step for a registered client. Returns (code, code_verifier)."""
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=RESOURCE,
+    )
+    return code, verifier
+
+
+async def test_authorization_code_is_single_use(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """A redeemed authorization code cannot be redeemed again (RFC 6749 §4.1.2)."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    first_status, _ = await _exchange_code(client, **exchange)
+    second_status, second_body = await _exchange_code(client, **exchange)
+
+    assert first_status == 200
+    assert second_status == 400
+    assert second_body["error"] == "invalid_grant"
+
+
+async def test_redemption_during_a_pending_one_is_refused(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A code presented again while its first redemption is still in flight is refused.
+
+    The first request is held inside its refresh token write, where a real store
+    yields to the disk, while the second request with the same code runs.
+    """
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    store = hass.data[DOMAIN]["token_store"]
+    save = store.async_save
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_save(data: dict) -> None:
+        if not parked.is_set():
+            parked.set()
+            await release.wait()
+        await save(data)
+
+    monkeypatch.setattr(store, "async_save", held_save)
+
+    first = asyncio.create_task(_exchange_code(client, **exchange))
+    await asyncio.wait_for(parked.wait(), timeout=5)
+    second_status, second_body = await _exchange_code(client, **exchange)
+    release.set()
+    first_status, first_body = await first
+
+    assert first_status == 200
+    assert second_status == 400
+    assert second_body["error"] == "invalid_grant"
+    # Only the redemption that was answered with tokens left a refresh token.
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == [first_body["refresh_token"]]
+
+
+async def test_failed_redemption_consumes_code(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """A rejected redemption burns the code, so it cannot be retried with other values."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    mismatch_status, _ = await _exchange_code(
+        client, **exchange, redirect_uri="https://mcp.example.com/other/callback"
+    )
+    retry_status, retry_body = await _exchange_code(client, **exchange)
+
+    assert mismatch_status == 400
+    assert retry_status == 400
+    assert retry_body["error"] == "invalid_grant"
 
 
 async def test_discovery_metadata_advertises_endpoints(
