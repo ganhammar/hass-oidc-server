@@ -81,6 +81,43 @@ class TestAsyncSetupEntry:
     @patch("custom_components.oidc_provider.Store")
     @patch("custom_components.oidc_provider.setup_http_endpoints")
     @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_async_setup_entry_prunes_stale_dynamic_clients(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """Stale dynamic clients are pruned once refresh tokens are loaded."""
+        now = time.time()
+        old = now - 8 * 86400
+        mock_store.async_load = AsyncMock(
+            return_value={
+                "clients": {
+                    "stale": {"registration": "dynamic", "created_at": old},
+                    "in_use": {"registration": "dynamic", "created_at": old},
+                    "manual": {"created_at": old},
+                }
+            }
+        )
+        mock_token_store.async_load = AsyncMock(
+            return_value={
+                "refresh_tokens": {"t": {"client_id": "in_use", "expires_at": now + 1000}}
+            }
+        )
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+
+        assert await async_setup_entry(mock_hass, mock_config_entry) is True
+
+        assert set(mock_hass.data[DOMAIN]["clients"]) == {"in_use", "manual"}
+        mock_store.async_save.assert_awaited_once()
+
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
     async def test_async_setup_entry_initializes_data(
         self,
         mock_panel,

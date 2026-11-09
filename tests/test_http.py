@@ -3827,3 +3827,169 @@ def test_discovery_advertises_revocation():
 
     assert metadata["revocation_endpoint"] == "https://ha.example.com/oidc/revoke"
     assert "none" in metadata["revocation_endpoint_auth_methods_supported"]
+
+
+def _register_hass(**domain_data):
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {},
+            "store": Mock(async_save=AsyncMock()),
+            CONF_ALLOW_DYNAMIC_REGISTRATION: True,
+            **domain_data,
+        }
+    }
+    return hass
+
+
+def _register_request(hass):
+    request = Mock()
+    request.app = {"hass": hass}
+    request.remote = "203.0.113.5"
+    request.json = AsyncMock(
+        return_value={"client_name": "C", "redirect_uris": ["https://example.com/cb"]}
+    )
+    return request
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_marks_client_dynamic_and_records_attempt():
+    """A successful registration is stored as dynamic and counted in the window."""
+    hass = _register_hass()
+    request = _register_request(hass)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 201
+    stored = next(iter(hass.data[DOMAIN]["clients"].values()))
+    assert stored["registration"] == "dynamic"
+    assert "created_at" in stored
+    assert len(hass.data[DOMAIN]["registration_times"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_rate_limited():
+    """The 21st registration within an hour is refused with 429 and Retry-After."""
+    now = time.time()
+    hass = _register_hass(registration_times=[now - 600] + [now - 60] * 19)
+    request = _register_request(hass)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 429
+    assert json.loads(response.body)["error"] == "temporarily_unavailable"
+    assert 2900 <= int(response.headers["Retry-After"]) <= 3001
+    assert hass.data[DOMAIN]["clients"] == {}
+    request.json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_rate_limit_window_slides():
+    """Registrations older than an hour no longer count."""
+    now = time.time()
+    hass = _register_hass(registration_times=[now - 3601] * 20)
+    request = _register_request(hass)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 201
+    assert len(hass.data[DOMAIN]["registration_times"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_client_cap():
+    """Registration is refused once 200 dynamic clients exist, without Retry-After."""
+    now = time.time()
+    clients = {f"c{i}": {"registration": "dynamic", "created_at": now} for i in range(200)}
+    hass = _register_hass(clients=clients)
+    request = _register_request(hass)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 429
+    assert json.loads(response.body)["error"] == "temporarily_unavailable"
+    assert "Retry-After" not in response.headers
+    assert len(hass.data[DOMAIN]["clients"]) == 200
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_prunes_before_cap_check():
+    """Stale dynamic clients are pruned first, so they free room under the cap."""
+    now = time.time()
+    clients = {
+        f"c{i}": {"registration": "dynamic", "created_at": now - 8 * 86400} for i in range(200)
+    }
+    clients["manual"] = {"created_at": now - 8 * 86400}
+    hass = _register_hass(clients=clients, refresh_tokens={})
+    request = _register_request(hass)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 201
+    assert len(hass.data[DOMAIN]["clients"]) == 2
+    assert "manual" in hass.data[DOMAIN]["clients"]
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_refusals_log_at_debug(caplog):
+    """Refusals are logged at debug level so anonymous callers cannot flood warnings."""
+    now = time.time()
+    hass = _register_hass(registration_times=[now] * 20)
+
+    with caplog.at_level("DEBUG"):
+        await OIDCRegisterView().post(_register_request(hass))
+
+    assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
+    assert any("rate limited" in r.getMessage() for r in caplog.records)
+
+
+async def _concurrent_registrations(hass, count):
+    """Send registrations whose bodies arrive only once all have passed the checks."""
+    import asyncio
+
+    release = asyncio.Event()
+
+    async def slow_json():
+        await release.wait()
+        return {"client_name": "Flood", "redirect_uris": ["https://app.example.com/cb"]}
+
+    tasks = []
+    for _ in range(count):
+        request = Mock()
+        request.app = {"hass": hass}
+        request.remote = "198.51.100.1"
+        request.json = slow_json
+        tasks.append(asyncio.create_task(OIDCRegisterView().post(request)))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    return [response.status for response in await asyncio.gather(*tasks)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_registrations_cannot_pass_the_rate_limit():
+    """Slots are taken before the body is read, so a burst cannot all get through."""
+    from custom_components.oidc_provider.const import REGISTRATION_RATE_LIMIT_MAX
+
+    hass = _register_hass()
+
+    statuses = await _concurrent_registrations(hass, REGISTRATION_RATE_LIMIT_MAX + 10)
+
+    assert statuses.count(201) == REGISTRATION_RATE_LIMIT_MAX
+    assert statuses.count(429) == 10
+    assert len(hass.data[DOMAIN]["clients"]) == REGISTRATION_RATE_LIMIT_MAX
+
+
+@pytest.mark.asyncio
+async def test_concurrent_registrations_cannot_pass_the_client_limit(monkeypatch):
+    """Registrations in progress count toward the client limit."""
+    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_DYNAMIC_CLIENTS", 3)
+    hass = _register_hass()
+
+    statuses = await _concurrent_registrations(hass, 8)
+
+    assert statuses.count(201) == 3
+    assert len(hass.data[DOMAIN]["clients"]) == 3
+    # Refused registrations give their rate limit slot back
+    assert len(hass.data[DOMAIN]["registration_times"]) == 3
+    assert hass.data[DOMAIN]["registrations_in_progress"] == 0

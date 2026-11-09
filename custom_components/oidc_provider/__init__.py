@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
-from .client_manager import create_client, validate_redirect_uris
+from .client_manager import create_client, prune_dynamic_clients, validate_redirect_uris
 from .const import (
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
@@ -132,6 +132,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         hass.data[DOMAIN]["refresh_tokens"] = {}
     hass.data[DOMAIN]["token_store"] = token_store
+
+    await prune_dynamic_clients(hass)
 
     # Store configuration options
     _apply_options(hass, entry)

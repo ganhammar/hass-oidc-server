@@ -20,7 +20,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
-from .client_manager import create_client, validate_client_name
+from .client_manager import (
+    count_dynamic_clients,
+    create_client,
+    prune_dynamic_clients,
+    validate_client_name,
+)
 from .const import (
     ACCESS_TOKEN_EXPIRY,
     AUTHORIZATION_CODE_EXPIRY,
@@ -37,6 +42,7 @@ from .const import (
     GROUP_OWNER,
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
+    MAX_DYNAMIC_CLIENTS,
     MAX_PENDING_AUTH_REQUESTS,
     MAX_TOKEN_ATTEMPTS,
     PANEL_URL_PATH,
@@ -44,6 +50,8 @@ from .const import (
     RATE_LIMIT_WINDOW,
     REFRESH_TOKEN_EXPIRY,
     REFRESH_TOKEN_REUSE_GRACE,
+    REGISTRATION_RATE_LIMIT_MAX,
+    REGISTRATION_RATE_LIMIT_WINDOW,
     RESPONSE_TYPE_CODE,
     SCOPE_EMAIL,
     SCOPE_GROUPS,
@@ -1697,6 +1705,56 @@ class OIDCRegisterView(HomeAssistantView):
                 status=403,
             )
 
+        # Sliding window over successful registrations, shared by all callers.
+        # A slot is taken before anything awaits, so concurrent requests cannot
+        # all pass the check, and it is given back when the registration fails.
+        now = time.time()
+        recent = hass.data[DOMAIN].setdefault("registration_times", [])
+        recent[:] = [t for t in recent if t > now - REGISTRATION_RATE_LIMIT_WINDOW]
+        if len(recent) >= REGISTRATION_RATE_LIMIT_MAX:
+            retry_after = max(1, int(recent[0] + REGISTRATION_RATE_LIMIT_WINDOW - now) + 1)
+            _LOGGER.debug(
+                "Refused dynamic client registration from %s: rate limited", request.remote
+            )
+            return web.json_response(
+                {
+                    "error": "temporarily_unavailable",
+                    "error_description": "Too many client registrations, try again later",
+                },
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+        recent.append(now)
+
+        await prune_dynamic_clients(hass)
+        # Registrations still being processed count toward the client limit,
+        # so concurrent requests cannot together go past it.
+        in_progress = hass.data[DOMAIN].get("registrations_in_progress", 0)
+        if count_dynamic_clients(hass) + in_progress >= MAX_DYNAMIC_CLIENTS:
+            recent.remove(now)
+            _LOGGER.debug(
+                "Refused dynamic client registration from %s: client limit reached",
+                request.remote,
+            )
+            return web.json_response(
+                {
+                    "error": "temporarily_unavailable",
+                    "error_description": "Too many registered clients, try again later",
+                },
+                status=429,
+            )
+
+        hass.data[DOMAIN]["registrations_in_progress"] = in_progress + 1
+        try:
+            response = await self._register(request, hass)
+        finally:
+            hass.data[DOMAIN]["registrations_in_progress"] -= 1
+        if response.status != 201 and now in recent:
+            recent.remove(now)
+        return response
+
+    async def _register(self, request: web.Request, hass: HomeAssistant) -> web.Response:
+        """Validate the registration request and create the client."""
         try:
             data = await request.json()
         except Exception:
@@ -1769,6 +1827,7 @@ class OIDCRegisterView(HomeAssistantView):
                 # Anyone can reach this endpoint, so the registrant is not
                 # vouched for by the operator and the user decides per login.
                 consent_required=True,
+                dynamic=True,
             )
         except ValueError as e:
             return web.json_response(

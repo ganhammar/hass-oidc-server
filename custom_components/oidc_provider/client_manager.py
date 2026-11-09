@@ -2,11 +2,13 @@
 
 import logging
 import secrets
+import time
 from typing import Any
 from urllib.parse import urlparse
 
 from homeassistant.core import HomeAssistant
 
+from .const import DYNAMIC_CLIENT_RETENTION, REGISTRATION_DYNAMIC
 from .security import hash_client_secret
 
 _LOGGER = logging.getLogger(__name__)
@@ -76,6 +78,42 @@ def validate_redirect_uris(redirect_uris: list[Any]) -> None:
             raise ValueError(f"Redirect URI has an invalid port: {uri}") from e
 
 
+def count_dynamic_clients(hass: HomeAssistant) -> int:
+    """Return how many stored clients were registered dynamically."""
+    clients = hass.data[DOMAIN].get("clients", {})
+    return sum(1 for c in clients.values() if c.get("registration") == REGISTRATION_DYNAMIC)
+
+
+async def prune_dynamic_clients(hass: HomeAssistant) -> int:
+    """Remove stale dynamically registered clients and return how many were removed.
+
+    A client is stale when it is marked as dynamically registered, was created
+    more than DYNAMIC_CLIENT_RETENTION seconds ago, and no refresh token issued
+    to it is still valid. Clients without the dynamic marker are never removed.
+    """
+    now = time.time()
+    clients = hass.data[DOMAIN].get("clients", {})
+    active = {
+        token["client_id"]
+        for token in hass.data[DOMAIN].get("refresh_tokens", {}).values()
+        if token.get("expires_at", 0) > now
+    }
+    stale = [
+        client_id
+        for client_id, client in clients.items()
+        if client.get("registration") == REGISTRATION_DYNAMIC
+        and client.get("created_at", now) < now - DYNAMIC_CLIENT_RETENTION
+        and client_id not in active
+    ]
+    if not stale:
+        return 0
+    for client_id in stale:
+        del clients[client_id]
+    await hass.data[DOMAIN]["store"].async_save({"clients": clients})
+    _LOGGER.info("Pruned %d unused dynamically registered clients", len(stale))
+    return len(stale)
+
+
 async def create_client(
     hass: HomeAssistant,
     client_name: str = "OIDC Client",
@@ -84,6 +122,7 @@ async def create_client(
     response_types: list[str] = None,
     token_endpoint_auth_method: str = "client_secret_basic",
     consent_required: bool = False,
+    dynamic: bool = False,
 ) -> dict[str, Any]:
     """
     Create and register a new OAuth client.
@@ -98,6 +137,8 @@ async def create_client(
         consent_required: Whether the user must approve each authorization on a
             consent screen. Clients the operator registered are first-party and
             default to no prompt; dynamically registered clients always prompt.
+        dynamic: Whether the client registered itself through /oidc/register.
+            Only such clients are ever pruned automatically.
 
     Returns:
         Dictionary with client_id, client_secret, and other metadata
@@ -128,18 +169,20 @@ async def create_client(
     if "clients" not in hass.data[DOMAIN]:
         hass.data[DOMAIN]["clients"] = {}
 
-    hass.data[DOMAIN]["clients"][client_id] = {
+    client_record = {
         "client_name": client_name,
         "redirect_uris": redirect_uris,
         "grant_types": grant_types,
         "response_types": response_types,
         "token_endpoint_auth_method": token_endpoint_auth_method,
         "consent_required": consent_required,
+        "created_at": time.time(),
     }
     if client_secret is not None:
-        hass.data[DOMAIN]["clients"][client_id]["client_secret_hash"] = hash_client_secret(
-            client_secret
-        )
+        client_record["client_secret_hash"] = hash_client_secret(client_secret)
+    if dynamic:
+        client_record["registration"] = REGISTRATION_DYNAMIC
+    hass.data[DOMAIN]["clients"][client_id] = client_record
 
     # Persist to storage
     store = hass.data[DOMAIN]["store"]
