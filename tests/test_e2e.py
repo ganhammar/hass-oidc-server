@@ -28,6 +28,7 @@ import hashlib
 import re
 import secrets
 import time
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from homeassistant import config_entries
@@ -109,7 +110,7 @@ async def _register_client(client: ClientSessionGenerator) -> dict:
     return await resp.json()
 
 
-async def _authorize_and_get_code(
+async def _start_authorization(
     client: ClientSessionGenerator,
     *,
     client_id: str,
@@ -117,7 +118,7 @@ async def _authorize_and_get_code(
     resource: str | None,
     redirect_uri: str = REDIRECT_URI,
 ) -> str:
-    """Drive /authorize -> /continue browser-free and return the authorization code."""
+    """Send an authorization request to /authorize and return the pending request id."""
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -136,22 +137,45 @@ async def _authorize_and_get_code(
     assert resp.status == 200, await resp.text()
     match = re.search(r"oidc_request_id', '([^']+)'", await resp.text())
     assert match, "authorize did not hand back a request_id"
-    request_id = match.group(1)
+    return match.group(1)
 
+
+async def _decide(
+    client: ClientSessionGenerator, request_id: str, *, approve: bool
+) -> dict[str, list[str]]:
+    """Post the consent decision and return the query of the redirect to the client."""
     # /oidc/continue requires an authenticated HA user; hass_client carries one.
-    # Approving is what the consent screen posts.
     resp = await client.post(
         "/oidc/continue",
-        json={"request_id": request_id, "approve": True},
+        json={"request_id": request_id, "approve": approve},
         headers=FORWARDED,
     )
     assert resp.status == 200, await resp.text()
     redirect_url = (await resp.json())["redirect_url"]
+    assert redirect_url.startswith(f"{REDIRECT_URI}?"), redirect_url
+    return parse_qs(urlparse(redirect_url).query)
 
-    code_match = re.search(r"[?&]code=([^&]+)", redirect_url)
-    assert code_match, f"no code in redirect: {redirect_url}"
-    assert "state=test-state" in redirect_url
-    return code_match.group(1)
+
+async def _authorize_and_get_code(
+    client: ClientSessionGenerator,
+    *,
+    client_id: str,
+    code_challenge: str,
+    resource: str | None,
+) -> str:
+    """Drive /authorize -> /continue browser-free and return the authorization code."""
+    request_id = await _start_authorization(
+        client, client_id=client_id, code_challenge=code_challenge, resource=resource
+    )
+
+    # Approving is what the consent screen posts.
+    query = await _decide(client, request_id, approve=True)
+
+    assert query["state"] == ["test-state"]
+    # The response names the issuer that signs the tokens (RFC 9207).
+    assert query["iss"] == [EXPECTED_ISSUER]
+    assert "code" in query, f"no code in redirect: {query}"
+    return query["code"][0]
 
 
 async def _exchange_code(
@@ -341,6 +365,30 @@ async def test_pkce_rejects_wrong_verifier(
 
     assert status == 400
     assert body["error"] == "invalid_grant"
+
+
+async def test_denial_names_the_issuer(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """A denied request sends access_denied with the issuer and no code (RFC 9207)."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=RESOURCE,
+    )
+
+    query = await _decide(client, request_id, approve=False)
+
+    assert query == {
+        "error": ["access_denied"],
+        "state": ["test-state"],
+        "iss": [EXPECTED_ISSUER],
+    }
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
 
 
 async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tuple[str, str]:
@@ -557,6 +605,19 @@ async def test_discovery_metadata_advertises_endpoints(
     assert discovery["authorization_endpoint"] == f"{ISSUER_BASE}/oidc/authorize"
     assert discovery["token_endpoint"] == f"{ISSUER_BASE}/oidc/token"
     assert discovery["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
+
+
+async def test_discovery_advertises_authorization_response_iss(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """Every discovery document advertises the iss response parameter (RFC 9207)."""
+    client = await hass_client()
+    for path in DISCOVERY_PATHS:
+        resp = await client.get(path, headers=FORWARDED)
+        assert resp.status == 200
+        metadata = await resp.json()
+        assert metadata["authorization_response_iss_parameter_supported"] is True, path
+        assert metadata["issuer"] == EXPECTED_ISSUER, path
 
 
 async def _assert_registration_refused(client: ClientSessionGenerator) -> None:

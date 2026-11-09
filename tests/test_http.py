@@ -3,6 +3,7 @@
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 import pytest
@@ -440,6 +441,28 @@ async def test_discovery_omits_registration_endpoint_when_registration_is_off(vi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "view_class",
+    [
+        OIDCDiscoveryView,
+        OAuth2AuthorizationServerMetadataView,
+        OAuth2AuthorizationServerMetadataAlternateView,
+    ],
+)
+async def test_discovery_advertises_authorization_response_iss(view_class):
+    """Every discovery document tells clients to expect iss on the response (RFC 9207)."""
+    request = Mock()
+    request.headers = {}
+    request.url.origin.return_value = "https://homeassistant.local"
+    request.app = _app_with_registration(True)
+
+    response = await view_class().get(request)
+
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["authorization_response_iss_parameter_supported"] is True
+
+
+@pytest.mark.asyncio
 async def test_oidc_jwks_endpoint():
     """Test OIDC JWKS endpoint returns public key."""
     # Create mock hass with RSA keys
@@ -493,9 +516,13 @@ def _continue_hass(pending=None, clients=None):
     return hass
 
 
+CONTINUE_ISSUER = "https://ha.example.com/oidc"
+
+
 def _continue_request(hass, *, query=None, body=None):
     request = MagicMock()
     request.query = query or {}
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "ha.example.com"}
     request.app = {"hass": hass}
     request.__getitem__.return_value = Mock(id="user123")
     request.json = AsyncMock(return_value=body if body is not None else {})
@@ -667,7 +694,7 @@ async def test_oidc_continue_view_url_encodes_state():
         _continue_request(hass, body={"request_id": "req123", "approve": True})
     )
     data = json.loads(response.body.decode("utf-8"))
-    assert data["redirect_url"].endswith("&state=a%26b%3Dc%23d%2Be")
+    assert "&state=a%26b%3Dc%23d%2Be&" in data["redirect_url"]
     assert data["redirect_url"].startswith("https://example.com/callback?code=")
 
     hass = _continue_hass(pending={"req123": _pending(state=state)})
@@ -677,6 +704,7 @@ async def test_oidc_continue_view_url_encodes_state():
     data = json.loads(response.body.decode("utf-8"))
     assert data["redirect_url"] == (
         "https://example.com/callback?error=access_denied&state=a%26b%3Dc%23d%2Be"
+        "&iss=https%3A%2F%2Fha.example.com%2Foidc"
     )
 
 
@@ -714,7 +742,10 @@ async def test_oidc_continue_view_success():
 
     # Verify redirect URL
     assert data["redirect_url"].startswith("https://example.com/callback?code=")
-    assert "state=state123" in data["redirect_url"]
+    query = parse_qs(urlparse(data["redirect_url"]).query)
+    assert query["state"] == ["state123"]
+    # The issuer is named on the response (RFC 9207) as tokens and discovery name it
+    assert query["iss"] == [CONTINUE_ISSUER]
 
     # Verify authorization code was created for the authenticated user
     codes = hass.data[DOMAIN]["authorization_codes"]
@@ -740,7 +771,10 @@ async def test_oidc_continue_view_deny():
 
     assert response.status == 200
     data = json.loads(response.body.decode("utf-8"))
-    assert data["redirect_url"] == "https://example.com/callback?error=access_denied&state=state123"
+    assert data["redirect_url"] == (
+        "https://example.com/callback?error=access_denied&state=state123"
+        "&iss=https%3A%2F%2Fha.example.com%2Foidc"
+    )
     assert hass.data[DOMAIN]["authorization_codes"] == {}
     assert "req123" not in hass.data[DOMAIN]["pending_auth_requests"]
 

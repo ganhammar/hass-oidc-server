@@ -85,6 +85,16 @@ def _normalize_resource(resource: str | None) -> str | None:
     return resource
 
 
+def _issuer_for(request: web.Request) -> str:
+    """Return the issuer identifier for a request.
+
+    It is the base URL with an /oidc suffix, as RFC 8414 requires: the issuer
+    URL concatenated with /.well-known/oauth-authorization-server must return
+    the auth-server metadata, and that metadata lives under /oidc.
+    """
+    return f"{get_issuer_from_request(request)}/oidc"
+
+
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
     """Return whether clients may register themselves at /oidc/register.
 
@@ -589,6 +599,9 @@ class OIDCContinueView(HomeAssistantView):
         def build_redirect(**params: str) -> str:
             if state:
                 params["state"] = state
+            # Every response names the issuer so the client can detect a mix-up
+            # with another authorization server (RFC 9207).
+            params["iss"] = _issuer_for(request)
             return f"{redirect_uri}{separator}{urlencode(params)}"
 
         if body.get("approve") is not True:
@@ -667,6 +680,7 @@ class OIDCDiscoveryView(HomeAssistantView):
                 "at_hash",
             ],
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             discovery["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -696,6 +710,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             metadata["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -731,6 +746,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             metadata["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -1421,13 +1437,7 @@ class OIDCTokenView(HomeAssistantView):
     ) -> str:
         """Generate JWT access token."""
         now = int(time.time())
-
-        # Use dynamic issuer based on the actual base URL. The /oidc suffix is
-        # required by RFC 8414: the issuer URL concatenated with
-        # /.well-known/oauth-authorization-server must return the auth-server
-        # metadata, and that metadata lives under /oidc.
-        base_url = get_issuer_from_request(request)
-        issuer = f"{base_url}/oidc"
+        issuer = _issuer_for(request)
 
         # When a resource indicator was supplied (RFC 8707), bind aud to that
         # resource and record the client in azp. Otherwise fall back to the
@@ -1475,8 +1485,7 @@ class OIDCTokenView(HomeAssistantView):
     ) -> str:
         """Generate an OIDC ID Token (OIDC Core 1.0 §2)."""
         now = int(time.time())
-        base_url = get_issuer_from_request(request)
-        issuer = f"{base_url}/oidc"
+        issuer = _issuer_for(request)
 
         payload: dict[str, Any] = {
             "iss": issuer,
@@ -1564,10 +1573,8 @@ class OIDCUserInfoView(HomeAssistantView):
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
 
-            # Decode and verify the JWT with issuer verification. The /oidc
-            # suffix matches what the token endpoint signs into the iss claim
-            # (RFC 8414).
-            expected_issuer = f"{get_issuer_from_request(request)}/oidc"
+            # Decode and verify the JWT with issuer verification
+            expected_issuer = _issuer_for(request)
 
             payload = jwt.decode(
                 access_token,
