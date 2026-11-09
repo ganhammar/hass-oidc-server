@@ -1337,3 +1337,38 @@ async def test_client_services_show_and_end_sessions(
 
     assert registration["client_id"] not in hass.data[DOMAIN]["clients"]
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.parametrize(
+    ("service", "data"),
+    [
+        ("register_client", {"client_name": "X", "redirect_uris": REDIRECT_URI}),
+        ("revoke_client", {"client_id": CIMD_CLIENT_ID}),
+        ("update_client", {"client_id": "x", "redirect_uris": REDIRECT_URI}),
+        ("list_clients", {}),
+    ],
+)
+async def test_client_actions_require_an_admin(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_read_only_user: MockUser,
+    service: str,
+    data: dict,
+) -> None:
+    """Users who are not administrators cannot manage clients or end others' sessions."""
+    with pytest.raises(Unauthorized):
+        await hass.services.async_call(
+            DOMAIN, service, data, blocking=True, context=Context(user_id=hass_read_only_user.id)
+        )
+
+
+async def test_client_actions_run_for_an_admin_and_without_a_user(
+    setup_provider: None, hass: HomeAssistant, hass_admin_user: MockUser
+) -> None:
+    """Administrators, and automations that run without a user, can list clients."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+    for context in (Context(user_id=hass_admin_user.id), Context()):
+        response = await hass.services.async_call(
+            DOMAIN, "list_clients", {}, blocking=True, return_response=True, context=context
+        )
+        assert response == {"clients": []}

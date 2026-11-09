@@ -203,6 +203,7 @@ To use a client you registered yourself instead, register one as described above
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. The replaced token keeps working for one minute, so a retried request does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700)
 - **Access Tokens**: Valid for 1 hour by default
+- **Client Actions**: Registering, updating, revoking and listing clients, and rotating the signing key, require a Home Assistant administrator. Automations and scripts, which run without a user, can still call them
 - **Signing Key**: Kept until you [rotate it](#rotating-the-signing-key). Rotate with `keep_previous_key: false` if it may have leaked
 - **Issuer Identification**: Authorization responses name the issuer (`iss`, RFC 9207) so clients that talk to several authorization servers can detect a mix-up
 - **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session

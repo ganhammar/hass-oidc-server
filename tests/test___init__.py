@@ -35,6 +35,9 @@ def mock_hass():
     hass.services = Mock()
     hass.services.async_register = Mock()
     hass.services.async_call = AsyncMock()
+    # Service calls in these tests come from an administrator
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=Mock(is_admin=True))
     return hass
 
 

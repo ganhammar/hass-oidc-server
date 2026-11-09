@@ -11,7 +11,8 @@ from homeassistant.components.frontend import (
 )
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import Unauthorized, UnknownUser
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
@@ -38,6 +39,28 @@ from .http import (
 _LOGGER = logging.getLogger(__name__)
 
 _MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()<>#+!|~-])")
+
+
+def _admin_only(hass: HomeAssistant, handler):
+    """Wrap a service handler so only administrators can call it.
+
+    The client actions create and remove clients, end the sessions of every
+    user and list every client, so they are for administrators only.
+    Calls without a user, from automations and scripts, are allowed, as with
+    Home Assistant's own admin services. That helper cannot return a response
+    on every supported Home Assistant release, so the check is done here.
+    """
+
+    async def checked(call: ServiceCall):
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.is_admin:
+                raise Unauthorized(context=call.context)
+        return await handler(call)
+
+    return checked
 
 
 def _markdown_text(value: str) -> str:
@@ -430,11 +453,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Handle rotate_signing_key service."""
         await async_rotate_signing_key(hass, keep_previous_key=call.data[ATTR_KEEP_PREVIOUS_KEY])
 
-    hass.services.async_register(DOMAIN, "register_client", handle_register_client)
-    hass.services.async_register(DOMAIN, "revoke_client", handle_revoke_client)
-    hass.services.async_register(DOMAIN, "update_client", handle_update_client)
     hass.services.async_register(
-        DOMAIN, "list_clients", handle_list_clients, supports_response=SupportsResponse.OPTIONAL
+        DOMAIN, "register_client", _admin_only(hass, handle_register_client)
+    )
+    hass.services.async_register(DOMAIN, "revoke_client", _admin_only(hass, handle_revoke_client))
+    hass.services.async_register(DOMAIN, "update_client", _admin_only(hass, handle_update_client))
+    hass.services.async_register(
+        DOMAIN,
+        "list_clients",
+        _admin_only(hass, handle_list_clients),
+        supports_response=SupportsResponse.OPTIONAL,
     )
     async_register_admin_service(
         hass,
