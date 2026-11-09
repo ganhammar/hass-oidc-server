@@ -4,6 +4,7 @@ import logging
 import re
 import time
 
+import voluptuous as vol
 from homeassistant.components.frontend import (
     async_register_built_in_panel,
     async_remove_panel,
@@ -12,6 +13,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
 
 from .client_manager import create_client, prune_dynamic_clients, validate_redirect_uris
@@ -26,7 +28,12 @@ from .const import (
     PANEL_URL_PATH,
     STORAGE_KEY_TOKENS,
 )
-from .http import client_sessions, revoke_client_sessions, setup_http_endpoints
+from .http import (
+    async_rotate_signing_key,
+    client_sessions,
+    revoke_client_sessions,
+    setup_http_endpoints,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +54,11 @@ STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.clients"
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+ATTR_KEEP_PREVIOUS_KEY = "keep_previous_key"
+ROTATE_SIGNING_KEY_SCHEMA = vol.Schema(
+    {vol.Optional(ATTR_KEEP_PREVIOUS_KEY, default=True): cv.boolean}
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -414,11 +426,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("Listed %d OIDC clients", len(listing))
         return {"clients": listing} if call.return_response else None
 
+    async def handle_rotate_signing_key(call):
+        """Handle rotate_signing_key service."""
+        await async_rotate_signing_key(hass, keep_previous_key=call.data[ATTR_KEEP_PREVIOUS_KEY])
+
     hass.services.async_register(DOMAIN, "register_client", handle_register_client)
     hass.services.async_register(DOMAIN, "revoke_client", handle_revoke_client)
     hass.services.async_register(DOMAIN, "update_client", handle_update_client)
     hass.services.async_register(
         DOMAIN, "list_clients", handle_list_clients, supports_response=SupportsResponse.OPTIONAL
+    )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        "rotate_signing_key",
+        handle_rotate_signing_key,
+        schema=ROTATE_SIGNING_KEY_SCHEMA,
     )
 
     _LOGGER.info("OIDC Provider initialized")

@@ -617,3 +617,56 @@ def test_validate_access_token_rejects_tokens_that_are_not_access_tokens(
     with caplog.at_level(logging.WARNING, logger="custom_components.oidc_provider.token_validator"):
         assert validate_access_token(hass, token, "https://ha.example.com") is None
     assert any("Not an access token" in record.getMessage() for record in caplog.records)
+
+
+@pytest.fixture
+def hass_with_rotated_keys(mock_hass_with_keys):
+    """Publish the current key as kid "current" and a retained previous key as "previous"."""
+    hass, current_key = mock_hass_with_keys
+    previous_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+    hass.data[DOMAIN]["jwt_kid"] = "current"
+    hass.data[DOMAIN]["jwt_verification_keys"] = {
+        "current": current_key.public_key(),
+        "previous": previous_key.public_key(),
+    }
+    return hass, current_key, previous_key
+
+
+@pytest.mark.parametrize(
+    ("signer", "kid", "valid"),
+    [
+        ("current", "current", True),
+        ("previous", "previous", True),
+        # Without a kid the current key is used
+        ("current", None, True),
+        ("previous", None, False),
+        # The kid picks the key, so a token cannot borrow another key's kid
+        ("current", "previous", False),
+        ("previous", "current", False),
+    ],
+)
+def test_validate_access_token_picks_key_by_kid(hass_with_rotated_keys, signer, kid, valid):
+    """The signature is checked with the published key the token's kid names."""
+    hass, current_key, previous_key = hass_with_rotated_keys
+    signing_key = current_key if signer == "current" else previous_key
+    headers = {"kid": kid} if kid is not None else {}
+
+    token = _encode(signing_key, _resource_token_payload("test_client"), headers=headers)
+
+    result = validate_access_token(hass, token, "https://ha.example.com")
+    assert (result is not None) is valid
+
+
+def test_validate_access_token_rejects_unpublished_kid(hass_with_rotated_keys, caplog):
+    """A token naming a key that is not published, such as a dropped one, is refused."""
+    hass, current_key, _ = hass_with_rotated_keys
+
+    token = _encode(current_key, _resource_token_payload("test_client"), headers={"kid": "dropped"})
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.oidc_provider.token_validator"):
+        assert validate_access_token(hass, token, "https://ha.example.com") is None
+    assert any(
+        "not published" in record.getMessage() and "kid='dropped'" in record.getMessage()
+        for record in caplog.records
+    )

@@ -387,52 +387,101 @@ def _prune_expired(entries: dict[str, dict[str, Any]]) -> None:
         del entries[key]
 
 
-async def _load_or_generate_keys(hass: HomeAssistant) -> tuple[Any, str]:
-    """Load existing RSA keys from storage or generate new ones.
+def _generate_signing_key() -> dict[str, Any]:
+    """Generate an RSA signing key in its stored form: private_key_pem, kid and created_at."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return {
+        "private_key_pem": private_pem.decode(),
+        "kid": str(uuid.uuid4()),
+        "created_at": time.time(),
+    }
 
-    Returns:
-        Tuple of (private_key, kid)
+
+async def _load_or_generate_keys(store: Store) -> dict[str, Any]:
+    """Load the stored signing keys, generating and storing a signing key if there is none.
+
+    The stored dict holds the current signing key at its top level
+    (private_key_pem, kid, created_at). After a rotation that kept the key it
+    replaced, previous_key holds that key's kid and public_key_pem. A dict
+    without previous_key is a single current key, and releases that predate
+    rotation read the same top-level fields.
     """
-    store = Store(hass, STORAGE_VERSION, STORAGE_KEY_KEYS)
     stored_keys = await store.async_load()
 
     if stored_keys and "private_key_pem" in stored_keys:
-        # Load existing key
         _LOGGER.info("Loading existing RSA key from storage")
-        private_key = serialization.load_pem_private_key(
-            stored_keys["private_key_pem"].encode(),
-            password=None,
-            backend=default_backend(),
-        )
-        kid = stored_keys.get("kid", "1")  # Fallback to "1" for old keys
-    else:
-        # Generate new key
-        _LOGGER.info("Generating new RSA key pair for JWT signing")
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048, backend=default_backend()
+        return stored_keys
+
+    _LOGGER.info("Generating new RSA key pair for JWT signing")
+    stored_keys = _generate_signing_key()
+    await store.async_save(stored_keys)
+    _LOGGER.info("RSA key pair generated and saved to storage with kid: %s", stored_keys["kid"])
+    return stored_keys
+
+
+def _use_signing_keys(hass: HomeAssistant, stored_keys: dict[str, Any]) -> None:
+    """Make the stored keys the ones tokens are signed and verified with.
+
+    jwt_private_key, jwt_public_key and jwt_kid are the current key, which signs
+    every token. jwt_verification_keys maps the kid of every published key, the
+    current one first, to its public key.
+    """
+    private_key = serialization.load_pem_private_key(
+        stored_keys["private_key_pem"].encode(),
+        password=None,
+        backend=default_backend(),
+    )
+    kid = stored_keys.get("kid", "1")  # Fallback to "1" for old keys
+    verification_keys = {kid: private_key.public_key()}
+
+    previous_key = stored_keys.get("previous_key")
+    if previous_key:
+        verification_keys[previous_key["kid"]] = serialization.load_pem_public_key(
+            previous_key["public_key_pem"].encode(), backend=default_backend()
         )
 
-        # Generate unique key ID
-        kid = str(uuid.uuid4())
+    domain_data = hass.data[DOMAIN]
+    domain_data["jwt_private_key"] = private_key
+    domain_data["jwt_public_key"] = verification_keys[kid]
+    domain_data["jwt_kid"] = kid
+    domain_data["jwt_verification_keys"] = verification_keys
 
-        # Save to storage
-        private_pem = private_key.private_bytes(
+
+async def async_rotate_signing_key(hass: HomeAssistant, keep_previous_key: bool) -> None:
+    """Replace the signing key with a new one and persist the result.
+
+    With keep_previous_key the replaced key stays published and keeps verifying
+    the tokens it signed until the next rotation, so they work until they
+    expire. Without it the replaced key is dropped at once and every token it
+    signed is refused, which is the response to a leaked key.
+    """
+    stored_keys = await hass.async_add_executor_job(_generate_signing_key)
+    domain_data = hass.data[DOMAIN]
+    replaced_kid = domain_data["jwt_kid"]
+
+    if keep_previous_key:
+        public_pem = domain_data["jwt_public_key"].public_bytes(
             encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
+        stored_keys["previous_key"] = {"kid": replaced_kid, "public_key_pem": public_pem.decode()}
 
-        await store.async_save(
-            {
-                "private_key_pem": private_pem.decode(),
-                "kid": kid,
-                "created_at": time.time(),
-            }
-        )
+    await domain_data["key_store"].async_save(stored_keys)
+    _use_signing_keys(hass, stored_keys)
 
-        _LOGGER.info("RSA key pair generated and saved to storage with kid: %s", kid)
-
-    return private_key, kid
+    _LOGGER.info(
+        "Rotated the JWT signing key to kid %s; the previous key %s was %s",
+        stored_keys["kid"],
+        replaced_kid,
+        "kept for verification" if keep_previous_key else "dropped",
+    )
 
 
 def _resolve_user_groups(user: Any) -> list[str]:
@@ -460,12 +509,11 @@ def _looks_like_email(value: str) -> bool:
 
 async def setup_http_endpoints(hass: HomeAssistant) -> None:
     """Set up the OIDC HTTP endpoints."""
-    # Load or generate RSA key pair for JWT signing
+    # Load or generate the RSA keys tokens are signed and verified with
     if "jwt_private_key" not in hass.data[DOMAIN]:
-        private_key, kid = await _load_or_generate_keys(hass)
-        hass.data[DOMAIN]["jwt_private_key"] = private_key
-        hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
-        hass.data[DOMAIN]["jwt_kid"] = kid
+        key_store = Store(hass, STORAGE_VERSION, STORAGE_KEY_KEYS)
+        hass.data[DOMAIN]["key_store"] = key_store
+        _use_signing_keys(hass, await _load_or_generate_keys(key_store))
 
     # Initialize rate limiting storage
     if "rate_limit_attempts" not in hass.data[DOMAIN]:
@@ -1636,11 +1684,6 @@ class OIDCJWKSView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         """Handle JWKS request."""
         hass = request.app["hass"]
-        public_key = hass.data[DOMAIN]["jwt_public_key"]
-        kid = hass.data[DOMAIN]["jwt_kid"]
-
-        # Get the public key numbers
-        public_numbers = public_key.public_numbers()
 
         # Convert modulus (n) and exponent (e) to base64url format
         def int_to_base64url(value: int) -> str:
@@ -1650,8 +1693,11 @@ class OIDCJWKSView(HomeAssistantView):
             # Base64url encode (no padding)
             return base64.urlsafe_b64encode(value_bytes).decode("utf-8").rstrip("=")
 
-        jwks = {
-            "keys": [
+        # Every key that verifies tokens is published, the signing key first
+        keys = []
+        for kid, public_key in hass.data[DOMAIN]["jwt_verification_keys"].items():
+            public_numbers = public_key.public_numbers()
+            keys.append(
                 {
                     "kty": "RSA",
                     "use": "sig",
@@ -1660,10 +1706,9 @@ class OIDCJWKSView(HomeAssistantView):
                     "n": int_to_base64url(public_numbers.n),  # Modulus
                     "e": int_to_base64url(public_numbers.e),  # Exponent
                 }
-            ]
-        }
+            )
 
-        return web.json_response(jwks)
+        return web.json_response({"keys": keys})
 
 
 class OIDCRegisterView(HomeAssistantView):

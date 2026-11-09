@@ -73,7 +73,9 @@ def _build_token_hass(
             "refresh_tokens": refresh_token_data or {},
             "rate_limit_attempts": {},
             "jwt_private_key": private_key,
+            "jwt_public_key": private_key.public_key(),
             "jwt_kid": "test-kid-1",
+            "jwt_verification_keys": {"test-kid-1": private_key.public_key()},
             "token_store": mock_token_store,
         }
     }
@@ -640,7 +642,6 @@ async def test_validate_access_token_rejects_id_token():
 
     response = await OIDCTokenView().post(_post_authorization_code(hass, code_verifier=verifier))
     body = json.loads(response.body.decode("utf-8"))
-    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
 
     assert jwt.decode(body["id_token"], options={"verify_signature": False})["aud"] == "test_client"
     assert validate_access_token(hass, body["id_token"], _FIXED_ISSUER) is None

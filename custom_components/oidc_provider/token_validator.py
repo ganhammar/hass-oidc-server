@@ -130,12 +130,23 @@ def decode_access_token(
     Checks the signature, expiry and issuer, and that the token is an access
     token rather than an ID token. The audience is left to the caller.
 
+    The signature is checked with the published key named by the token's kid
+    header, or with the current signing key when the token has no kid.
+
     Raises:
         jwt.InvalidTokenError: The token fails one of those checks.
     """
+    kid = jwt.get_unverified_header(token).get("kid")
+    if kid is None:
+        public_key = domain_data["jwt_public_key"]
+    else:
+        public_key = domain_data.get("jwt_verification_keys", {}).get(kid)
+        if public_key is None:
+            raise jwt.InvalidTokenError("Signed with a key that is not published")
+
     decoded = jwt.decode_complete(
         token,
-        domain_data["jwt_public_key"],
+        public_key,
         algorithms=["RS256"],
         issuer=expected_issuer,
         options={"verify_aud": False},

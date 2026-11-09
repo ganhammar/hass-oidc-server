@@ -65,3 +65,15 @@ list_clients:
   name: List OIDC Clients
   description: Display all OIDC clients with their IDs, redirect URIs and number of active sessions, including clients signed in through a metadata document (client secrets are hidden). Also returns the list as a response.
   fields: {}
+
+rotate_signing_key:
+  name: Rotate Signing Key
+  description: Replace the key that signs access and ID tokens with a new one. Only administrators can run this action.
+  fields:
+    keep_previous_key:
+      name: Keep previous key
+      description: Keep publishing the old key so tokens it signed stay valid until they expire (at most an hour). Turn this off if the key may have leaked; every outstanding access and ID token then stops working at once.
+      required: false
+      default: true
+      selector:
+        boolean:

@@ -4,6 +4,7 @@ import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import voluptuous as vol
 from homeassistant.components.frontend import DATA_PANELS
 
 from custom_components.oidc_provider import (
@@ -289,7 +290,7 @@ class TestAsyncSetupEntry:
 
         await async_setup_entry(mock_hass, mock_config_entry)
 
-        assert mock_hass.services.async_register.call_count == 4
+        assert mock_hass.services.async_register.call_count == 5
         registered_services = [
             call[0][1] for call in mock_hass.services.async_register.call_args_list
         ]
@@ -297,6 +298,7 @@ class TestAsyncSetupEntry:
         assert "revoke_client" in registered_services
         assert "update_client" in registered_services
         assert "list_clients" in registered_services
+        assert "rotate_signing_key" in registered_services
 
 
 class TestAsyncUnloadEntry:
@@ -774,6 +776,75 @@ class TestListClientsService:
         assert "No clients registered" in notification_call[0][2]["message"]
 
 
+class TestRotateSigningKeyService:
+    """Test rotate_signing_key service registration and handler."""
+
+    @pytest.mark.parametrize(
+        ("data", "keep_previous_key"),
+        [({}, True), ({"keep_previous_key": True}, True), ({"keep_previous_key": False}, False)],
+    )
+    @patch("custom_components.oidc_provider.async_rotate_signing_key", new_callable=AsyncMock)
+    @patch("custom_components.oidc_provider.async_register_admin_service")
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_rotate_signing_key_is_an_admin_service(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_register_admin,
+        mock_rotate,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+        data,
+        keep_previous_key,
+    ):
+        """Only admins can rotate, and the previous key is kept unless told otherwise."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+
+        await async_setup_entry(mock_hass, mock_config_entry)
+
+        mock_register_admin.assert_called_once()
+        hass, domain, service, handler = mock_register_admin.call_args[0]
+        schema = mock_register_admin.call_args[1]["schema"]
+        assert (hass, domain, service) == (mock_hass, DOMAIN, "rotate_signing_key")
+
+        call = Mock()
+        call.data = schema(data)
+        await handler(call)
+
+        mock_rotate.assert_awaited_once_with(mock_hass, keep_previous_key=keep_previous_key)
+
+    @patch("custom_components.oidc_provider.async_register_admin_service")
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_rotate_signing_key_rejects_unknown_fields(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_register_admin,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """The schema refuses fields it does not define and values that are not booleans."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+
+        await async_setup_entry(mock_hass, mock_config_entry)
+
+        schema = mock_register_admin.call_args[1]["schema"]
+        with pytest.raises(vol.Invalid):
+            schema({"keep_old_key": True})
+        with pytest.raises(vol.Invalid):
+            schema({"keep_previous_key": "sometimes"})
+
+
 class TestKeyPersistence:
     """Test RSA key persistence."""
 
@@ -844,6 +915,11 @@ class TestKeyPersistence:
         mock_store.async_save.assert_not_called()
         # Verify the kid matches what was loaded
         assert mock_hass.data[DOMAIN]["jwt_kid"] == "test-existing-kid"
+        # The stored key is the only one tokens are verified with
+        assert mock_hass.data[DOMAIN]["jwt_verification_keys"] == {
+            "test-existing-kid": mock_hass.data[DOMAIN]["jwt_public_key"]
+        }
+        assert mock_hass.data[DOMAIN]["key_store"] is mock_store
 
 
 class TestMigrateEntry:

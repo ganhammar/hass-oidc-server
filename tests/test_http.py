@@ -16,10 +16,14 @@ from custom_components.oidc_provider.http import (
     OIDCDiscoveryView,
     OIDCJWKSView,
     OIDCRegisterView,
+    _load_or_generate_keys,
+    _use_signing_keys,
+    async_rotate_signing_key,
 )
 from custom_components.oidc_provider.token_validator import (
     _get_ha_external_url,
     get_issuer_from_request,
+    validate_access_token,
 )
 
 
@@ -480,6 +484,7 @@ async def test_oidc_jwks_endpoint():
         DOMAIN: {
             "jwt_public_key": public_key,
             "jwt_kid": "test-kid-1",
+            "jwt_verification_keys": {"test-kid-1": public_key},
         }
     }
 
@@ -500,6 +505,145 @@ async def test_oidc_jwks_endpoint():
     assert key["kid"] == "test-kid-1"
     assert "n" in key  # modulus
     assert "e" in key  # exponent
+
+
+def _stored_signing_key(kid=None):
+    """Return an RSA private key and the dict the key store holds for it."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    stored = {
+        "private_key_pem": private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode(),
+        "created_at": 1234567890.0,
+    }
+    if kid is not None:
+        stored["kid"] = kid
+    return private_key, stored
+
+
+def _key_store(stored=None):
+    store = Mock()
+    store.async_load = AsyncMock(return_value=stored)
+    store.async_save = AsyncMock()
+    return store
+
+
+async def _published_kids(hass):
+    request = Mock()
+    request.app = {"hass": hass}
+    response = await OIDCJWKSView().get(request)
+    return [key["kid"] for key in json.loads(response.body.decode("utf-8"))["keys"]]
+
+
+def _sign_access_token(private_key, kid):
+    now = int(time.time())
+    payload = {
+        "sub": "user123",
+        "iat": now,
+        "exp": now + 3600,
+        "iss": "https://ha.example.com/oidc",
+        "aud": "test_client",
+        "token_use": "access",
+    }
+    return jwt.encode(payload, private_key, algorithm="RS256", headers={"kid": kid})
+
+
+@pytest.mark.parametrize(("kid", "expected_kid"), [("kid-a", "kid-a"), (None, "1")])
+async def test_signing_key_in_single_key_format_is_loaded_as_is(hass, kid, expected_kid):
+    """A stored key without previous_key is the current key and the only published one."""
+    private_key, stored = _stored_signing_key(kid)
+    store = _key_store(stored)
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}}
+
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+
+    store.async_save.assert_not_called()
+    domain_data = hass.data[DOMAIN]
+    assert domain_data["jwt_kid"] == expected_kid
+    assert (
+        domain_data["jwt_public_key"].public_numbers() == private_key.public_key().public_numbers()
+    )
+    assert domain_data["jwt_verification_keys"] == {expected_kid: domain_data["jwt_public_key"]}
+    assert await _published_kids(hass) == [expected_kid]
+
+    token = _sign_access_token(private_key, expected_kid)
+    assert validate_access_token(hass, token, "https://ha.example.com") is not None
+
+
+async def test_signing_key_is_generated_and_stored_when_none_exists(hass):
+    """Without a stored key a new one is generated, stored and used."""
+    store = _key_store(None)
+    hass.data[DOMAIN] = {}
+
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+
+    saved = store.async_save.call_args[0][0]
+    assert set(saved) == {"private_key_pem", "kid", "created_at"}
+    assert hass.data[DOMAIN]["jwt_kid"] == saved["kid"]
+    assert await _published_kids(hass) == [saved["kid"]]
+
+
+async def _key_rotation_hass(hass):
+    """Set hass up with stored key kid-a and return (store, key a, a token it signed)."""
+    private_key, stored = _stored_signing_key("kid-a")
+    store = _key_store(stored)
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}, "key_store": store}
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+    return store, private_key, _sign_access_token(private_key, "kid-a")
+
+
+async def test_rotate_signing_key_keeps_previous_key(hass):
+    """The replaced key stays published and keeps verifying until the next rotation."""
+    store, _, token_a = await _key_rotation_hass(hass)
+
+    await async_rotate_signing_key(hass, keep_previous_key=True)
+
+    domain_data = hass.data[DOMAIN]
+    kid_b = domain_data["jwt_kid"]
+    assert kid_b != "kid-a"
+    assert await _published_kids(hass) == [kid_b, "kid-a"]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is not None
+
+    saved = store.async_save.call_args[0][0]
+    assert saved["kid"] == kid_b
+    assert saved["previous_key"]["kid"] == "kid-a"
+    # Only the public half of the replaced key is kept
+    assert set(saved["previous_key"]) == {"kid", "public_key_pem"}
+
+    # What was stored loads back into the same keys after a restart
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}}
+    _use_signing_keys(hass, await _load_or_generate_keys(_key_store(saved)))
+    assert await _published_kids(hass) == [kid_b, "kid-a"]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is not None
+
+    # The next rotation keeps only the key it replaces
+    hass.data[DOMAIN]["key_store"] = store
+    await async_rotate_signing_key(hass, keep_previous_key=True)
+
+    kid_c = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(hass) == [kid_c, kid_b]
+    assert store.async_save.call_args[0][0]["previous_key"]["kid"] == kid_b
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is None
+
+
+async def test_rotate_signing_key_drops_previous_key(hass):
+    """Without keeping it, the replaced key is unpublished and its tokens are refused."""
+    store, _, token_a = await _key_rotation_hass(hass)
+
+    await async_rotate_signing_key(hass, keep_previous_key=False)
+
+    kid_b = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(hass) == [kid_b]
+    assert "previous_key" not in store.async_save.call_args[0][0]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is None
+
+    token_b = _sign_access_token(hass.data[DOMAIN]["jwt_private_key"], kid_b)
+    assert validate_access_token(hass, token_b, "https://ha.example.com") is not None
 
 
 def _continue_hass(pending=None, clients=None):
