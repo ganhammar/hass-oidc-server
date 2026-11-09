@@ -6,7 +6,7 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 
 - **Standards-compliant OIDC server** with discovery endpoint
 - **Integrates with Home Assistant's native authentication** including TOTP/2FA
-- **JWT-based access tokens** with RSA signing
+- **JWT access tokens** (RFC 9068) with RSA signing and key rotation
 - **Support for authorization code flow** with refresh tokens
 - **Claude and other MCP clients connect without registration** through Client ID Metadata Documents
 - **Easy client registration** via Home Assistant services
@@ -151,6 +151,21 @@ Revoking a client also ends every session it holds, so its refresh tokens stop w
 
 Each user can see the applications signed in with their Home Assistant account at `https://your-ha-instance/oidc_login`, with when each signed in and was last used, and sign any of them out. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
 
+### Rotating the Signing Key
+
+Access and ID tokens are signed with an RSA key that is generated on first start and kept in Home Assistant's storage. To replace it, an administrator runs **"Rotate Signing Key"** (`oidc_provider.rotate_signing_key`):
+
+```yaml
+action: oidc_provider.rotate_signing_key
+data:
+  keep_previous_key: true
+```
+
+- **`keep_previous_key: true`** (default): the old key stays published and keeps verifying the tokens it signed until the next rotation, so clients keep working until those tokens expire (within an hour). Use this for routine rotation.
+- **`keep_previous_key: false`**: the old key is dropped at once and every outstanding access and ID token stops working. Use this if the key may have leaked.
+
+Refresh tokens are not signed with this key, so clients holding one get new tokens without signing in again.
+
 ### OIDC Endpoints
 
 Once installed, your Home Assistant instance exposes the following OIDC endpoints:
@@ -160,9 +175,15 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Authorization**: `https://your-ha-instance/oidc/authorize`
 - **Token**: `https://your-ha-instance/oidc/token`
 - **UserInfo**: `https://your-ha-instance/oidc/userinfo`
-- **JWKS**: `https://your-ha-instance/oidc/jwks`
+- **JWKS**: `https://your-ha-instance/oidc/jwks` (the current signing key, and the previous one after a rotation that kept it)
 - **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it
 - **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
+
+Both redirects back to the client, with `code` on approval or `error=access_denied` on denial, carry an `iss` parameter with the issuer (RFC 9207), and the discovery documents advertise `authorization_response_iss_parameter_supported`.
+
+### Tokens
+
+Access tokens are JWTs in the RFC 9068 profile. The header has `typ: at+jwt` and the `kid` of the signing key, and the claims include `iss`, `sub`, `aud`, `client_id`, `scope`, `jti`, `iat`, `exp` and `token_use: access`. `/oidc/userinfo` and the validator hass-mcp-server uses accept only access tokens, so an ID token is refused there.
 
 ### Using with Claude Connectors
 
@@ -182,6 +203,8 @@ To use a client you registered yourself instead, register one as described above
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. The replaced token keeps working for one minute, so a retried request does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700)
 - **Access Tokens**: Valid for 1 hour by default
+- **Signing Key**: Kept until you [rotate it](#rotating-the-signing-key). Rotate with `keep_previous_key: false` if it may have leaked
+- **Issuer Identification**: Authorization responses name the issuer (`iss`, RFC 9207) so clients that talk to several authorization servers can detect a mix-up
 - **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session
 - **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
 - **Client Metadata Documents**: Anyone who can reach your instance can start a sign-in that makes Home Assistant fetch a URL. The fetch only reaches public addresses over HTTPS and is size, time and rate limited, as [described above](#client-id-metadata-documents). Sign-ins through these clients always go through the consent screen
