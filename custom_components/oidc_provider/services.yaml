@@ -26,7 +26,7 @@ register_client:
 
 revoke_client:
   name: Revoke OIDC Client
-  description: Revoke an existing OIDC client. Use "List OIDC Clients" to see all client IDs.
+  description: Revoke an OIDC client and end every session it holds. Use "List OIDC Clients" to see all client IDs. For a client that signed in with a metadata document, give its URL client ID to end its sessions.
   fields:
     client_id:
       name: Client ID
@@ -63,5 +63,5 @@ update_client:
 
 list_clients:
   name: List OIDC Clients
-  description: Display all registered OIDC clients with their IDs and redirect URIs (client secrets are hidden)
+  description: Display all OIDC clients with their IDs, redirect URIs and number of active sessions, including clients signed in through a metadata document (client secrets are hidden). Also returns the list as a response.
   fields: {}

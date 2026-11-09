@@ -1,5 +1,7 @@
 // OIDC login panel. Shows the consent screen for a pending authorization
-// request and completes the redirect back to the client.
+// request and completes the redirect back to the client. Opened without a
+// pending request, it lists the applications signed in as the current user
+// and lets them end those sessions.
 //
 // The layout mirrors Home Assistant's own login page (ha-authorize): a
 // centered column with the HA icon above a card, built from HA's CSS
@@ -11,6 +13,9 @@ const SCOPE_DESCRIPTIONS = {
   email: 'Your email address',
   groups: 'Your group memberships',
 };
+
+const SESSIONS_ERROR_HINT =
+  'Your connected applications could not be loaded or changed. Reload the page to try again.';
 
 const STYLES = `
   .oidc-page {
@@ -78,6 +83,16 @@ const STYLES = `
   .action + .action {
     margin-top: 8px;
   }
+  .oidc-session {
+    padding: 12px 0;
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+  }
+  .oidc-session .action {
+    margin-top: 8px;
+  }
+  .oidc-session-meta {
+    color: var(--secondary-text-color, #727272);
+  }
 `;
 
 function escapeHtml(value) {
@@ -108,10 +123,12 @@ class OidcLoginPanel extends HTMLElement {
   async connectedCallback() {
     const requestId = sessionStorage.getItem('oidc_request_id');
     if (!requestId) {
-      this._renderCard(`
-        <h1>No pending request</h1>
-        <p>There is no authorization request waiting for you. Start again from the application that sent you here.</p>
-      `);
+      try {
+        await this._waitForHass();
+        await this._renderSessions();
+      } catch (error) {
+        this._renderError(error, SESSIONS_ERROR_HINT);
+      }
       return;
     }
 
@@ -214,6 +231,48 @@ class OidcLoginPanel extends HTMLElement {
     window.location.href = data.redirect_url;
   }
 
+  async _renderSessions() {
+    const { sessions } = await this._fetchJson('/oidc/sessions');
+    const formatTime = (seconds) => (seconds ? new Date(seconds * 1000).toLocaleString() : 'never');
+    const items = sessions.map((session) => {
+      const host = session.client_host ? ` from ${escapeHtml(session.client_host)}` : '';
+      return `
+        <div class="oidc-session">
+          <b>${escapeHtml(session.client_name)}</b>${host}
+          <div class="oidc-session-meta">Signed in ${escapeHtml(formatTime(session.signed_in_at))}, last used ${escapeHtml(formatTime(session.last_used_at))}</div>
+          <div class="action">
+            <ha-button appearance="plain" variant="danger" data-session="${escapeHtml(session.session_id)}">Sign out</ha-button>
+          </div>
+        </div>
+      `;
+    });
+
+    this._renderCard(`
+      <h1>Connected applications</h1>
+      ${
+        items.length
+          ? `<p>These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.</p>${items.join('')}`
+          : '<p>No applications are signed in with your Home Assistant account.</p>'
+      }
+    `);
+
+    for (const button of this.querySelectorAll('ha-button[data-session]')) {
+      button.addEventListener('click', () => this._endSession(button.dataset.session));
+    }
+  }
+
+  async _endSession(sessionId) {
+    for (const button of this.querySelectorAll('ha-button')) {
+      button.disabled = true;
+    }
+    try {
+      await this._fetchJson(`/oidc/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      await this._renderSessions();
+    } catch (error) {
+      this._renderError(error, SESSIONS_ERROR_HINT);
+    }
+  }
+
   async _fetchJson(url, init = {}) {
     const response = await fetch(url, {
       ...init,
@@ -255,11 +314,14 @@ class OidcLoginPanel extends HTMLElement {
     });
   }
 
-  _renderError(error) {
+  _renderError(
+    error,
+    hint = 'The authorization could not be completed. Close this page and try again from the application.'
+  ) {
     this._renderCard(
       `
         <h1>Something went wrong</h1>
-        <p>The authorization could not be completed. Close this page and try again from the application.</p>
+        <p>${escapeHtml(hint)}</p>
       `,
       `<ha-alert alert-type="error">${escapeHtml(error.message)}</ha-alert>`
     );

@@ -856,3 +856,115 @@ async def test_pending_authorizations_are_capped(
         request_ids.append(re.search(r"oidc_request_id', '([^']+)'", await resp.text()).group(1))
 
     assert list(hass.data[DOMAIN]["pending_auth_requests"]) == request_ids[1:]
+
+
+async def _signed_in(client: ClientSessionGenerator) -> tuple[dict, dict]:
+    """Register a client and sign in through it. Returns (registration, token response)."""
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    status, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, body
+    return registration, body
+
+
+async def test_client_revokes_its_session(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """A client revoking its refresh token at /oidc/revoke ends the session (RFC 7009)."""
+    client = await hass_client()
+    registration, tokens = await _signed_in(client)
+
+    resp = await client.get(DISCOVERY_PATHS[0], headers=FORWARDED)
+    assert (await resp.json())["revocation_endpoint"] == f"{ISSUER_BASE}/oidc/revoke"
+
+    resp = await client.post(
+        "/oidc/revoke",
+        data={
+            "token": tokens["refresh_token"],
+            "token_type_hint": "refresh_token",
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+        },
+        headers=FORWARDED,
+    )
+    assert resp.status == 200
+
+    status, body = await _refresh(client, registration, tokens["refresh_token"])
+    assert (status, body["error"]) == (400, "invalid_grant")
+
+
+async def test_user_lists_and_ends_their_sessions(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """The signed-in user sees the applications using their account and can sign one out."""
+    client = await hass_client()
+    registration, tokens = await _signed_in(client)
+
+    resp = await client.get("/oidc/sessions")
+    [session] = (await resp.json())["sessions"]
+    assert session["client_name"] == "Test MCP Client"
+    assert session["client_id"] == registration["client_id"]
+    assert session["scopes"] == ["openid", "profile"]
+
+    resp = await client.delete(f"/oidc/sessions/{session['session_id']}")
+    assert resp.status == 200
+
+    assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
+    resp = await client.get("/oidc/sessions")
+    assert (await resp.json())["sessions"] == []
+
+
+async def test_client_services_show_and_end_sessions(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    metadata_document: list[str],
+) -> None:
+    """list_clients counts sessions, metadata document clients too; revoke_client ends them."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+    client = await hass_client()
+    registration, tokens = await _signed_in(client)
+
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=CIMD_CLIENT_ID,
+        code_challenge=challenge,
+        resource=RESOURCE,
+        redirect_uri=LOOPBACK_REDIRECT_URI,
+    )
+    status, cimd_tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=CIMD_CLIENT_ID,
+        client_secret="",
+        code_verifier=verifier,
+        redirect_uri=LOOPBACK_REDIRECT_URI,
+    )
+    assert status == 200
+
+    response = await hass.services.async_call(
+        DOMAIN, "list_clients", {}, blocking=True, return_response=True
+    )
+    listed = {entry["client_id"]: entry for entry in response["clients"]}
+    assert listed[registration["client_id"]]["active_sessions"] == 1
+    assert listed[CIMD_CLIENT_ID] == {
+        "client_id": CIMD_CLIENT_ID,
+        "client_name": "Claude Code",
+        "client_host": "claude.ai",
+        "active_sessions": 1,
+    }
+
+    for client_id in (registration["client_id"], CIMD_CLIENT_ID):
+        await hass.services.async_call(
+            DOMAIN, "revoke_client", {"client_id": client_id}, blocking=True
+        )
+
+    assert registration["client_id"] not in hass.data[DOMAIN]["clients"]
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}

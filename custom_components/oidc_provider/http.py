@@ -115,6 +115,16 @@ def _client_authentication_metadata(hass: HomeAssistant) -> dict[str, Any]:
     return metadata
 
 
+def _revocation_metadata(hass: HomeAssistant, base_url: str) -> dict[str, Any]:
+    """Return the discovery entries for the revocation endpoint (RFC 7009, RFC 8414)."""
+    return {
+        "revocation_endpoint": f"{base_url}/oidc/revoke",
+        "revocation_endpoint_auth_methods_supported": _client_authentication_metadata(hass)[
+            "token_endpoint_auth_methods_supported"
+        ],
+    }
+
+
 def _is_public_client(client: dict[str, Any]) -> bool:
     """Return whether a client authenticates without a secret.
 
@@ -234,6 +244,123 @@ async def _revoke_code_grant(hass: HomeAssistant, grant: dict[str, Any]) -> None
         await _save_refresh_tokens(hass)
 
 
+def _session_key(token: str, data: dict[str, Any]) -> str:
+    """Return what ties the refresh tokens of one sign-in together.
+
+    That is the token family. A token stored before families existed is a
+    session of its own until its first refresh puts it in one.
+    """
+    return data.get("family") or token
+
+
+def _session_id(key: str) -> str:
+    """Return the identifier a session is listed and revoked by.
+
+    It is derived from the session key so the family id, which prefixes every
+    refresh token of the session, is never shown.
+    """
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+
+def _live_sessions(hass: HomeAssistant) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """Group the unexpired refresh tokens by session key."""
+    now = time.time()
+    sessions: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for token, data in hass.data[DOMAIN]["refresh_tokens"].items():
+        if data["expires_at"] >= now:
+            sessions.setdefault(_session_key(token, data), []).append((token, data))
+    return sessions
+
+
+def _revoke_session(hass: HomeAssistant, key: str) -> bool:
+    """Drop every refresh token of a session. Returns whether any was stored."""
+    refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
+    doomed = [token for token, data in refresh_tokens.items() if _session_key(token, data) == key]
+    for token in doomed:
+        del refresh_tokens[token]
+    return bool(doomed)
+
+
+def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
+    """Return the session key and client_id a refresh token belongs to.
+
+    The token may be the current one of its session or one it replaced, which
+    is traced through its family prefix.
+    """
+    refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
+    data = refresh_tokens.get(token)
+    if data is not None:
+        return _session_key(token, data), data["client_id"]
+    family = _refresh_token_family(token)
+    for stored_token, data in refresh_tokens.items():
+        if data.get("previous") == token or (family and data.get("family") == family):
+            return _session_key(stored_token, data), data["client_id"]
+    return None
+
+
+def _client_display(hass: HomeAssistant, client_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Return how a session's client is named in lists of sessions."""
+    client = hass.data[DOMAIN].get("clients", {}).get(client_id)
+    if client is not None:
+        name = client.get("client_name") or client_id
+    else:
+        name = data.get("client_name") or client_id
+    return {
+        "client_id": client_id,
+        "client_name": name,
+        "client_host": client_id_host(client_id) if is_client_id_url(client_id) else None,
+    }
+
+
+def user_sessions(hass: HomeAssistant, user_id: str) -> list[dict[str, Any]]:
+    """Return a user's live sessions, most recently used first."""
+    sessions = []
+    for key, tokens in _live_sessions(hass).items():
+        _, data = tokens[0]
+        if data.get("user_id") != user_id:
+            continue
+        last_used = max((d.get("issued_at") or 0 for _, d in tokens), default=0)
+        sessions.append(
+            {
+                "session_id": _session_id(key),
+                **_client_display(hass, data["client_id"], data),
+                "scopes": (data.get("scope") or "").split(),
+                "signed_in_at": data.get("auth_time"),
+                "last_used_at": last_used or None,
+                "expires_at": int(data["expires_at"]),
+            }
+        )
+    sessions.sort(key=lambda session: session["last_used_at"] or 0, reverse=True)
+    return sessions
+
+
+def client_sessions(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
+    """Return each client with live sessions: its display details and session count."""
+    clients: dict[str, dict[str, Any]] = {}
+    for tokens in _live_sessions(hass).values():
+        _, data = tokens[0]
+        entry = clients.setdefault(
+            data["client_id"],
+            {**_client_display(hass, data["client_id"], data), "active_sessions": 0},
+        )
+        entry["active_sessions"] += 1
+    return clients
+
+
+async def revoke_client_sessions(hass: HomeAssistant, client_id: str) -> int:
+    """End every session of a client. Returns how many there were."""
+    keys = {
+        _session_key(token, data)
+        for token, data in hass.data[DOMAIN]["refresh_tokens"].items()
+        if data["client_id"] == client_id
+    }
+    for key in keys:
+        _revoke_session(hass, key)
+    if keys:
+        await _save_refresh_tokens(hass)
+    return len(keys)
+
+
 def _prune_expired(entries: dict[str, dict[str, Any]]) -> None:
     """Drop the entries whose expires_at has passed."""
     now = time.time()
@@ -335,6 +462,9 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
     hass.http.register_view(OIDCUserInfoView())
     hass.http.register_view(OIDCJWKSView())
     hass.http.register_view(OIDCRegisterView())
+    hass.http.register_view(OIDCRevocationView())
+    hass.http.register_view(OIDCSessionsView())
+    hass.http.register_view(OIDCSessionView())
 
 
 class OIDCContinueView(HomeAssistantView):
@@ -430,7 +560,7 @@ class OIDCContinueView(HomeAssistantView):
         result = self._get_pending_request(hass, body.get("request_id"))
         if isinstance(result, web.Response):
             return result
-        stored_request, _client = result
+        stored_request, client = result
         request_id = body["request_id"]
 
         # Extract parameters
@@ -481,6 +611,9 @@ class OIDCContinueView(HomeAssistantView):
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "resource": resource,
+            # Kept with the session, so a client that is not stored, such as a
+            # metadata document client, can still be named in session lists.
+            "client_name": client.get("client_name"),
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
 
@@ -510,6 +643,7 @@ class OIDCDiscoveryView(HomeAssistantView):
             "id_token_signing_alg_values_supported": ["RS256"],
             "scopes_supported": SUPPORTED_SCOPES,
             **_client_authentication_metadata(request.app["hass"]),
+            **_revocation_metadata(request.app["hass"], base_url),
             "claims_supported": [
                 "sub",
                 "name",
@@ -551,6 +685,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             **_client_authentication_metadata(request.app["hass"]),
+            **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
@@ -585,6 +720,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             **_client_authentication_metadata(request.app["hass"]),
+            **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
@@ -791,6 +927,129 @@ class OIDCAuthorizationView(HomeAssistantView):
         )
 
 
+def _record_failed_attempt(hass: HomeAssistant, rate_limit_key: str, current_time: float) -> None:
+    """Record a failed authentication attempt for rate limiting."""
+    rate_limits = hass.data[DOMAIN]["rate_limit_attempts"]
+
+    if rate_limit_key not in rate_limits:
+        rate_limits[rate_limit_key] = {
+            "attempts": 1,
+            "window_start": current_time,
+        }
+    else:
+        rate_limits[rate_limit_key]["attempts"] += 1
+
+    # Check if we've exceeded max attempts
+    if rate_limits[rate_limit_key]["attempts"] >= MAX_TOKEN_ATTEMPTS:
+        rate_limits[rate_limit_key]["locked_until"] = current_time + RATE_LIMIT_PENALTY
+        _LOGGER.warning(
+            "Rate limit triggered for %s - locked for %d seconds",
+            rate_limit_key,
+            RATE_LIMIT_PENALTY,
+        )
+
+
+def _authenticate_client(
+    request: web.Request, hass: HomeAssistant, data: Any
+) -> tuple[str, dict[str, Any]] | web.Response:
+    """Authenticate the client of a token or revocation request (RFC 6749 §2.3).
+
+    Credentials come from HTTP Basic or the form body. Failed attempts are rate
+    limited per client and address. Returns the client_id and its client, or
+    the error response to send.
+    """
+    # Extract client credentials from either POST data or Authorization header
+    body_client_id = data.get("client_id")
+    client_id = body_client_id
+    client_secret = data.get("client_secret")
+
+    # Check for HTTP Basic authentication
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+        try:
+            # Decode Basic auth credentials
+            credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
+            client_id, client_secret = credentials.split(":", 1)
+        except Exception as e:
+            _LOGGER.warning("Invalid Basic auth header: %s", e)
+            return web.json_response({"error": "invalid_client"}, status=401)
+
+        # A body client_id that disagrees with the Basic credentials is an
+        # attempt to authenticate as one client while acting for another.
+        if body_client_id and body_client_id != client_id:
+            _LOGGER.warning(
+                "client_id mismatch between Basic auth (%s) and request body (%s)",
+                client_id,
+                body_client_id,
+            )
+            return web.json_response({"error": "invalid_client"}, status=401)
+
+    # Check rate limiting
+    rate_limit_key = f"{client_id}:{request.remote}"
+    rate_limits = hass.data[DOMAIN]["rate_limit_attempts"]
+    current_time = time.time()
+
+    # Clean up old rate limit entries
+    expired_keys = [
+        key
+        for key, data in rate_limits.items()
+        if data["window_start"] < current_time - RATE_LIMIT_WINDOW
+    ]
+    for key in expired_keys:
+        del rate_limits[key]
+
+    # Check if client is rate limited
+    if rate_limit_key in rate_limits:
+        limit_data = rate_limits[rate_limit_key]
+        if limit_data.get("locked_until", 0) > current_time:
+            _LOGGER.warning("Rate limit active for client %s from %s", client_id, request.remote)
+            return web.json_response(
+                {
+                    "error": "invalid_client",
+                    "error_description": "Too many failed attempts. Please try again later.",
+                },
+                status=429,
+            )
+
+    # Validate client
+    client = _token_endpoint_client(hass, client_id)
+    if client is None:
+        _record_failed_attempt(hass, rate_limit_key, current_time)
+        return web.json_response({"error": "invalid_client"}, status=401)
+
+    # Verify client secret using constant-time comparison
+    # Support both old (plain) and new (hashed) client secrets for backward compatibility
+    if _is_public_client(client):
+        # A public client has no secret to present; its grants are bound to
+        # it by PKCE instead.
+        if client_secret:
+            _LOGGER.warning("Public client %s presented a client secret", client_id)
+            _record_failed_attempt(hass, rate_limit_key, current_time)
+            return web.json_response({"error": "invalid_client"}, status=401)
+    elif "client_secret_hash" in client:
+        # New hashed format
+        if not verify_client_secret(client_secret, client["client_secret_hash"]):
+            _LOGGER.warning("Invalid client secret for client %s", client_id)
+            _record_failed_attempt(hass, rate_limit_key, current_time)
+            return web.json_response({"error": "invalid_client"}, status=401)
+    elif "client_secret" in client:
+        # Old plain text format (backward compatibility)
+        if client["client_secret"] != client_secret:
+            _LOGGER.warning("Invalid client secret for client %s (legacy)", client_id)
+            _record_failed_attempt(hass, rate_limit_key, current_time)
+            return web.json_response({"error": "invalid_client"}, status=401)
+    else:
+        _LOGGER.error("Client %s has no secret configured", client_id)
+        _record_failed_attempt(hass, rate_limit_key, current_time)
+        return web.json_response({"error": "invalid_client"}, status=401)
+
+    # Successful authentication - clear rate limit
+    if rate_limit_key in rate_limits:
+        del rate_limits[rate_limit_key]
+
+    return client_id, client
+
+
 class OIDCTokenView(HomeAssistantView):
     """OIDC Token endpoint."""
 
@@ -805,96 +1064,10 @@ class OIDCTokenView(HomeAssistantView):
 
         grant_type = data.get("grant_type")
 
-        # Extract client credentials from either POST data or Authorization header
-        body_client_id = data.get("client_id")
-        client_id = body_client_id
-        client_secret = data.get("client_secret")
-
-        # Check for HTTP Basic authentication
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Basic "):
-            try:
-                # Decode Basic auth credentials
-                credentials = base64.b64decode(auth_header[6:]).decode("utf-8")
-                client_id, client_secret = credentials.split(":", 1)
-            except Exception as e:
-                _LOGGER.warning("Invalid Basic auth header: %s", e)
-                return web.json_response({"error": "invalid_client"}, status=401)
-
-            # A body client_id that disagrees with the Basic credentials is an
-            # attempt to authenticate as one client while acting for another.
-            if body_client_id and body_client_id != client_id:
-                _LOGGER.warning(
-                    "client_id mismatch between Basic auth (%s) and request body (%s)",
-                    client_id,
-                    body_client_id,
-                )
-                return web.json_response({"error": "invalid_client"}, status=401)
-
-        # Check rate limiting
-        rate_limit_key = f"{client_id}:{request.remote}"
-        rate_limits = hass.data[DOMAIN]["rate_limit_attempts"]
-        current_time = time.time()
-
-        # Clean up old rate limit entries
-        expired_keys = [
-            key
-            for key, data in rate_limits.items()
-            if data["window_start"] < current_time - RATE_LIMIT_WINDOW
-        ]
-        for key in expired_keys:
-            del rate_limits[key]
-
-        # Check if client is rate limited
-        if rate_limit_key in rate_limits:
-            limit_data = rate_limits[rate_limit_key]
-            if limit_data.get("locked_until", 0) > current_time:
-                _LOGGER.warning(
-                    "Rate limit active for client %s from %s", client_id, request.remote
-                )
-                return web.json_response(
-                    {
-                        "error": "invalid_client",
-                        "error_description": "Too many failed attempts. Please try again later.",
-                    },
-                    status=429,
-                )
-
-        # Validate client
-        client = _token_endpoint_client(hass, client_id)
-        if client is None:
-            self._record_failed_attempt(hass, rate_limit_key, current_time)
-            return web.json_response({"error": "invalid_client"}, status=401)
-
-        # Verify client secret using constant-time comparison
-        # Support both old (plain) and new (hashed) client secrets for backward compatibility
-        if _is_public_client(client):
-            # A public client has no secret to present; its grants are bound to
-            # it by PKCE instead.
-            if client_secret:
-                _LOGGER.warning("Public client %s presented a client secret", client_id)
-                self._record_failed_attempt(hass, rate_limit_key, current_time)
-                return web.json_response({"error": "invalid_client"}, status=401)
-        elif "client_secret_hash" in client:
-            # New hashed format
-            if not verify_client_secret(client_secret, client["client_secret_hash"]):
-                _LOGGER.warning("Invalid client secret for client %s", client_id)
-                self._record_failed_attempt(hass, rate_limit_key, current_time)
-                return web.json_response({"error": "invalid_client"}, status=401)
-        elif "client_secret" in client:
-            # Old plain text format (backward compatibility)
-            if client["client_secret"] != client_secret:
-                _LOGGER.warning("Invalid client secret for client %s (legacy)", client_id)
-                self._record_failed_attempt(hass, rate_limit_key, current_time)
-                return web.json_response({"error": "invalid_client"}, status=401)
-        else:
-            _LOGGER.error("Client %s has no secret configured", client_id)
-            self._record_failed_attempt(hass, rate_limit_key, current_time)
-            return web.json_response({"error": "invalid_client"}, status=401)
-
-        # Successful authentication - clear rate limit
-        if rate_limit_key in rate_limits:
-            del rate_limits[rate_limit_key]
+        authenticated = _authenticate_client(request, hass, data)
+        if isinstance(authenticated, web.Response):
+            return authenticated
+        client_id, _client = authenticated
 
         # Grants are bound to the client that authenticated above, never to a
         # client_id taken from the request body.
@@ -904,29 +1077,6 @@ class OIDCTokenView(HomeAssistantView):
             return await self._handle_refresh_token(request, hass, data, client_id)
         else:
             return web.json_response({"error": "unsupported_grant_type"}, status=400)
-
-    def _record_failed_attempt(
-        self, hass: HomeAssistant, rate_limit_key: str, current_time: float
-    ) -> None:
-        """Record a failed authentication attempt for rate limiting."""
-        rate_limits = hass.data[DOMAIN]["rate_limit_attempts"]
-
-        if rate_limit_key not in rate_limits:
-            rate_limits[rate_limit_key] = {
-                "attempts": 1,
-                "window_start": current_time,
-            }
-        else:
-            rate_limits[rate_limit_key]["attempts"] += 1
-
-        # Check if we've exceeded max attempts
-        if rate_limits[rate_limit_key]["attempts"] >= MAX_TOKEN_ATTEMPTS:
-            rate_limits[rate_limit_key]["locked_until"] = current_time + RATE_LIMIT_PENALTY
-            _LOGGER.warning(
-                "Rate limit triggered for %s - locked for %d seconds",
-                rate_limit_key,
-                RATE_LIMIT_PENALTY,
-            )
 
     async def _handle_authorization_code(
         self, _request: web.Request, hass: HomeAssistant, data: Any, client_id: str
@@ -1067,6 +1217,7 @@ class OIDCTokenView(HomeAssistantView):
             "nonce": nonce,
             "auth_time": auth_time,
             "resource": resource,
+            "client_name": auth_data.get("client_name"),
             "family": family,
             "issued_at": time.time(),
             "expires_at": time.time() + REFRESH_TOKEN_EXPIRY,
@@ -1629,3 +1780,87 @@ class OIDCRegisterView(HomeAssistantView):
             )
 
         return web.json_response(client_info, status=201)
+
+
+class OIDCRevocationView(HomeAssistantView):
+    """OAuth 2.0 Token Revocation endpoint (RFC 7009)."""
+
+    url = "/oidc/revoke"
+    name = "api:oidc:revoke"
+    requires_auth = False
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Revoke the session a refresh token belongs to.
+
+        Access tokens are self-contained JWTs that expire within the hour and
+        cannot be revoked one by one; like unknown tokens they are answered
+        with 200 (RFC 7009 §2.2).
+        """
+        hass = request.app["hass"]
+        data = await request.post()
+
+        authenticated = _authenticate_client(request, hass, data)
+        if isinstance(authenticated, web.Response):
+            return authenticated
+        client_id, _client = authenticated
+
+        token = data.get("token")
+        if not token:
+            return web.json_response({"error": "invalid_request"}, status=400)
+
+        session = _find_session(hass, token)
+        if session is None:
+            return web.Response(status=200)
+        key, owner = session
+
+        _revoke_session(hass, key)
+        await _save_refresh_tokens(hass)
+
+        # Only the client a token was issued to may revoke it (RFC 7009 §2.1).
+        # Another client holding it means it leaked, so it is revoked anyway.
+        if owner != client_id:
+            _LOGGER.warning(
+                "Refresh token issued to client %s presented for revocation by client %s; "
+                "session revoked",
+                owner,
+                client_id,
+            )
+            return web.json_response({"error": "unauthorized_client"}, status=400)
+
+        _LOGGER.info("Client %s revoked one of its sessions", client_id)
+        return web.Response(status=200)
+
+
+class OIDCSessionsView(HomeAssistantView):
+    """The signed-in user's sessions with OIDC clients, listed in the login panel."""
+
+    url = "/oidc/sessions"
+    name = "api:oidc:sessions"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """List the user's live sessions."""
+        hass = request.app["hass"]
+        user = request["hass_user"]
+        return web.json_response({"sessions": user_sessions(hass, user.id)})
+
+
+class OIDCSessionView(HomeAssistantView):
+    """One of the signed-in user's sessions."""
+
+    url = "/oidc/sessions/{session_id}"
+    name = "api:oidc:session"
+    requires_auth = True
+
+    async def delete(self, request: web.Request, session_id: str) -> web.Response:
+        """End one of the user's sessions. Sessions of other users are not found."""
+        hass = request.app["hass"]
+        user = request["hass_user"]
+        for key, tokens in _live_sessions(hass).items():
+            _, data = tokens[0]
+            if _session_id(key) == session_id and data.get("user_id") == user.id:
+                _revoke_session(hass, key)
+                await _save_refresh_tokens(hass)
+                _LOGGER.info("User %s ended a session of client %s", user.id, data["client_id"])
+                return web.json_response({"revoked": True})
+        return web.json_response({"error": "not_found"}, status=404)
