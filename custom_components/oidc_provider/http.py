@@ -91,6 +91,19 @@ async def _save_refresh_tokens(hass: HomeAssistant) -> None:
         await token_store.async_save({"refresh_tokens": hass.data[DOMAIN]["refresh_tokens"]})
 
 
+async def _revoke_code_grant(hass: HomeAssistant, grant: dict[str, Any]) -> None:
+    """Revoke the refresh token issued when an authorization code was redeemed."""
+    if hass.data[DOMAIN]["refresh_tokens"].pop(grant["refresh_token"], None) is not None:
+        await _save_refresh_tokens(hass)
+
+
+def _prune_expired(entries: dict[str, dict[str, Any]]) -> None:
+    """Drop the entries whose expires_at has passed."""
+    now = time.time()
+    for key in [key for key, value in entries.items() if value["expires_at"] < now]:
+        del entries[key]
+
+
 async def _load_or_generate_keys(hass: HomeAssistant) -> tuple[Any, str]:
     """Load existing RSA keys from storage or generate new ones.
 
@@ -296,6 +309,11 @@ class OIDCContinueView(HomeAssistantView):
         if body.get("approve") is not True:
             _LOGGER.info("User %s denied authorization for client %s", user.id, client_id)
             return web.json_response({"redirect_url": build_redirect(error="access_denied")})
+
+        # Codes that were never redeemed, and the records of redeemed ones, are
+        # dropped once they expire so neither grows without bound.
+        _prune_expired(hass.data[DOMAIN]["authorization_codes"])
+        _prune_expired(hass.data[DOMAIN].setdefault("redeemed_codes", {}))
 
         # Generate authorization code
         auth_code = secrets.token_urlsafe(32)
@@ -531,14 +549,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             hass.data[DOMAIN]["pending_auth_requests"] = {}
 
         # Clean up expired pending requests
-        current_time = time.time()
-        expired_ids = [
-            req_id
-            for req_id, req_data in hass.data[DOMAIN]["pending_auth_requests"].items()
-            if req_data["expires_at"] < current_time
-        ]
-        for req_id in expired_ids:
-            del hass.data[DOMAIN]["pending_auth_requests"][req_id]
+        _prune_expired(hass.data[DOMAIN]["pending_auth_requests"])
 
         hass.data[DOMAIN]["pending_auth_requests"][auth_request_id] = {
             "client_id": client_id,
@@ -754,22 +765,31 @@ class OIDCTokenView(HomeAssistantView):
         redirect_uri = data.get("redirect_uri")
         code_verifier = data.get("code_verifier")
 
-        auth_codes = hass.data[DOMAIN]["authorization_codes"]
-        if code not in auth_codes:
+        # A code is good for one redemption attempt (RFC 6749 §4.1.2). Taking it
+        # out of the store before anything awaits means a request racing this
+        # one cannot find it, and a failed attempt cannot be retried.
+        auth_data = hass.data[DOMAIN]["authorization_codes"].pop(code, None)
+        redeemed_codes = hass.data[DOMAIN].setdefault("redeemed_codes", {})
+        if auth_data is None:
+            # A code that already issued tokens and is presented again may have
+            # leaked, so the refresh token it issued is revoked (RFC 6749 §4.1.2).
+            grant = redeemed_codes.pop(code, None)
+            if grant is not None:
+                _LOGGER.warning(
+                    "Authorization code issued to client %s was presented again; "
+                    "revoking the refresh token it issued",
+                    grant["client_id"],
+                )
+                await _revoke_code_grant(hass, grant)
             return web.json_response({"error": "invalid_grant"}, status=400)
-
-        auth_data = auth_codes[code]
 
         # Validate authorization code
         if auth_data["expires_at"] < time.time():
-            del auth_codes[code]
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         # The code may only be redeemed by the client it was issued to
-        # (RFC 6749 §4.1.3). A redemption attempt by another client consumes
-        # the code so it cannot be retried.
+        # (RFC 6749 §4.1.3).
         if auth_data["client_id"] != client_id:
-            del auth_codes[code]
             _LOGGER.warning(
                 "Authorization code issued to client %s redeemed by client %s",
                 auth_data["client_id"],
@@ -784,7 +804,6 @@ class OIDCTokenView(HomeAssistantView):
         code_challenge = auth_data.get("code_challenge")
         if code_challenge:
             if not code_verifier:
-                del auth_codes[code]
                 return web.json_response(
                     {"error": "invalid_grant", "error_description": "code_verifier required"},
                     status=400,
@@ -797,7 +816,6 @@ class OIDCTokenView(HomeAssistantView):
                 )
                 if code_challenge_method != CODE_CHALLENGE_METHOD_S256:
                     # Only S256 method is supported (RFC 7636 + OAuth 2.1)
-                    del auth_codes[code]
                     return web.json_response(
                         {
                             "error": "invalid_grant",
@@ -816,7 +834,6 @@ class OIDCTokenView(HomeAssistantView):
                 )
 
                 if computed_challenge != code_challenge:
-                    del auth_codes[code]
                     _LOGGER.warning(
                         "PKCE verification failed for client %s - expected %s, got %s",
                         auth_data["client_id"],
@@ -828,7 +845,6 @@ class OIDCTokenView(HomeAssistantView):
                         status=400,
                     )
             except Exception as e:
-                del auth_codes[code]
                 _LOGGER.error("Error verifying PKCE: %s", str(e), exc_info=True)
                 return web.json_response(
                     {"error": "invalid_grant", "error_description": "PKCE verification error"},
@@ -847,10 +863,19 @@ class OIDCTokenView(HomeAssistantView):
         # honor it only when the authorize step didn't specify one.
         resource = auth_data.get("resource") or _normalize_resource(data.get("resource"))
 
+        # Kept until the code would have expired, so a later presentation of the
+        # same code can revoke what this redemption issues.
+        refresh_token = secrets.token_urlsafe(32)
+        grant = {
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "expires_at": auth_data["expires_at"],
+        }
+        redeemed_codes[code] = grant
+
         access_token = await self._generate_access_token(
             _request, hass, user_id, scope, client_id, audience=resource
         )
-        refresh_token = secrets.token_urlsafe(32)
 
         # Store refresh token (nonce + auth_time persisted so future refreshes
         # produce spec-correct id_tokens after Home Assistant restarts; resource
@@ -867,9 +892,6 @@ class OIDCTokenView(HomeAssistantView):
 
         # Persist refresh tokens to storage
         await _save_refresh_tokens(hass)
-
-        # Delete used authorization code
-        del auth_codes[code]
 
         response_body: dict[str, Any] = {
             "access_token": access_token,
@@ -894,6 +916,12 @@ class OIDCTokenView(HomeAssistantView):
                 auth_time=auth_time,
                 access_token=access_token,
             )
+
+        # The code was presented again while these tokens were being issued.
+        # That request took the record, so nothing issued here is handed out.
+        if redeemed_codes.get(code) is not grant:
+            await _revoke_code_grant(hass, grant)
+            return web.json_response({"error": "invalid_grant"}, status=400)
 
         return web.json_response(response_body)
 
@@ -1248,7 +1276,7 @@ class OIDCRegisterView(HomeAssistantView):
         hass = request.app["hass"]
 
         if not _dynamic_registration_enabled(hass):
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Refused dynamic client registration from %s: it is turned off in the "
                 "OIDC Provider options",
                 request.remote,

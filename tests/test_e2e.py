@@ -22,6 +22,7 @@ entry, HTTP views, frontend panel, static paths) and that DCR and issuance keep
 working, catching HA runtime/API drift before it reaches users.
 """
 
+import asyncio
 import base64
 import hashlib
 import re
@@ -154,6 +155,7 @@ async def _exchange_code(
     client_id: str,
     client_secret: str,
     code_verifier: str,
+    redirect_uri: str = REDIRECT_URI,
 ) -> tuple[int, dict]:
     """Exchange an authorization code at /oidc/token. Returns (status, json body)."""
     resp = await client.post(
@@ -161,7 +163,7 @@ async def _exchange_code(
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "client_id": client_id,
             "client_secret": client_secret,
             "code_verifier": code_verifier,
@@ -294,6 +296,136 @@ async def test_pkce_rejects_wrong_verifier(
     assert body["error"] == "invalid_grant"
 
 
+async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tuple[str, str]:
+    """Run the authorize step for a registered client. Returns (code, code_verifier)."""
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=RESOURCE,
+    )
+    return code, verifier
+
+
+async def _refresh(client: ClientSessionGenerator, registration: dict, refresh_token: str) -> int:
+    """Use a refresh token at /oidc/token. Returns the response status."""
+    resp = await client.post(
+        "/oidc/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+        },
+        headers=FORWARDED,
+    )
+    return resp.status
+
+
+async def test_replayed_code_is_refused_and_revokes_its_refresh_token(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """A redeemed code presented again is refused, and what it issued is revoked.
+
+    RFC 6749 §4.1.2: the server must deny the request and should revoke the
+    tokens previously issued with that code.
+    """
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    first_status, first_body = await _exchange_code(client, **exchange)
+    assert first_status == 200
+    assert await _refresh(client, registration, first_body["refresh_token"]) == 200
+
+    second_status, second_body = await _exchange_code(client, **exchange)
+
+    assert second_status == 400
+    assert second_body["error"] == "invalid_grant"
+    assert await _refresh(client, registration, first_body["refresh_token"]) == 400
+
+
+async def test_code_presented_during_its_redemption_issues_nothing(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A code presented again while its first redemption is in flight voids both.
+
+    The first request is held inside its refresh token write, where a real store
+    yields to the disk, while the second request with the same code runs. The
+    second is refused, and the first gives up the tokens it was issuing.
+    """
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    store = hass.data[DOMAIN]["token_store"]
+    save = store.async_save
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_save(data: dict) -> None:
+        if not parked.is_set():
+            parked.set()
+            await release.wait()
+        await save(data)
+
+    monkeypatch.setattr(store, "async_save", held_save)
+
+    first = asyncio.create_task(_exchange_code(client, **exchange))
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=5)
+        second_status, second_body = await _exchange_code(client, **exchange)
+    finally:
+        # Let the held request finish even when an assertion above fails, so
+        # teardown does not hang on it and hide the failure.
+        release.set()
+    first_status, first_body = await first
+
+    assert (first_status, first_body["error"]) == (400, "invalid_grant")
+    assert (second_status, second_body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+async def test_failed_redemption_consumes_code(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """A rejected redemption burns the code, so it cannot be retried with other values."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    exchange = {
+        "code": code,
+        "client_id": registration["client_id"],
+        "client_secret": registration["client_secret"],
+        "code_verifier": verifier,
+    }
+
+    mismatch_status, _ = await _exchange_code(
+        client, **exchange, redirect_uri="https://mcp.example.com/other/callback"
+    )
+    retry_status, retry_body = await _exchange_code(client, **exchange)
+
+    assert mismatch_status == 400
+    assert retry_status == 400
+    assert retry_body["error"] == "invalid_grant"
+
+
 async def test_discovery_metadata_advertises_endpoints(
     setup_provider: None, hass_client: ClientSessionGenerator
 ) -> None:
@@ -355,6 +487,21 @@ async def test_entry_from_earlier_release_keeps_registration_on(
     await _register_client(client)
     resp = await client.get(DISCOVERY_PATHS[0], headers=FORWARDED)
     assert (await resp.json())["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
+
+
+async def test_entry_with_saved_choice_keeps_it_on_migration(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """A minor version 1 entry that saved registration off, as forks do, stays off."""
+    entry = await _setup_entry(
+        hass, minor_version=1, options={CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+    )
+
+    assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
+    assert entry.options == {CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+    await _assert_registration_refused(await hass_client())
 
 
 @pytest.mark.parametrize("enabled", [True, False])
