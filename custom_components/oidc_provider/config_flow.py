@@ -4,13 +4,22 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 
-from .const import CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE, DOMAIN
+from .const import (
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
+    CONF_REQUIRE_PKCE,
+    DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
+    DEFAULT_REQUIRE_PKCE,
+    DOMAIN,
+)
 
 
 class OIDCProviderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OIDC Provider."""
 
     VERSION = 1
+    # Entries from minor version 2 on record the dynamic registration choice
+    # in their options; async_migrate_entry brings older entries up to it.
+    MINOR_VERSION = 2
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""
@@ -20,12 +29,24 @@ class OIDCProviderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             return self.async_create_entry(
                 title="OIDC Provider",
-                data=user_input,
+                data={},
+                options={
+                    CONF_ALLOW_DYNAMIC_REGISTRATION: user_input.get(
+                        CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION
+                    ),
+                },
             )
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({}),
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_ALLOW_DYNAMIC_REGISTRATION,
+                        default=DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
+                    ): bool,
+                }
+            ),
         )
 
     @staticmethod
@@ -53,6 +74,12 @@ class OIDCProviderOptionsFlow(config_entries.OptionsFlow):
                     vol.Optional(
                         CONF_REQUIRE_PKCE,
                         default=options.get(CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE),
+                    ): bool,
+                    vol.Optional(
+                        CONF_ALLOW_DYNAMIC_REGISTRATION,
+                        default=options.get(
+                            CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION
+                        ),
                     ): bool,
                 }
             ),

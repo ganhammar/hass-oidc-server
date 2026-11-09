@@ -64,5 +64,10 @@ RATE_LIMIT_PENALTY = 60  # Lockout period in seconds after max attempts
 DEFAULT_REQUIRE_PKCE = True  # Default to required for security (OAuth 2.1 compliance)
 CONF_REQUIRE_PKCE = "require_pkce"
 
+# Dynamic client registration (RFC 7591). Off for new installs because anyone
+# who can reach /oidc/register can create a client while it is on.
+DEFAULT_ALLOW_DYNAMIC_REGISTRATION = False
+CONF_ALLOW_DYNAMIC_REGISTRATION = "allow_dynamic_registration"
+
 # Frontend panel serving the login flow (hidden from the sidebar)
 PANEL_URL_PATH = "oidc_login"

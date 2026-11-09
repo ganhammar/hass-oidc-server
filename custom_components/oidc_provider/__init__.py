@@ -15,7 +15,9 @@ from homeassistant.helpers.storage import Store
 
 from .client_manager import create_client, validate_redirect_uris
 from .const import (
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
     CONF_REQUIRE_PKCE,
+    DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
     PANEL_URL_PATH,
@@ -34,6 +36,38 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the OIDC Provider component."""
     hass.data.setdefault(DOMAIN, {})
     return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Bring an older config entry up to the current version."""
+    if entry.version > 1:
+        # Written by a newer release whose schema this one cannot read
+        return False
+
+    if entry.minor_version < 2:
+        # Minor version 1 entries come from releases where dynamic registration
+        # was always on. It stays on so clients that register themselves keep
+        # connecting after an upgrade; the options flow can turn it off.
+        hass.config_entries.async_update_entry(
+            entry,
+            options={**entry.options, CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+            minor_version=2,
+        )
+        _LOGGER.info(
+            "Migrated config entry to minor version 2; dynamic client registration stays enabled"
+        )
+
+    return True
+
+
+def _apply_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Copy the entry options into the runtime state the HTTP views read."""
+    hass.data[DOMAIN][CONF_REQUIRE_PKCE] = entry.options.get(
+        CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE
+    )
+    hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] = entry.options.get(
+        CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -64,9 +98,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["token_store"] = token_store
 
     # Store configuration options
-    hass.data[DOMAIN][CONF_REQUIRE_PKCE] = entry.options.get(
-        CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE
-    )
+    _apply_options(hass, entry)
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(async_update_options))
@@ -307,10 +339,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
-    hass.data[DOMAIN][CONF_REQUIRE_PKCE] = entry.options.get(
-        CONF_REQUIRE_PKCE, DEFAULT_REQUIRE_PKCE
+    _apply_options(hass, entry)
+    _LOGGER.info(
+        "Options updated: PKCE required %s, dynamic client registration %s",
+        hass.data[DOMAIN][CONF_REQUIRE_PKCE],
+        hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION],
     )
-    _LOGGER.info("PKCE enforcement updated: %s", hass.data[DOMAIN][CONF_REQUIRE_PKCE])
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
