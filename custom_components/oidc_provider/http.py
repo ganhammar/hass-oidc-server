@@ -24,7 +24,9 @@ from .const import (
     ACCESS_TOKEN_EXPIRY,
     AUTHORIZATION_CODE_EXPIRY,
     CODE_CHALLENGE_METHOD_S256,
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
     CONF_REQUIRE_PKCE,
+    DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
     GRANT_TYPE_AUTHORIZATION_CODE,
@@ -68,6 +70,18 @@ def _normalize_resource(resource: str | None) -> str | None:
         _LOGGER.warning("Ignoring malformed resource indicator: %s", resource)
         return None
     return resource
+
+
+def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
+    """Return whether clients may register themselves at /oidc/register.
+
+    The discovery documents advertise registration_endpoint only while this is
+    true, so clients that discover endpoints are never sent to one that refuses
+    them.
+    """
+    return bool(
+        hass.data[DOMAIN].get(CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION)
+    )
 
 
 async def _save_refresh_tokens(hass: HomeAssistant) -> None:
@@ -326,7 +340,6 @@ class OIDCDiscoveryView(HomeAssistantView):
             "token_endpoint": f"{base_url}/oidc/token",
             "userinfo_endpoint": f"{base_url}/oidc/userinfo",
             "jwks_uri": f"{base_url}/oidc/jwks",
-            "registration_endpoint": f"{base_url}/oidc/register",
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
@@ -351,6 +364,8 @@ class OIDCDiscoveryView(HomeAssistantView):
             ],
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
         }
+        if _dynamic_registration_enabled(request.app["hass"]):
+            discovery["registration_endpoint"] = f"{base_url}/oidc/register"
 
         return web.json_response(discovery)
 
@@ -370,7 +385,6 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             "issuer": f"{base_url}/oidc",
             "authorization_endpoint": f"{base_url}/oidc/authorize",
             "token_endpoint": f"{base_url}/oidc/token",
-            "registration_endpoint": f"{base_url}/oidc/register",
             "jwks_uri": f"{base_url}/oidc/jwks",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -381,6 +395,8 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
+        if _dynamic_registration_enabled(request.app["hass"]):
+            metadata["registration_endpoint"] = f"{base_url}/oidc/register"
 
         return web.json_response(metadata)
 
@@ -406,7 +422,6 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             "issuer": f"{base_url}/oidc",
             "authorization_endpoint": f"{base_url}/oidc/authorize",
             "token_endpoint": f"{base_url}/oidc/token",
-            "registration_endpoint": f"{base_url}/oidc/register",
             "jwks_uri": f"{base_url}/oidc/jwks",
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
@@ -417,6 +432,8 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
         }
+        if _dynamic_registration_enabled(request.app["hass"]):
+            metadata["registration_endpoint"] = f"{base_url}/oidc/register"
 
         return web.json_response(metadata)
 
@@ -1220,6 +1237,20 @@ class OIDCRegisterView(HomeAssistantView):
     async def post(self, request: web.Request) -> web.Response:
         """Handle client registration request."""
         hass = request.app["hass"]
+
+        if not _dynamic_registration_enabled(hass):
+            _LOGGER.warning(
+                "Refused dynamic client registration from %s: it is turned off in the "
+                "OIDC Provider options",
+                request.remote,
+            )
+            return web.json_response(
+                {
+                    "error": "access_denied",
+                    "error_description": "Dynamic client registration is disabled",
+                },
+                status=403,
+            )
 
         try:
             data = await request.json()

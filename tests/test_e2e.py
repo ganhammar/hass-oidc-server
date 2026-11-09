@@ -4,7 +4,8 @@ These drive the integration the way a real OAuth client (e.g. the hass-mcp-serve
 protected resource and Claude) would, with the component set up through HA's
 config-entry machinery and every request made over the real aiohttp test client:
 
-* Dynamic Client Registration (RFC 7591) at ``/oidc/register``.
+* Dynamic Client Registration (RFC 7591) at ``/oidc/register``, and the setup,
+  options and migration paths that turn it on or off.
 * The full authorization-code + PKCE flow: ``/oidc/authorize`` ->
   ``/oidc/continue`` (approve) -> ``/oidc/token``, ending in a signed access token.
 * RFC 8707 audience binding: the issued token's ``aud`` is the requested
@@ -28,13 +29,16 @@ import re
 import secrets
 
 import pytest
+from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
-from custom_components.oidc_provider.const import DOMAIN
+from custom_components.oidc_provider.config_flow import OIDCProviderConfigFlow
+from custom_components.oidc_provider.const import CONF_ALLOW_DYNAMIC_REGISTRATION, DOMAIN
 from custom_components.oidc_provider.token_validator import validate_access_token
 
 # The issuer is derived from the request Host. Pin it with forwarded headers so
@@ -44,6 +48,26 @@ ISSUER_BASE = "https://mcp.example.com"
 EXPECTED_ISSUER = f"{ISSUER_BASE}/oidc"
 RESOURCE = "https://mcp.example.com/api/mcp"
 REDIRECT_URI = "https://mcp.example.com/auth/callback"
+DISCOVERY_PATHS = (
+    "/oidc/.well-known/openid-configuration",
+    "/.well-known/oauth-authorization-server/oidc",
+    "/oidc/.well-known/oauth-authorization-server",
+)
+
+
+async def _setup_entry(hass: HomeAssistant, **entry_kwargs) -> MockConfigEntry:
+    """Add an OIDC provider config entry, set it up, and check it loaded."""
+    assert await async_setup_component(hass, "http", {})
+
+    entry = MockConfigEntry(domain=DOMAIN, data={}, **entry_kwargs)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The whole integration loaded cleanly on this HA version.
+    assert entry.state is ConfigEntryState.LOADED
+    return entry
 
 
 @pytest.fixture
@@ -54,16 +78,11 @@ async def setup_provider(enable_custom_integrations: None, hass: HomeAssistant) 
     ``hass.data`` without the full ``frontend`` component (whose compiled
     ``hass_frontend`` assets are not installed in the test environment).
     """
-    assert await async_setup_component(hass, "http", {})
-
-    entry = MockConfigEntry(domain=DOMAIN, data={})
-    entry.add_to_hass(hass)
-
-    assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
-
-    # The whole integration loaded cleanly on this HA version.
-    assert entry.state is ConfigEntryState.LOADED
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -394,3 +413,99 @@ async def test_discovery_metadata_advertises_endpoints(
     assert discovery["authorization_endpoint"] == f"{ISSUER_BASE}/oidc/authorize"
     assert discovery["token_endpoint"] == f"{ISSUER_BASE}/oidc/token"
     assert discovery["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
+
+
+async def _assert_registration_refused(client: ClientSessionGenerator) -> None:
+    """Check /oidc/register refuses and no discovery document advertises it."""
+    resp = await client.post(
+        "/oidc/register",
+        json={"client_name": "Test MCP Client", "redirect_uris": [REDIRECT_URI]},
+        headers=FORWARDED,
+    )
+    assert resp.status == 403
+    assert (await resp.json())["error"] == "access_denied"
+
+    for path in DISCOVERY_PATHS:
+        resp = await client.get(path, headers=FORWARDED)
+        assert resp.status == 200
+        assert "registration_endpoint" not in await resp.json(), path
+
+
+async def test_registration_refused_when_turned_off(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """With registration off nobody can register and discovery does not offer it."""
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: False},
+    )
+
+    await _assert_registration_refused(await hass_client())
+    assert hass.data[DOMAIN]["clients"] == {}
+
+
+async def test_entry_from_earlier_release_keeps_registration_on(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+) -> None:
+    """An entry from before the option existed is migrated with registration on."""
+    entry = await _setup_entry(hass, minor_version=1, options={"require_pkce": True})
+
+    assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
+    assert entry.options == {"require_pkce": True, CONF_ALLOW_DYNAMIC_REGISTRATION: True}
+
+    client = await hass_client()
+    await _register_client(client)
+    resp = await client.get(DISCOVERY_PATHS[0], headers=FORWARDED)
+    assert (await resp.json())["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_setup_flow_records_registration_choice(
+    enable_custom_integrations: None, hass: HomeAssistant, enabled: bool
+) -> None:
+    """The setup form's registration choice is stored on the new entry."""
+    assert await async_setup_component(hass, "http", {})
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_ALLOW_DYNAMIC_REGISTRATION: enabled}
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    entry = result["result"]
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
+    assert entry.options == {CONF_ALLOW_DYNAMIC_REGISTRATION: enabled}
+    assert hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is enabled
+
+
+async def test_options_flow_turns_registration_off_without_reload(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Turning registration off in the options applies to the next request."""
+    client = await hass_client()
+    await _register_client(client)
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"require_pkce": True, CONF_ALLOW_DYNAMIC_REGISTRATION: False},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    await _assert_registration_refused(client)
+    # The client that registered while it was on is still there
+    assert len(hass.data[DOMAIN]["clients"]) == 1

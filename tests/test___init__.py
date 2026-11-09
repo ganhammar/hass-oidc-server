@@ -8,11 +8,17 @@ from homeassistant.components.frontend import DATA_PANELS
 
 from custom_components.oidc_provider import (
     DOMAIN,
+    async_migrate_entry,
     async_setup,
     async_setup_entry,
     async_unload_entry,
+    async_update_options,
 )
-from custom_components.oidc_provider.const import PANEL_URL_PATH
+from custom_components.oidc_provider.const import (
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
+    CONF_REQUIRE_PKCE,
+    PANEL_URL_PATH,
+)
 
 
 @pytest.fixture
@@ -800,3 +806,106 @@ class TestKeyPersistence:
         mock_store.async_save.assert_not_called()
         # Verify the kid matches what was loaded
         assert mock_hass.data[DOMAIN]["jwt_kid"] == "test-existing-kid"
+
+
+class TestMigrateEntry:
+    """Test async_migrate_entry."""
+
+    def _entry(self, version, minor_version, options):
+        entry = Mock()
+        entry.version = version
+        entry.minor_version = minor_version
+        entry.options = options
+        return entry
+
+    async def test_minor_version_1_keeps_dynamic_registration_on(self, mock_hass):
+        """Entries from before the option existed had registration on and keep it."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(1, 1, {CONF_REQUIRE_PKCE: False})
+
+        assert await async_migrate_entry(mock_hass, entry) is True
+
+        mock_hass.config_entries.async_update_entry.assert_called_once_with(
+            entry,
+            options={CONF_REQUIRE_PKCE: False, CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+            minor_version=2,
+        )
+
+    async def test_current_entry_is_left_alone(self, mock_hass):
+        """An entry already at minor version 2 keeps its recorded choice."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(1, 2, {CONF_ALLOW_DYNAMIC_REGISTRATION: False})
+
+        assert await async_migrate_entry(mock_hass, entry) is True
+
+        mock_hass.config_entries.async_update_entry.assert_not_called()
+
+    async def test_newer_major_version_is_refused(self, mock_hass):
+        """An entry written by a newer major version cannot be read."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(2, 1, {})
+
+        assert await async_migrate_entry(mock_hass, entry) is False
+
+        mock_hass.config_entries.async_update_entry.assert_not_called()
+
+
+class TestOptions:
+    """Test that entry options reach the runtime state."""
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_setup_entry_applies_dynamic_registration_option(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        enabled,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """The registration option is read into hass.data at setup."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+        mock_config_entry.options = {CONF_ALLOW_DYNAMIC_REGISTRATION: enabled}
+
+        assert await async_setup_entry(mock_hass, mock_config_entry) is True
+
+        assert mock_hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is enabled
+
+    @patch("custom_components.oidc_provider.Store")
+    @patch("custom_components.oidc_provider.setup_http_endpoints")
+    @patch("custom_components.oidc_provider.async_register_built_in_panel")
+    async def test_setup_entry_defaults_dynamic_registration_off(
+        self,
+        mock_panel,
+        mock_http,
+        mock_store_class,
+        mock_hass,
+        mock_config_entry,
+        mock_store,
+        mock_token_store,
+    ):
+        """An entry with no recorded setting does not allow registration."""
+        mock_store_class.side_effect = [mock_store, mock_token_store]
+        mock_config_entry.options = {}
+
+        assert await async_setup_entry(mock_hass, mock_config_entry) is True
+
+        assert mock_hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is False
+
+    async def test_update_options_applies_both_settings(self, mock_hass, mock_config_entry):
+        """Saving the options form updates the runtime state without a reload."""
+        mock_hass.data = {DOMAIN: {CONF_REQUIRE_PKCE: True, CONF_ALLOW_DYNAMIC_REGISTRATION: True}}
+        mock_config_entry.options = {
+            CONF_REQUIRE_PKCE: False,
+            CONF_ALLOW_DYNAMIC_REGISTRATION: False,
+        }
+
+        await async_update_options(mock_hass, mock_config_entry)
+
+        assert mock_hass.data[DOMAIN][CONF_REQUIRE_PKCE] is False
+        assert mock_hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is False

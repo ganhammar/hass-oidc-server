@@ -1,0 +1,34 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "OIDC Provider Setup",
+        "description": "Set up OIDC Provider for Home Assistant. This will enable your Home Assistant instance to act as an OpenID Connect provider for external applications. You can change this later with the integration's Configure button.",
+        "data": {
+          "allow_dynamic_registration": "Allow dynamic client registration"
+        },
+        "data_description": {
+          "allow_dynamic_registration": "Let clients register themselves at /oidc/register (RFC 7591). MCP clients such as Claude use this to connect without a client ID you created for them. Anyone who can reach Home Assistant can then register a client, and every sign-in through such a client stops on a consent screen. Leave this off if you register clients yourself with the Register OIDC Client action."
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "OIDC Provider Options",
+        "data": {
+          "require_pkce": "Require PKCE",
+          "allow_dynamic_registration": "Allow dynamic client registration"
+        },
+        "data_description": {
+          "require_pkce": "Authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires.",
+          "allow_dynamic_registration": "Let clients register themselves at /oidc/register (RFC 7591). Anyone who can reach Home Assistant can then register a client, and every sign-in through such a client stops on a consent screen. Turning this off stops new registrations; clients that already registered keep working until you revoke them."
+        }
+      }
+    }
+  }
+}
