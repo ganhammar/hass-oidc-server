@@ -57,7 +57,7 @@ def test_validate_access_token_valid(mock_hass_with_keys):
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Validate the token
     result = validate_access_token(hass, token, "http://localhost")
@@ -85,7 +85,7 @@ def test_validate_access_token_expired(mock_hass_with_keys):
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Validate the token
     result = validate_access_token(hass, token, "http://localhost")
@@ -115,7 +115,7 @@ def test_validate_access_token_invalid_signature(mock_hass_with_keys):
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, different_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, different_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Validate the token
     result = validate_access_token(hass, token, "http://localhost")
@@ -175,7 +175,7 @@ def test_validate_access_token_with_custom_claims(mock_hass_with_keys):
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Validate the token
     result = validate_access_token(hass, token, "http://localhost")
@@ -207,7 +207,7 @@ async def test_validate_access_token_rejects_missing_audience(mock_hass_with_key
         "exp": int(time.time()) + 3600,
         # Missing "aud" claim
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is None
@@ -233,7 +233,7 @@ async def test_validate_access_token_rejects_invalid_audience(mock_hass_with_key
         "exp": int(time.time()) + 3600,
         "aud": "nonexistent_client",  # Not registered
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is None
@@ -260,7 +260,7 @@ async def test_validate_access_token_accepts_valid_audience(mock_hass_with_keys)
         "iss": "http://localhost/oidc",
         "aud": "test_client",  # Registered client
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is not None
@@ -289,7 +289,7 @@ async def test_validate_access_token_rejects_missing_issuer(mock_hass_with_keys)
         "aud": "test_client",
         # Missing "iss" claim
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is None
@@ -316,7 +316,7 @@ async def test_validate_access_token_rejects_invalid_issuer(mock_hass_with_keys)
         "iss": "http://evil.com",  # Wrong issuer
         "aud": "test_client",
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     result = validate_access_token(hass, token, "http://localhost")
     assert result is None
@@ -344,7 +344,7 @@ async def test_validate_access_token_accepts_issuer_without_oidc_suffix(mock_has
         "iss": "https://ha.example.com/oidc",
         "aud": "test_client",
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Caller passes the base URL (no /oidc suffix). Validation still succeeds.
     result = validate_access_token(hass, token, "https://ha.example.com")
@@ -374,7 +374,7 @@ async def test_validate_access_token_rejects_unsuffixed_iss(mock_hass_with_keys)
         "iss": "https://ha.example.com",  # missing /oidc suffix
         "aud": "test_client",
     }
-    token = jwt.encode(payload, private_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     assert validate_access_token(hass, token, "https://ha.example.com") is None
     assert validate_access_token(hass, token, "https://ha.example.com/oidc") is None
@@ -459,14 +459,19 @@ def test_malformed_token_failure_logs_unparseable(mock_hass_with_keys, caplog):
     assert any("header=<unparseable>" in record.getMessage() for record in caplog.records)
 
 
-def _encode(private_key, payload):
-    """Sign a JWT payload with the given RSA private key (RS256)."""
+def _encode(private_key, payload, headers=None):
+    """Sign a JWT payload with the given RSA private key (RS256).
+
+    The header carries typ at+jwt unless headers overrides it.
+    """
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    return jwt.encode(payload, private_pem, algorithm="RS256")
+    return jwt.encode(
+        payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt", **(headers or {})}
+    )
 
 
 def _resource_token_payload(aud):
@@ -559,3 +564,56 @@ def test_validate_access_token_accepts_client_audience_without_expected_resource
     result = validate_access_token(hass, token, "https://ha.example.com")
     assert result is not None
     assert result["sub"] == "user123"
+
+
+@pytest.mark.parametrize(
+    ("typ", "token_use"),
+    [
+        ("at+jwt", "access"),
+        ("at+jwt", None),
+        ("application/at+jwt", "access"),
+        ("AT+JWT", "access"),
+        # Access tokens signed without the RFC 9068 typ carry token_use=access
+        ("JWT", "access"),
+        (None, "access"),
+    ],
+)
+def test_validate_access_token_accepts_access_tokens(mock_hass_with_keys, typ, token_use):
+    """An access token is told apart by its typ header or, without it, by token_use."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+    payload = _resource_token_payload("test_client")
+    if token_use is not None:
+        payload["token_use"] = token_use
+
+    token = _encode(private_key, payload, headers={"typ": typ})
+
+    assert jwt.get_unverified_header(token).get("typ") == typ
+    assert validate_access_token(hass, token, "https://ha.example.com") is not None
+
+
+@pytest.mark.parametrize(
+    ("typ", "token_use"),
+    [
+        # An ID token, as the token endpoint signs it
+        ("JWT", "id"),
+        ("JWT", None),
+        (None, None),
+        ("at+jwt", "id"),
+    ],
+)
+def test_validate_access_token_rejects_tokens_that_are_not_access_tokens(
+    mock_hass_with_keys, caplog, typ, token_use
+):
+    """An ID token, or a token with neither marker, is refused as an access token."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+    payload = _resource_token_payload("test_client")
+    if token_use is not None:
+        payload["token_use"] = token_use
+
+    token = _encode(private_key, payload, headers={"typ": typ})
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.oidc_provider.token_validator"):
+        assert validate_access_token(hass, token, "https://ha.example.com") is None
+    assert any("Not an access token" in record.getMessage() for record in caplog.records)

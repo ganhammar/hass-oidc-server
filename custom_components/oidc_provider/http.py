@@ -28,6 +28,7 @@ from .client_manager import (
 )
 from .const import (
     ACCESS_TOKEN_EXPIRY,
+    ACCESS_TOKEN_TYPE,
     AUTHORIZATION_CODE_EXPIRY,
     CODE_CHALLENGE_METHOD_S256,
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
@@ -65,7 +66,7 @@ from .const import (
     TOKEN_USE_ID,
 )
 from .security import verify_client_secret
-from .token_validator import get_issuer_from_request
+from .token_validator import decode_access_token, get_issuer_from_request
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1435,19 +1436,22 @@ class OIDCTokenView(HomeAssistantView):
         client_id: str,
         audience: str | None = None,
     ) -> str:
-        """Generate JWT access token."""
+        """Generate a JWT access token (RFC 9068)."""
         now = int(time.time())
         issuer = _issuer_for(request)
 
         # When a resource indicator was supplied (RFC 8707), bind aud to that
         # resource and record the client in azp. Otherwise fall back to the
-        # client_id as the audience for backward compatibility.
+        # client_id as the audience for backward compatibility. token_use marks
+        # the token as an access token for validators that do not check typ.
         payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
             "iss": issuer,
             "aud": audience or client_id,
+            "client_id": client_id,
+            "jti": str(uuid.uuid4()),
             "scope": scope,
             "token_use": TOKEN_USE_ACCESS,
         }
@@ -1469,7 +1473,9 @@ class OIDCTokenView(HomeAssistantView):
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        return jwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": kid})
+        return jwt.encode(
+            payload, private_pem, algorithm="RS256", headers={"kid": kid, "typ": ACCESS_TOKEN_TYPE}
+        )
 
     async def _generate_id_token(
         self,
@@ -1566,35 +1572,8 @@ class OIDCUserInfoView(HomeAssistantView):
         access_token = auth_header[7:]  # Remove "Bearer " prefix
 
         try:
-            # Verify and decode the JWT
-            public_key = hass.data[DOMAIN]["jwt_public_key"]
-            public_pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-
-            # Decode and verify the JWT with issuer verification
-            expected_issuer = _issuer_for(request)
-
-            payload = jwt.decode(
-                access_token,
-                public_pem,
-                algorithms=["RS256"],
-                issuer=expected_issuer,
-                options={
-                    "verify_aud": False,  # We verify manually below
-                    "verify_signature": True,
-                    "verify_exp": True,
-                },
-            )
-
-            # Reject id_tokens at the userinfo endpoint. Only access tokens
-            # are accepted here. Tokens issued before the token_use claim
-            # existed have no token_use; treat absent as access for backward
-            # compatibility, but explicitly reject token_use="id".
-            if payload.get("token_use") == TOKEN_USE_ID:
-                _LOGGER.warning("ID token presented at userinfo endpoint")
-                return web.json_response({"error": "invalid_token"}, status=401)
+            # Verify the signature, expiry and issuer, and refuse ID tokens
+            payload = decode_access_token(hass.data[DOMAIN], access_token, _issuer_for(request))
 
             # Verify the audience claim exists. Access tokens are audience-bound
             # either to a registered client_id (legacy) or to a protected

@@ -30,6 +30,7 @@ import secrets
 import time
 from urllib.parse import parse_qs, urlparse
 
+import jwt
 import pytest
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
@@ -339,6 +340,113 @@ async def test_token_audience_mismatch_is_rejected(
         )
         is None
     )
+
+
+async def _issue_tokens(client: ClientSessionGenerator) -> tuple[dict, dict]:
+    """Register a client and run the whole flow. Returns (registration, token response)."""
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    status, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, body
+    return registration, body
+
+
+async def _userinfo_status(client: ClientSessionGenerator, token: str) -> int:
+    """Present a bearer token at /oidc/userinfo and return the response status."""
+    resp = await client.get(
+        "/oidc/userinfo", headers={**FORWARDED, "Authorization": f"Bearer {token}"}
+    )
+    return resp.status
+
+
+async def test_access_token_follows_jwt_profile(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """The access token is an RFC 9068 JWT that still carries token_use."""
+    client = await hass_client()
+    registration, body = await _issue_tokens(client)
+
+    header = jwt.get_unverified_header(body["access_token"])
+    assert header["typ"] == "at+jwt"
+    assert header["kid"] == hass.data[DOMAIN]["jwt_kid"]
+
+    payload = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=RESOURCE
+    )
+    assert payload is not None
+    assert payload["iss"] == EXPECTED_ISSUER
+    assert payload["aud"] == RESOURCE
+    assert payload["client_id"] == registration["client_id"]
+    assert payload["scope"] == "openid profile"
+    assert payload["token_use"] == "access"
+    assert payload["sub"]
+    assert payload["jti"]
+    assert payload["exp"] - payload["iat"] == 3600
+
+
+async def test_id_token_is_not_accepted_as_access_token(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """An ID token is refused by the validator and at /oidc/userinfo.
+
+    Its aud is the registered client, so only its type keeps it from passing a
+    validator that is not given an expected audience.
+    """
+    client = await hass_client()
+    registration, body = await _issue_tokens(client)
+    id_token = body["id_token"]
+    assert jwt.decode(id_token, options={"verify_signature": False})["aud"] == (
+        registration["client_id"]
+    )
+
+    assert validate_access_token(hass, id_token, ISSUER_BASE) is None
+    assert validate_access_token(hass, id_token, ISSUER_BASE, expected_audience=RESOURCE) is None
+
+    anonymous = await hass_client_no_auth()
+    assert await _userinfo_status(anonymous, id_token) == 401
+    assert await _userinfo_status(anonymous, body["access_token"]) == 200
+
+
+async def test_access_token_without_jwt_profile_type_still_validates(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """An access token without typ at+jwt, client_id or jti is accepted by token_use.
+
+    That is the shape of access tokens from releases without the RFC 9068
+    profile, which stay valid until they expire.
+    """
+    client = await hass_client()
+    _, body = await _issue_tokens(client)
+    claims = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=RESOURCE
+    )
+    legacy_claims = {
+        name: value for name, value in claims.items() if name not in ("client_id", "jti")
+    }
+    legacy_token = jwt.encode(
+        legacy_claims,
+        hass.data[DOMAIN]["jwt_private_key"],
+        algorithm="RS256",
+        headers={"kid": hass.data[DOMAIN]["jwt_kid"]},
+    )
+    assert jwt.get_unverified_header(legacy_token)["typ"] == "JWT"
+
+    payload = validate_access_token(hass, legacy_token, ISSUER_BASE, expected_audience=RESOURCE)
+    assert payload is not None
+    assert payload["sub"] == claims["sub"]
+    assert await _userinfo_status(await hass_client_no_auth(), legacy_token) == 200
 
 
 async def test_pkce_rejects_wrong_verifier(

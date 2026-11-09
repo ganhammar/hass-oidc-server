@@ -6,11 +6,15 @@ from typing import Any
 
 import jwt
 from aiohttp import web
-from cryptography.hazmat.primitives import serialization
 from homeassistant.core import HomeAssistant
+
+from .const import ACCESS_TOKEN_TYPE, TOKEN_USE_ACCESS
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "oidc_provider"
+
+# RFC 9068 §4 accepts the media type with or without its application/ prefix
+_ACCESS_TOKEN_TYPES = {ACCESS_TOKEN_TYPE, f"application/{ACCESS_TOKEN_TYPE}"}
 
 
 def _describe_token(token: str) -> str:
@@ -104,6 +108,43 @@ def _get_ha_external_url(request: web.Request) -> str | None:
         return None
 
 
+def _is_access_token(header: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Return whether a verified token's header and claims make it an access token.
+
+    An access token carries the RFC 9068 typ at+jwt. A token without that typ
+    counts as one only when its token_use claim says it is an access token, so
+    an ID token is never accepted in place of an access token.
+    """
+    token_use = payload.get("token_use")
+    typ = header.get("typ")
+    if isinstance(typ, str) and typ.lower() in _ACCESS_TOKEN_TYPES:
+        return token_use in (None, TOKEN_USE_ACCESS)
+    return token_use == TOKEN_USE_ACCESS
+
+
+def decode_access_token(
+    domain_data: dict[str, Any], token: str, expected_issuer: str
+) -> dict[str, Any]:
+    """Verify an access token signed by this provider and return its claims.
+
+    Checks the signature, expiry and issuer, and that the token is an access
+    token rather than an ID token. The audience is left to the caller.
+
+    Raises:
+        jwt.InvalidTokenError: The token fails one of those checks.
+    """
+    decoded = jwt.decode_complete(
+        token,
+        domain_data["jwt_public_key"],
+        algorithms=["RS256"],
+        issuer=expected_issuer,
+        options={"verify_aud": False},
+    )
+    if not _is_access_token(decoded["header"], decoded["payload"]):
+        raise jwt.InvalidTokenError("Not an access token")
+    return decoded["payload"]
+
+
 def validate_access_token(
     hass: HomeAssistant,
     token: str,
@@ -112,6 +153,8 @@ def validate_access_token(
 ) -> dict[str, Any] | None:
     """
     Validate an OAuth access token issued by this OIDC provider.
+
+    An ID token is refused even though this provider signed it.
 
     Args:
         hass: Home Assistant instance
@@ -130,16 +173,9 @@ def validate_access_token(
             _LOGGER.error("OIDC provider not loaded")
             return None
 
-        public_key = hass.data[DOMAIN].get("jwt_public_key")
-        if not public_key:
+        if not hass.data[DOMAIN].get("jwt_public_key"):
             _LOGGER.error("JWT public key not found")
             return None
-
-        # Convert public key to PEM format for JWT library
-        public_key_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
 
         # The issuer signed into tokens always has the /oidc suffix (RFC 8414).
         # External callers (e.g. hass-mcp-server) typically pass the base URL
@@ -148,16 +184,7 @@ def validate_access_token(
         if not expected_issuer.rstrip("/").endswith("/oidc"):
             expected_issuer = expected_issuer.rstrip("/") + "/oidc"
 
-        # Verify and decode the token with issuer verification
-        payload = jwt.decode(
-            token,
-            public_key_pem,
-            algorithms=["RS256"],
-            issuer=expected_issuer,
-            options={
-                "verify_aud": False,  # We verify manually below
-            },
-        )
+        payload = decode_access_token(hass.data[DOMAIN], token, expected_issuer)
 
         # Verify the audience claim exists.
         aud = payload.get("aud")

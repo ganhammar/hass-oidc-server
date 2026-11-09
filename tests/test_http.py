@@ -1397,6 +1397,110 @@ async def test_oidc_token_view_binds_aud_to_resource():
 
 
 @pytest.mark.asyncio
+async def test_oidc_token_view_issues_jwt_access_token_profile():
+    """Access tokens follow the RFC 9068 JWT profile and keep token_use."""
+    import base64
+
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
+    resource = "https://ha.example.com/api/mcp"
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"test_client": {"client_secret_hash": hash_client_secret("test_secret")}},
+            "authorization_codes": {
+                "valid_code": {
+                    "client_id": "test_client",
+                    "redirect_uri": "https://example.com/callback",
+                    "user_id": "user123",
+                    "scope": "openid profile",
+                    "resource": resource,
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "refresh_tokens": {},
+            "rate_limit_attempts": {},
+            "jwt_private_key": private_key,
+            "jwt_kid": "test-kid-1",
+            "token_store": mock_token_store,
+        }
+    }
+    mock_user = Mock()
+    mock_user.name = "Test User"
+    mock_user.groups = []
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
+
+    def token_request(form):
+        request = MagicMock()
+        request.app = {"hass": hass}
+        request.remote = "127.0.0.1"
+        credentials = base64.b64encode(b"test_client:test_secret").decode("utf-8")
+        request.headers = {
+            "Authorization": f"Basic {credentials}",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "ha.example.com",
+        }
+        request.post = AsyncMock(return_value=form)
+        return request
+
+    view = OIDCTokenView()
+    response = await view.post(
+        token_request(
+            {
+                "grant_type": "authorization_code",
+                "code": "valid_code",
+                "redirect_uri": "https://example.com/callback",
+            }
+        )
+    )
+    assert response.status == 200
+    issued = json.loads(response.body.decode("utf-8"))
+    response = await view.post(
+        token_request({"grant_type": "refresh_token", "refresh_token": issued["refresh_token"]})
+    )
+    assert response.status == 200
+    refreshed = json.loads(response.body.decode("utf-8"))
+
+    claims = []
+    for token in (issued["access_token"], refreshed["access_token"]):
+        assert jwt.get_unverified_header(token) == {
+            "alg": "RS256",
+            "kid": "test-kid-1",
+            "typ": "at+jwt",
+        }
+        decoded = jwt.decode(
+            token,
+            private_key.public_key(),
+            algorithms=["RS256"],
+            audience=resource,
+            issuer="https://ha.example.com/oidc",
+        )
+        assert decoded["sub"] == "user123"
+        assert decoded["client_id"] == "test_client"
+        assert decoded["azp"] == "test_client"
+        assert decoded["scope"] == "openid profile"
+        assert decoded["token_use"] == "access"
+        assert decoded["exp"] - decoded["iat"] == 3600
+        claims.append(decoded)
+
+    assert claims[0]["jti"] and claims[1]["jti"]
+    assert claims[0]["jti"] != claims[1]["jti"]
+
+    # The ID token keeps the generic JWT typ, so it never passes as an access token
+    assert jwt.get_unverified_header(issued["id_token"])["typ"] == "JWT"
+
+
+@pytest.mark.asyncio
 async def test_oidc_token_view_invalid_basic_auth():
     """Test token endpoint with malformed Basic auth."""
     hass = Mock()
@@ -2605,7 +2709,7 @@ async def test_oidc_userinfo_endpoint():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock user
     mock_user = Mock()
@@ -2680,7 +2784,7 @@ async def test_oidc_userinfo_accepts_resource_bound_token():
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -2717,6 +2821,64 @@ async def test_oidc_userinfo_accepts_resource_bound_token():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "token_use", "status"),
+    [
+        ({"typ": "at+jwt"}, "access", 200),
+        # Access tokens signed without the RFC 9068 typ carry token_use=access
+        ({}, "access", 200),
+        ({}, "id", 401),
+        ({}, None, 401),
+        ({"typ": "at+jwt"}, "id", 401),
+    ],
+)
+async def test_oidc_userinfo_accepts_only_access_tokens(headers, token_use, status):
+    """UserInfo tells access tokens apart by typ, or by token_use without it."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "http://localhost/oidc",
+        "aud": "test_client",
+        "scope": "openid",
+    }
+    if token_use is not None:
+        payload["token_use"] = token_use
+    token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
+
+    mock_user = Mock()
+    mock_user.id = "user123"
+    hass = Mock()
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
+    hass.data = {DOMAIN: {"jwt_public_key": private_key.public_key(), "clients": {}}}
+
+    mock_url = Mock()
+    mock_url.origin.return_value = "http://localhost"
+    request = Mock()
+    request.app = {"hass": hass}
+    request.headers = {"Authorization": f"Bearer {token}"}
+    request.url = mock_url
+
+    response = await OIDCUserInfoView().get(request)
+
+    assert response.status == status
+    data = json.loads(response.body.decode("utf-8"))
+    if status == 200:
+        assert data == {"sub": "user123"}
+    else:
+        assert data["error"] == "invalid_token"
+
+
+@pytest.mark.asyncio
 async def test_oidc_userinfo_includes_groups_when_scope_requested():
     """Test UserInfo endpoint includes groups when groups scope is requested."""
     from cryptography.hazmat.backends import default_backend
@@ -2745,7 +2907,7 @@ async def test_oidc_userinfo_includes_groups_when_scope_requested():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock admin user
     mock_user = Mock()
@@ -2814,7 +2976,7 @@ async def test_oidc_userinfo_groups_for_owner():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock owner user (owner is also in admin group)
     mock_user = Mock()
@@ -2883,7 +3045,7 @@ async def test_oidc_userinfo_groups_for_regular_user():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "regular123"
@@ -2951,7 +3113,7 @@ async def test_oidc_userinfo_groups_for_read_only_user():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "readonly123"
@@ -3019,7 +3181,7 @@ async def test_oidc_userinfo_only_returns_sub_without_scopes():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -3090,7 +3252,7 @@ async def test_oidc_userinfo_returns_email_when_username_is_email():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -3440,7 +3602,9 @@ async def test_oidc_userinfo_rejects_token_without_audience():
         "exp": int(time.time()) + 3600,
         # Missing "aud" claim
     }
-    invalid_token = jwt.encode(token_payload, private_pem, algorithm="RS256")
+    invalid_token = jwt.encode(
+        token_payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"}
+    )
 
     hass = Mock()
     hass.data = {
@@ -3492,7 +3656,9 @@ async def test_oidc_userinfo_rejects_token_with_invalid_audience():
         "exp": int(time.time()) + 3600,
         "aud": "nonexistent_client",  # Not registered
     }
-    invalid_token = jwt.encode(token_payload, private_pem, algorithm="RS256")
+    invalid_token = jwt.encode(
+        token_payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"}
+    )
 
     hass = Mock()
     hass.data = {

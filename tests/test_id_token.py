@@ -20,6 +20,7 @@ from custom_components.oidc_provider.http import (
     OIDCUserInfoView,
 )
 from custom_components.oidc_provider.security import hash_client_secret
+from custom_components.oidc_provider.token_validator import validate_access_token
 
 
 def _make_keys():
@@ -614,3 +615,33 @@ async def test_userinfo_accepts_access_token():
     assert userinfo_response.status == 200
     payload = json.loads(userinfo_response.body.decode("utf-8"))
     assert payload["sub"] == "user123"
+
+
+@pytest.mark.asyncio
+async def test_validate_access_token_rejects_id_token():
+    """An ID token is refused where an access token is expected, though its aud is a client."""
+    private_key, _ = _make_keys()
+    verifier, challenge = _pkce_pair()
+
+    hass = _build_token_hass(
+        private_key,
+        auth_code_data={
+            "client_id": "test_client",
+            "redirect_uri": "https://example.com/callback",
+            "user_id": "user123",
+            "scope": "openid",
+            "nonce": None,
+            "auth_time": int(time.time()),
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "expires_at": time.time() + 600,
+        },
+    )
+
+    response = await OIDCTokenView().post(_post_authorization_code(hass, code_verifier=verifier))
+    body = json.loads(response.body.decode("utf-8"))
+    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
+
+    assert jwt.decode(body["id_token"], options={"verify_signature": False})["aud"] == "test_client"
+    assert validate_access_token(hass, body["id_token"], _FIXED_ISSUER) is None
+    assert validate_access_token(hass, body["access_token"], _FIXED_ISSUER) is not None
