@@ -1455,7 +1455,7 @@ async def test_oidc_token_view_rate_limiting():
 
 @pytest.mark.asyncio
 async def test_oidc_token_view_replayed_code_revokes_its_refresh_token():
-    """A code that already issued tokens is refused and its refresh token revoked."""
+    """A code that already issued tokens is refused and its session revoked."""
     from custom_components.oidc_provider.http import OIDCTokenView
     from custom_components.oidc_provider.security import hash_client_secret
 
@@ -1467,13 +1467,14 @@ async def test_oidc_token_view_replayed_code_revokes_its_refresh_token():
             "redeemed_codes": {
                 "used_code": {
                     "client_id": "test_client",
-                    "refresh_token": "issued_refresh",
+                    "family": "fam1",
                     "expires_at": time.time() + 600,
                 }
             },
             "refresh_tokens": {
-                "issued_refresh": {"client_id": "test_client"},
-                "other_refresh": {"client_id": "test_client"},
+                "fam1.issued": {"client_id": "test_client", "family": "fam1"},
+                "fam1.rotated": {"client_id": "test_client", "family": "fam1"},
+                "fam2.other": {"client_id": "test_client", "family": "fam2"},
             },
             "rate_limit_attempts": {},
         }
@@ -1497,7 +1498,8 @@ async def test_oidc_token_view_replayed_code_revokes_its_refresh_token():
 
     assert response.status == 400
     assert json.loads(response.body.decode("utf-8"))["error"] == "invalid_grant"
-    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other_refresh"]
+    # Every refresh token descended from the code is revoked, others are kept
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.other"]
     assert hass.data[DOMAIN]["redeemed_codes"] == {}
 
 
@@ -2090,6 +2092,168 @@ async def test_oidc_token_view_refresh_token():
     assert data["token_type"] == "Bearer"
     assert data["scope"] == "openid email"
 
+    # The presented token is replaced by a new one that remembers it
+    refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
+    assert data["refresh_token"] != "valid_refresh_token"
+    assert list(refresh_tokens) == [data["refresh_token"]]
+    assert refresh_tokens[data["refresh_token"]]["previous"] == "valid_refresh_token"
+    mock_token_store.async_save.assert_called_once()
+
+
+def _rotation_hass(refresh_tokens):
+    """Return hass state for refresh token rotation tests, with its token store."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    token_store = Mock()
+    token_store.async_save = AsyncMock()
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {
+                "test_client": {"client_secret_hash": hash_client_secret("test_secret")},
+                "other_client": {"client_secret_hash": hash_client_secret("other_secret")},
+            },
+            "refresh_tokens": refresh_tokens,
+            "rate_limit_attempts": {},
+            "jwt_private_key": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+            "jwt_kid": "test-kid-1",
+            "token_store": token_store,
+        }
+    }
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=None)
+    return hass, token_store
+
+
+async def _post_refresh_grant(hass, refresh_token, client_id="test_client", secret="test_secret"):
+    """Present a refresh token at the token endpoint. Returns (status, body)."""
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    request.url = Mock()
+    request.url.origin.return_value = "http://localhost"
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "client_secret": secret,
+            "refresh_token": refresh_token,
+        }
+    )
+    response = await OIDCTokenView().post(request)
+    return response.status, json.loads(response.body.decode("utf-8"))
+
+
+def _stored_token(family="fam1", **overrides):
+    data = {
+        "client_id": "test_client",
+        "user_id": "user123",
+        "scope": "openid",
+        "family": family,
+        "expires_at": time.time() + 3600,
+    }
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.asyncio
+async def test_refresh_rotation_keeps_family_and_expiry():
+    """A rotated token stays in its family and keeps the session's original expiry."""
+    expires_at = time.time() + 1234
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(expires_at=expires_at)})
+
+    status, body = await _post_refresh_grant(hass, "fam1.a")
+
+    assert status == 200
+    assert body["refresh_token"].startswith("fam1.")
+    stored = hass.data[DOMAIN]["refresh_tokens"][body["refresh_token"]]
+    assert stored["family"] == "fam1"
+    assert stored["expires_at"] == expires_at
+
+
+@pytest.mark.asyncio
+async def test_refresh_rotation_starts_a_family_for_older_tokens():
+    """A token stored without a family is rotated into a new family."""
+    legacy = _stored_token()
+    del legacy["family"]
+    hass, _ = _rotation_hass({"legacy_token": legacy})
+
+    status, body = await _post_refresh_grant(hass, "legacy_token")
+
+    assert status == 200
+    family = hass.data[DOMAIN]["refresh_tokens"][body["refresh_token"]]["family"]
+    assert body["refresh_token"].startswith(f"{family}.")
+
+
+@pytest.mark.asyncio
+async def test_replaced_refresh_token_within_grace_gets_the_current_token():
+    """Presenting the replaced token right after rotation returns its replacement."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    _, first = await _post_refresh_grant(hass, "fam1.a")
+
+    status, second = await _post_refresh_grant(hass, "fam1.a")
+
+    assert status == 200
+    assert second["refresh_token"] == first["refresh_token"]
+    assert second["access_token"]
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == [first["refresh_token"]]
+
+
+@pytest.mark.asyncio
+async def test_replaced_refresh_token_after_grace_revokes_the_family():
+    """A replaced token presented after the grace period revokes the whole session."""
+    hass, token_store = _rotation_hass(
+        {
+            "fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time() - 61),
+            "fam2.x": _stored_token(family="fam2"),
+        }
+    )
+
+    status, body = await _post_refresh_grant(hass, "fam1.a")
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.x"]
+    token_store.async_save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_older_token_of_a_family_revokes_it():
+    """A token two rotations old is not remembered, so its family prefix revokes the session."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(previous="fam1.b", rotated_at=time.time())})
+
+    status, _ = await _post_refresh_grant(hass, "fam1.a")
+
+    assert status == 400
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_replaced_refresh_token_from_another_client_revokes_the_family():
+    """Another client presenting a replaced token, even within the grace period, revokes it."""
+    hass, _ = _rotation_hass({"fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time())})
+
+    status, _ = await _post_refresh_grant(hass, "fam1.a", "other_client", "other_secret")
+
+    assert status == 400
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_unknown_refresh_token_revokes_nothing():
+    """A token whose prefix matches no stored family is refused and changes nothing."""
+    hass, token_store = _rotation_hass({"fam1.a": _stored_token()})
+
+    status, _ = await _post_refresh_grant(hass, "fam9.zzz")
+
+    assert status == 400
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
+    token_store.async_save.assert_not_called()
+
 
 @pytest.mark.asyncio
 async def test_oidc_token_view_invalid_refresh_token():
@@ -2246,6 +2410,19 @@ async def test_oidc_token_view_rejects_refresh_token_issued_to_other_client():
     # Presentation by the wrong client revokes the token and persists the change
     assert "victim_refresh_token" not in hass.data[DOMAIN]["refresh_tokens"]
     mock_token_store.async_save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_from_another_client_revokes_its_family():
+    """Presentation by another client revokes every token of that session."""
+    hass, _ = _rotation_hass(
+        {"fam1.a": _stored_token(), "fam1.b": _stored_token(), "fam2.x": _stored_token("fam2")}
+    )
+
+    status, _ = await _post_refresh_grant(hass, "fam1.a", "other_client", "other_secret")
+
+    assert status == 400
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.x"]
 
 
 @pytest.mark.asyncio
