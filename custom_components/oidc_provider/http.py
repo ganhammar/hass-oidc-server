@@ -285,8 +285,8 @@ def _revoke_session(hass: HomeAssistant, key: str) -> bool:
 def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
     """Return the session key and client_id a refresh token belongs to.
 
-    The token may be the current one of its session or one it replaced, which
-    is traced through its family prefix.
+    The token may be the current one of its session, one the session retired
+    in the grace period, or an older one traced through its family prefix.
     """
     refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
     data = refresh_tokens.get(token)
@@ -294,9 +294,23 @@ def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
         return _session_key(token, data), data["client_id"]
     family = _refresh_token_family(token)
     for stored_token, data in refresh_tokens.items():
-        if data.get("previous") == token or (family and data.get("family") == family):
+        if token in data.get("retired", {}) or (family and data.get("family") == family):
             return _session_key(stored_token, data), data["client_id"]
     return None
+
+
+def _is_issued_jwt(hass: HomeAssistant, token: str) -> bool:
+    """Return whether a token is a JWT this provider signed, expired or not."""
+    try:
+        jwt.decode(
+            token,
+            hass.data[DOMAIN]["jwt_public_key"],
+            algorithms=["RS256"],
+            options={"verify_exp": False, "verify_aud": False, "verify_iss": False},
+        )
+    except (jwt.InvalidTokenError, KeyError):
+        return False
+    return True
 
 
 def _client_display(hass: HomeAssistant, client_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -1819,7 +1833,8 @@ class OIDCRevocationView(HomeAssistantView):
         """Revoke the session a refresh token belongs to.
 
         Access tokens are self-contained JWTs that expire within the hour and
-        cannot be revoked one by one; like unknown tokens they are answered
+        cannot be revoked one by one, so presenting one is answered with
+        unsupported_token_type (RFC 7009 §2.2.1). Unknown tokens are answered
         with 200 (RFC 7009 §2.2).
         """
         hass = request.app["hass"]
@@ -1836,6 +1851,15 @@ class OIDCRevocationView(HomeAssistantView):
 
         session = _find_session(hass, token)
         if session is None:
+            if _is_issued_jwt(hass, token):
+                return web.json_response(
+                    {
+                        "error": "unsupported_token_type",
+                        "error_description": "Access tokens expire within an hour and "
+                        "cannot be revoked; revoke the refresh token to end the session",
+                    },
+                    status=400,
+                )
             return web.Response(status=200)
         key, owner = session
 

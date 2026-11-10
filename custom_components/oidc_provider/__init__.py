@@ -30,17 +30,19 @@ from .http import client_sessions, revoke_client_sessions, setup_http_endpoints
 
 _LOGGER = logging.getLogger(__name__)
 
-_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()<>#+!|~-])")
 
 
 def _markdown_text(value: str) -> str:
-    """Escape a value for Markdown in a notification.
+    """Return a value as a Markdown code span for a notification.
 
     Client names and redirect URIs come from whoever registered the client,
-    which with dynamic registration or metadata documents can be anyone, so
-    they must not add links or formatting to an administrator's notification.
+    which with dynamic registration or metadata documents can be anyone. In a
+    code span Markdown adds no links, headings or formatting, bare URLs
+    included. Backticks and line breaks, which could end the span, become
+    plain characters.
     """
-    return _MARKDOWN_SPECIAL.sub(r"\\\1", value)
+    text = re.sub(r"[\r\n]+", " ", value).replace("`", "'")
+    return f"`{text}`"
 
 
 STORAGE_VERSION = 1

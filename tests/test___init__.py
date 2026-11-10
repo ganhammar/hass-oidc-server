@@ -988,6 +988,7 @@ def test_markdown_text_cannot_add_links_or_formatting():
     from custom_components.oidc_provider import _markdown_text
 
     assert _markdown_text("[Claude](https://evil.example) *now*") == (
-        r"\[Claude\]\(https://evil.example\) \*now\*"
+        "`[Claude](https://evil.example) *now*`"
     )
-    assert _markdown_text("Test MCP Client") == "Test MCP Client"
+    # Neither a backtick nor a line break can end the code span
+    assert _markdown_text("a`b\n# Heading") == "`a'b # Heading`"

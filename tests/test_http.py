@@ -3741,14 +3741,29 @@ async def test_revocation_ends_the_session_of_a_refresh_token():
 
 
 @pytest.mark.asyncio
-async def test_revocation_of_a_replaced_token_ends_its_session():
-    """A replaced refresh token still identifies its session."""
-    hass, _ = _rotation_hass({"fam1.c": _stored_token(previous="fam1.b")})
+@pytest.mark.parametrize("token", ["fam1.a", "legacy_token"])
+async def test_revocation_of_a_replaced_token_ends_its_session(token):
+    """A replaced refresh token still identifies its session, by prefix or as retired."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(retired={"legacy_token": time.time()})})
 
-    status, _ = await _post_revoke(hass, "fam1.a")
+    status, _ = await _post_revoke(hass, token)
 
     assert status == 200
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_revocation_of_an_access_token_is_unsupported():
+    """Access tokens cannot be revoked, which RFC 7009 §2.2.1 says to report."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    private_key = hass.data[DOMAIN]["jwt_private_key"]
+    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
+    access_token = jwt.encode({"sub": "user123"}, private_key, algorithm="RS256")
+
+    status, body = await _post_revoke(hass, access_token)
+
+    assert (status, json.loads(body)["error"]) == (400, "unsupported_token_type")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
 
 
 @pytest.mark.asyncio

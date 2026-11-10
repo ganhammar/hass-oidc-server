@@ -148,7 +148,20 @@ class OidcLoginPanel extends HTMLElement {
         await this._decide(true);
       }
     } catch (error) {
-      this._renderError(error);
+      if (error.status !== 400) {
+        this._renderError(error);
+        return;
+      }
+      // The stored request has expired or was already used. It stays in this
+      // tab's storage until cleared, so clear it and show the applications.
+      sessionStorage.removeItem('oidc_request_id');
+      try {
+        await this._renderSessions(
+          'That sign-in request is no longer valid. To sign in, start again from the application.'
+        );
+      } catch (sessionsError) {
+        this._renderError(sessionsError, SESSIONS_ERROR_HINT);
+      }
     }
   }
 
@@ -159,10 +172,11 @@ class OidcLoginPanel extends HTMLElement {
     });
 
     // A client identified by a metadata document is vouched for only by the
-    // host serving that document, so the host is shown next to its name.
+    // host serving that document, so the host is shown next to its name. bdi
+    // keeps right-to-left text in a name from reordering what follows it.
     const clientLabel = details.client_host
-      ? `<b>${escapeHtml(details.client_name)}</b> from <b>${escapeHtml(details.client_host)}</b>`
-      : `<b>${escapeHtml(details.client_name)}</b>`;
+      ? `<b><bdi>${escapeHtml(details.client_name)}</bdi></b> from <b><bdi>${escapeHtml(details.client_host)}</bdi></b>`
+      : `<b><bdi>${escapeHtml(details.client_name)}</bdi></b>`;
     // Any program on a computer can listen on a loopback address, so a sign-in
     // that returns there is only safe when the user started it themselves.
     const loopbackNote = details.redirect_is_loopback
@@ -172,7 +186,7 @@ class OidcLoginPanel extends HTMLElement {
     this._renderCard(
       `
         <h1>Approve access?</h1>
-        <p>If you continue, you will be sent to <b>${escapeHtml(details.redirect_host)}</b>. The application will be able to see:</p>
+        <p>If you continue, you will be sent to <b><bdi>${escapeHtml(details.redirect_host)}</bdi></b>. The application will be able to see:</p>
         <ul>${scopes.join('')}</ul>
         ${loopbackNote}
         <div class="action">
@@ -231,14 +245,14 @@ class OidcLoginPanel extends HTMLElement {
     window.location.href = data.redirect_url;
   }
 
-  async _renderSessions() {
+  async _renderSessions(notice = '') {
     const { sessions } = await this._fetchJson('/oidc/sessions');
     const formatTime = (seconds) => (seconds ? new Date(seconds * 1000).toLocaleString() : 'never');
     const items = sessions.map((session) => {
-      const host = session.client_host ? ` from ${escapeHtml(session.client_host)}` : '';
+      const host = session.client_host ? ` from <bdi>${escapeHtml(session.client_host)}</bdi>` : '';
       return `
         <div class="oidc-session">
-          <b>${escapeHtml(session.client_name)}</b>${host}
+          <b><bdi>${escapeHtml(session.client_name)}</bdi></b>${host}
           <div class="oidc-session-meta">Signed in ${escapeHtml(formatTime(session.signed_in_at))}, last used ${escapeHtml(formatTime(session.last_used_at))}</div>
           <div class="action">
             <ha-button appearance="plain" variant="danger" data-session="${escapeHtml(session.session_id)}">Sign out</ha-button>
@@ -247,14 +261,17 @@ class OidcLoginPanel extends HTMLElement {
       `;
     });
 
-    this._renderCard(`
+    this._renderCard(
+      `
       <h1>Connected applications</h1>
       ${
         items.length
           ? `<p>These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.</p>${items.join('')}`
           : '<p>No applications are signed in with your Home Assistant account.</p>'
       }
-    `);
+    `,
+      notice ? `<ha-alert alert-type="info">${escapeHtml(notice)}</ha-alert>` : ''
+    );
 
     for (const button of this.querySelectorAll('ha-button[data-session]')) {
       button.addEventListener('click', () => this._endSession(button.dataset.session));
@@ -274,16 +291,23 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   async _fetchJson(url, init = {}) {
-    const response = await fetch(url, {
-      ...init,
-      headers: {
-        ...(init.headers || {}),
-        Authorization: `Bearer ${this._accessToken()}`,
-      },
-    });
+    // fetchWithAuth renews the Home Assistant access token when it has
+    // expired, which a tab left open for a while needs.
+    const response =
+      typeof this._hass?.fetchWithAuth === 'function'
+        ? await this._hass.fetchWithAuth(url, init)
+        : await fetch(url, {
+            ...init,
+            headers: {
+              ...(init.headers || {}),
+              Authorization: `Bearer ${this._accessToken()}`,
+            },
+          });
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`${response.status} ${text}`.trim());
+      const error = new Error(`${response.status} ${text}`.trim());
+      error.status = response.status;
+      throw error;
     }
     return response.json();
   }

@@ -159,7 +159,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Token**: `https://your-ha-instance/oidc/token`
 - **UserInfo**: `https://your-ha-instance/oidc/userinfo`
 - **JWKS**: `https://your-ha-instance/oidc/jwks`
-- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it
+- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it. Access tokens cannot be revoked and are answered with `unsupported_token_type`; they expire within the hour
 - **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
 
 ### Using with Claude Connectors
