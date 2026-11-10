@@ -22,6 +22,9 @@ REFRESH_TOKEN_REUSE_GRACE = 60  # seconds
 TOKEN_USE_ACCESS = "access"
 TOKEN_USE_ID = "id"
 
+# JOSE typ header of JWT access tokens (RFC 9068)
+ACCESS_TOKEN_TYPE = "at+jwt"
+
 # OIDC scopes
 SCOPE_OPENID = "openid"
 SCOPE_PROFILE = "profile"

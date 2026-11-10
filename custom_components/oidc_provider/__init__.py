@@ -4,14 +4,17 @@ import logging
 import re
 import time
 
+import voluptuous as vol
 from homeassistant.components.frontend import (
     async_register_built_in_panel,
     async_remove_panel,
 )
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError, Unauthorized, UnknownUser
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
 
 from .client_manager import create_client, prune_dynamic_clients, validate_redirect_uris
@@ -26,9 +29,37 @@ from .const import (
     PANEL_URL_PATH,
     STORAGE_KEY_TOKENS,
 )
-from .http import client_sessions, revoke_client_sessions, setup_http_endpoints
+from .http import (
+    async_rotate_signing_key,
+    client_sessions,
+    revoke_client_sessions,
+    setup_http_endpoints,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _admin_only(hass: HomeAssistant, handler):
+    """Wrap a service handler so only administrators can call it.
+
+    The client actions create and remove clients, end the sessions of every
+    user and list every client, so they are for administrators only.
+    Calls without a user, such as from automations, are allowed, as with Home
+    Assistant's own admin services; a script runs as the user who started it.
+    That helper cannot return a response on every supported Home Assistant
+    release, so the check is done here.
+    """
+
+    async def checked(call: ServiceCall):
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.is_admin:
+                raise Unauthorized(context=call.context)
+        return await handler(call)
+
+    return checked
 
 
 def _markdown_text(value: str) -> str:
@@ -48,6 +79,11 @@ STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.clients"
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+ATTR_KEEP_PREVIOUS_KEY = "keep_previous_key"
+ROTATE_SIGNING_KEY_SCHEMA = vol.Schema(
+    {vol.Optional(ATTR_KEEP_PREVIOUS_KEY, default=True): cv.boolean}
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -182,7 +218,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register services
     async def handle_register_client(call):
-        """Handle register_client service."""
+        """Handle register_client service.
+
+        Called for a response, as from Developer Tools, it returns the client
+        ID and secret there. Otherwise it shows them in a notification, which
+        every Home Assistant user can read, so that is only the fallback.
+        """
+
+        async def fail(message: str, notification_id: str) -> None:
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "OIDC Client Registration Failed",
+                    "message": f"❌ {message}",
+                    "notification_id": notification_id,
+                },
+            )
+            if call.return_response:
+                raise HomeAssistantError(message)
+
         try:
             _LOGGER.debug("handle_register_client called with data: %s", call.data)
 
@@ -197,16 +252,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if existing_client["client_name"] == client_name:
                     error_msg = f"Client with name '{client_name}' already exists"
                     _LOGGER.error(error_msg)
-                    await hass.services.async_call(
-                        "persistent_notification",
-                        "create",
-                        {
-                            "title": "OIDC Client Registration Failed",
-                            "message": f"❌ {error_msg}\n\nPlease choose a different client name.",
-                            "notification_id": f"oidc_client_error_{client_name}",
-                        },
+                    await fail(
+                        f"{error_msg}. Please choose a different client name.",
+                        f"oidc_client_error_{client_name}",
                     )
-                    return
+                    return None
 
             # Create client using shared client_manager
             client_info = await create_client(
@@ -217,6 +267,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             client_id = client_info["client_id"]
             client_secret = client_info["client_secret"]
+
+            _LOGGER.info(
+                "Registered OIDC client: %s | Client ID: %s | Redirect URIs: %s",
+                client_name,
+                client_id,
+                redirect_uris,
+            )
+            if call.return_response:
+                return {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "client_name": client_info["client_name"],
+                    "redirect_uris": redirect_uris,
+                    "consent_required": consent_required,
+                }
 
             # Create persistent notification with credentials
             try:
@@ -239,24 +304,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info("Notification created for client registration")
             except Exception as notif_error:
                 _LOGGER.error("Failed to create notification: %s", notif_error)
-
-            _LOGGER.info(
-                "Registered OIDC client: %s | Client ID: %s | Redirect URIs: %s",
-                client_name,
-                client_id,
-                redirect_uris,
-            )
+            return None
         except ValueError as e:
             _LOGGER.error("Error registering OIDC client: %s", e)
-            await hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "OIDC Client Registration Failed",
-                    "message": f"❌ {e}",
-                    "notification_id": "oidc_client_error_invalid",
-                },
-            )
+            await fail(str(e), "oidc_client_error_invalid")
+            return None
+        except HomeAssistantError:
+            raise
         except Exception as e:
             _LOGGER.error("Error registering OIDC client: %s", e, exc_info=True)
 
@@ -421,11 +475,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("Listed %d OIDC clients", len(listing))
         return {"clients": listing} if call.return_response else None
 
-    hass.services.async_register(DOMAIN, "register_client", handle_register_client)
-    hass.services.async_register(DOMAIN, "revoke_client", handle_revoke_client)
-    hass.services.async_register(DOMAIN, "update_client", handle_update_client)
+    async def handle_rotate_signing_key(call):
+        """Handle rotate_signing_key service."""
+        await async_rotate_signing_key(hass, keep_previous_key=call.data[ATTR_KEEP_PREVIOUS_KEY])
+
     hass.services.async_register(
-        DOMAIN, "list_clients", handle_list_clients, supports_response=SupportsResponse.OPTIONAL
+        DOMAIN,
+        "register_client",
+        _admin_only(hass, handle_register_client),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(DOMAIN, "revoke_client", _admin_only(hass, handle_revoke_client))
+    hass.services.async_register(DOMAIN, "update_client", _admin_only(hass, handle_update_client))
+    hass.services.async_register(
+        DOMAIN,
+        "list_clients",
+        _admin_only(hass, handle_list_clients),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        "rotate_signing_key",
+        handle_rotate_signing_key,
+        schema=ROTATE_SIGNING_KEY_SCHEMA,
     )
 
     _LOGGER.info("OIDC Provider initialized")

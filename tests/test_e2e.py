@@ -28,14 +28,19 @@ import hashlib
 import re
 import secrets
 import time
+from urllib.parse import parse_qs, urlparse
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.setup import async_setup_component
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, MockUser
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 from custom_components.oidc_provider.config_flow import OIDCProviderConfigFlow
@@ -43,6 +48,7 @@ from custom_components.oidc_provider.const import (
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
     DOMAIN,
+    STORAGE_KEY_KEYS,
 )
 from custom_components.oidc_provider.token_validator import validate_access_token
 
@@ -109,7 +115,7 @@ async def _register_client(client: ClientSessionGenerator) -> dict:
     return await resp.json()
 
 
-async def _authorize_and_get_code(
+async def _start_authorization(
     client: ClientSessionGenerator,
     *,
     client_id: str,
@@ -117,7 +123,7 @@ async def _authorize_and_get_code(
     resource: str | None,
     redirect_uri: str = REDIRECT_URI,
 ) -> str:
-    """Drive /authorize -> /continue browser-free and return the authorization code."""
+    """Send an authorization request to /authorize and return the pending request id."""
     params = {
         "response_type": "code",
         "client_id": client_id,
@@ -136,22 +142,54 @@ async def _authorize_and_get_code(
     assert resp.status == 200, await resp.text()
     match = re.search(r"oidc_request_id', '([^']+)'", await resp.text())
     assert match, "authorize did not hand back a request_id"
-    request_id = match.group(1)
+    return match.group(1)
 
+
+async def _decide(
+    client: ClientSessionGenerator,
+    request_id: str,
+    *,
+    approve: bool,
+    redirect_uri: str = REDIRECT_URI,
+) -> dict[str, list[str]]:
+    """Post the consent decision and return the query of the redirect to the client."""
     # /oidc/continue requires an authenticated HA user; hass_client carries one.
-    # Approving is what the consent screen posts.
     resp = await client.post(
         "/oidc/continue",
-        json={"request_id": request_id, "approve": True},
+        json={"request_id": request_id, "approve": approve},
         headers=FORWARDED,
     )
     assert resp.status == 200, await resp.text()
     redirect_url = (await resp.json())["redirect_url"]
+    assert redirect_url.startswith(f"{redirect_uri}?"), redirect_url
+    return parse_qs(urlparse(redirect_url).query)
 
-    code_match = re.search(r"[?&]code=([^&]+)", redirect_url)
-    assert code_match, f"no code in redirect: {redirect_url}"
-    assert "state=test-state" in redirect_url
-    return code_match.group(1)
+
+async def _authorize_and_get_code(
+    client: ClientSessionGenerator,
+    *,
+    client_id: str,
+    code_challenge: str,
+    resource: str | None,
+    redirect_uri: str = REDIRECT_URI,
+) -> str:
+    """Drive /authorize -> /continue browser-free and return the authorization code."""
+    request_id = await _start_authorization(
+        client,
+        client_id=client_id,
+        code_challenge=code_challenge,
+        resource=resource,
+        redirect_uri=redirect_uri,
+    )
+
+    # Approving is what the consent screen posts.
+    query = await _decide(client, request_id, approve=True, redirect_uri=redirect_uri)
+
+    assert query["state"] == ["test-state"]
+    # The response names the issuer that signs the tokens (RFC 9207).
+    assert query["iss"] == [EXPECTED_ISSUER]
+    assert "code" in query, f"no code in redirect: {query}"
+    return query["code"][0]
 
 
 async def _exchange_code(
@@ -316,6 +354,258 @@ async def test_token_audience_mismatch_is_rejected(
     )
 
 
+async def _issue_tokens(client: ClientSessionGenerator) -> tuple[dict, dict]:
+    """Register a client and run the whole flow. Returns (registration, token response)."""
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    status, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, body
+    return registration, body
+
+
+async def _userinfo_status(client: ClientSessionGenerator, token: str) -> int:
+    """Present a bearer token at /oidc/userinfo and return the response status."""
+    resp = await client.get(
+        "/oidc/userinfo", headers={**FORWARDED, "Authorization": f"Bearer {token}"}
+    )
+    return resp.status
+
+
+async def test_access_token_follows_jwt_profile(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """The access token is an RFC 9068 JWT that still carries token_use."""
+    client = await hass_client()
+    registration, body = await _issue_tokens(client)
+
+    header = jwt.get_unverified_header(body["access_token"])
+    assert header["typ"] == "at+jwt"
+    assert header["kid"] == hass.data[DOMAIN]["jwt_kid"]
+
+    payload = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=RESOURCE
+    )
+    assert payload is not None
+    assert payload["iss"] == EXPECTED_ISSUER
+    assert payload["aud"] == RESOURCE
+    assert payload["client_id"] == registration["client_id"]
+    assert payload["scope"] == "openid profile"
+    assert payload["token_use"] == "access"
+    assert payload["sub"]
+    assert payload["jti"]
+    assert payload["exp"] - payload["iat"] == 3600
+
+
+async def test_id_token_is_not_accepted_as_access_token(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """An ID token is refused by the validator and at /oidc/userinfo.
+
+    Its aud is the registered client, so only its type keeps it from passing a
+    validator that is not given an expected audience.
+    """
+    client = await hass_client()
+    registration, body = await _issue_tokens(client)
+    id_token = body["id_token"]
+    assert jwt.decode(id_token, options={"verify_signature": False})["aud"] == (
+        registration["client_id"]
+    )
+
+    assert validate_access_token(hass, id_token, ISSUER_BASE) is None
+    assert validate_access_token(hass, id_token, ISSUER_BASE, expected_audience=RESOURCE) is None
+
+    anonymous = await hass_client_no_auth()
+    assert await _userinfo_status(anonymous, id_token) == 401
+    assert await _userinfo_status(anonymous, body["access_token"]) == 200
+
+
+async def test_access_token_without_jwt_profile_type_still_validates(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """An access token without typ at+jwt, client_id or jti is accepted by token_use.
+
+    That is the shape of access tokens from releases without the RFC 9068
+    profile, which stay valid until they expire.
+    """
+    client = await hass_client()
+    _, body = await _issue_tokens(client)
+    claims = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=RESOURCE
+    )
+    legacy_claims = {
+        name: value for name, value in claims.items() if name not in ("client_id", "jti")
+    }
+    legacy_token = jwt.encode(
+        legacy_claims,
+        hass.data[DOMAIN]["jwt_private_key"],
+        algorithm="RS256",
+        headers={"kid": hass.data[DOMAIN]["jwt_kid"]},
+    )
+    assert jwt.get_unverified_header(legacy_token)["typ"] == "JWT"
+
+    payload = validate_access_token(hass, legacy_token, ISSUER_BASE, expected_audience=RESOURCE)
+    assert payload is not None
+    assert payload["sub"] == claims["sub"]
+    assert await _userinfo_status(await hass_client_no_auth(), legacy_token) == 200
+
+
+async def _published_kids(client: ClientSessionGenerator) -> list[str]:
+    """Return the kids /oidc/jwks publishes, in order."""
+    resp = await client.get("/oidc/jwks", headers=FORWARDED)
+    assert resp.status == 200
+    return [key["kid"] for key in (await resp.json())["keys"]]
+
+
+def _is_valid(hass: HomeAssistant, access_token: str) -> bool:
+    """Return whether the access token passes the validator hass-mcp-server uses."""
+    payload = validate_access_token(hass, access_token, ISSUER_BASE, expected_audience=RESOURCE)
+    return payload is not None
+
+
+async def _rotate(hass: HomeAssistant, data: dict, **kwargs) -> None:
+    """Call the rotate_signing_key action and wait for it to finish."""
+    await hass.services.async_call(DOMAIN, "rotate_signing_key", data, blocking=True, **kwargs)
+
+
+async def test_rotation_keeps_previous_key_until_next_rotation(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_storage: dict,
+) -> None:
+    """By default a rotation keeps the replaced key, so tokens it signed keep working."""
+    client = await hass_client()
+    anonymous = await hass_client_no_auth()
+    _, before = await _issue_tokens(client)
+    kid_a = hass.data[DOMAIN]["jwt_kid"]
+
+    await _rotate(hass, {})
+
+    kid_b = hass.data[DOMAIN]["jwt_kid"]
+    assert kid_b != kid_a
+    assert await _published_kids(client) == [kid_b, kid_a]
+    assert _is_valid(hass, before["access_token"])
+    assert await _userinfo_status(anonymous, before["access_token"]) == 200
+
+    _, after = await _issue_tokens(client)
+    assert jwt.get_unverified_header(after["access_token"])["kid"] == kid_b
+    assert jwt.get_unverified_header(after["id_token"])["kid"] == kid_b
+    assert _is_valid(hass, after["access_token"])
+
+    stored = hass_storage[STORAGE_KEY_KEYS]["data"]
+    assert stored["kid"] == kid_b
+    assert stored["previous_key"]["kid"] == kid_a
+
+    # The next rotation keeps only the key it replaces
+    await _rotate(hass, {"keep_previous_key": True})
+
+    kid_c = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(client) == [kid_c, kid_b]
+    assert not _is_valid(hass, before["access_token"])
+    assert await _userinfo_status(anonymous, before["access_token"]) == 401
+    assert _is_valid(hass, after["access_token"])
+
+
+async def test_rotation_dropping_previous_key_invalidates_its_tokens(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_storage: dict,
+) -> None:
+    """Dropping the replaced key, as after a leak, refuses every token it signed at once."""
+    client = await hass_client()
+    _, before = await _issue_tokens(client)
+
+    await _rotate(hass, {"keep_previous_key": False})
+
+    kid_b = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(client) == [kid_b]
+    assert not _is_valid(hass, before["access_token"])
+    assert await _userinfo_status(await hass_client_no_auth(), before["access_token"]) == 401
+    assert "previous_key" not in hass_storage[STORAGE_KEY_KEYS]["data"]
+
+    _, after = await _issue_tokens(client)
+    assert _is_valid(hass, after["access_token"])
+
+
+async def test_rotation_requires_an_admin(
+    setup_provider: None, hass: HomeAssistant, hass_read_only_user: MockUser
+) -> None:
+    """A user who is not an administrator cannot rotate the signing key."""
+    kid = hass.data[DOMAIN]["jwt_kid"]
+
+    with pytest.raises(Unauthorized):
+        await _rotate(hass, {}, context=Context(user_id=hass_read_only_user.id))
+
+    assert hass.data[DOMAIN]["jwt_kid"] == kid
+
+
+async def test_signing_key_stored_without_rotation_support_is_used(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_storage: dict,
+) -> None:
+    """A key stored in the single-key format keeps signing and verifying, and rotates."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    hass_storage[STORAGE_KEY_KEYS] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORAGE_KEY_KEYS,
+        "data": {
+            "private_key_pem": private_pem.decode(),
+            "kid": "kid-from-storage",
+            "created_at": 1234567890.0,
+        },
+    }
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
+    client = await hass_client()
+
+    assert hass.data[DOMAIN]["jwt_kid"] == "kid-from-storage"
+    assert await _published_kids(client) == ["kid-from-storage"]
+    _, body = await _issue_tokens(client)
+    assert jwt.get_unverified_header(body["access_token"])["kid"] == "kid-from-storage"
+    assert jwt.decode(
+        body["access_token"],
+        private_key.public_key(),
+        algorithms=["RS256"],
+        audience=RESOURCE,
+        issuer=EXPECTED_ISSUER,
+    )
+    assert _is_valid(hass, body["access_token"])
+
+    await _rotate(hass, {})
+
+    stored = hass_storage[STORAGE_KEY_KEYS]["data"]
+    assert stored["kid"] == hass.data[DOMAIN]["jwt_kid"] != "kid-from-storage"
+    assert stored["previous_key"]["kid"] == "kid-from-storage"
+    assert await _published_kids(client) == [stored["kid"], "kid-from-storage"]
+    assert _is_valid(hass, body["access_token"])
+
+
 async def test_pkce_rejects_wrong_verifier(
     setup_provider: None, hass_client: ClientSessionGenerator
 ) -> None:
@@ -340,6 +630,30 @@ async def test_pkce_rejects_wrong_verifier(
 
     assert status == 400
     assert body["error"] == "invalid_grant"
+
+
+async def test_denial_names_the_issuer(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """A denied request sends access_denied with the issuer and no code (RFC 9207)."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=RESOURCE,
+    )
+
+    query = await _decide(client, request_id, approve=False)
+
+    assert query == {
+        "error": ["access_denied"],
+        "state": ["test-state"],
+        "iss": [EXPECTED_ISSUER],
+    }
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
 
 
 async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tuple[str, str]:
@@ -556,6 +870,19 @@ async def test_discovery_metadata_advertises_endpoints(
     assert discovery["authorization_endpoint"] == f"{ISSUER_BASE}/oidc/authorize"
     assert discovery["token_endpoint"] == f"{ISSUER_BASE}/oidc/token"
     assert discovery["registration_endpoint"] == f"{ISSUER_BASE}/oidc/register"
+
+
+async def test_discovery_advertises_authorization_response_iss(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    """Every discovery document advertises the iss response parameter (RFC 9207)."""
+    client = await hass_client()
+    for path in DISCOVERY_PATHS:
+        resp = await client.get(path, headers=FORWARDED)
+        assert resp.status == 200
+        metadata = await resp.json()
+        assert metadata["authorization_response_iss_parameter_supported"] is True, path
+        assert metadata["issuer"] == EXPECTED_ISSUER, path
 
 
 async def _assert_registration_refused(client: ClientSessionGenerator) -> None:
@@ -1017,6 +1344,41 @@ async def test_client_services_show_and_end_sessions(
 
 
 @pytest.mark.parametrize(
+    ("service", "data"),
+    [
+        ("register_client", {"client_name": "X", "redirect_uris": REDIRECT_URI}),
+        ("revoke_client", {"client_id": CIMD_CLIENT_ID}),
+        ("update_client", {"client_id": "x", "redirect_uris": REDIRECT_URI}),
+        ("list_clients", {}),
+    ],
+)
+async def test_client_actions_require_an_admin(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_read_only_user: MockUser,
+    service: str,
+    data: dict,
+) -> None:
+    """Users who are not administrators cannot manage clients or end others' sessions."""
+    with pytest.raises(Unauthorized):
+        await hass.services.async_call(
+            DOMAIN, service, data, blocking=True, context=Context(user_id=hass_read_only_user.id)
+        )
+
+
+async def test_client_actions_run_for_an_admin_and_without_a_user(
+    setup_provider: None, hass: HomeAssistant, hass_admin_user: MockUser
+) -> None:
+    """Administrators, and automations that run without a user, can list clients."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+    for context in (Context(user_id=hass_admin_user.id), Context()):
+        response = await hass.services.async_call(
+            DOMAIN, "list_clients", {}, blocking=True, return_response=True, context=context
+        )
+        assert response == {"clients": []}
+
+
+@pytest.mark.parametrize(
     "client_id", ["https://[evil.com]/x", "https://[::1/x", "https://ex\\ample.com/x"]
 )
 async def test_malformed_url_client_id_is_refused_cleanly(
@@ -1040,3 +1402,87 @@ async def test_malformed_url_client_id_is_refused_cleanly(
     )
 
     assert resp.status == 400
+
+
+async def test_register_client_returns_credentials_without_a_notification(
+    setup_provider: None, hass: HomeAssistant, hass_admin_user: MockUser
+) -> None:
+    """Asked for a response, register_client returns the secret instead of posting it."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+    posted: list[dict] = []
+    hass.bus.async_listen(
+        "call_service",
+        lambda event: (
+            posted.append(event.data)
+            if event.data.get("domain") == "persistent_notification"
+            else None
+        ),
+    )
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        "register_client",
+        {"client_name": "Responder", "redirect_uris": REDIRECT_URI},
+        blocking=True,
+        return_response=True,
+        context=Context(user_id=hass_admin_user.id),
+    )
+    await hass.async_block_till_done()
+
+    assert response["client_secret"]
+    assert response["client_id"] in hass.data[DOMAIN]["clients"]
+    assert posted == []
+
+    # Without a response to carry them, the credentials go to a notification
+    await hass.services.async_call(
+        DOMAIN,
+        "register_client",
+        {"client_name": "Notified", "redirect_uris": REDIRECT_URI},
+        blocking=True,
+        context=Context(user_id=hass_admin_user.id),
+    )
+    await hass.async_block_till_done()
+    assert [call["service"] for call in posted] == ["create"]
+
+
+async def test_register_client_failure_is_raised_when_a_response_is_asked_for(
+    setup_provider: None, hass: HomeAssistant
+) -> None:
+    """A caller waiting for the credentials gets the error, not just a notification."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+
+    with pytest.raises(HomeAssistantError, match="must use HTTPS"):
+        await hass.services.async_call(
+            DOMAIN,
+            "register_client",
+            {"client_name": "Bad", "redirect_uris": "http://app.example.com/cb"},
+            blocking=True,
+            return_response=True,
+        )
+
+
+async def test_concurrent_rotations_do_not_bring_back_the_replaced_key(
+    setup_provider: None, hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two rotations at once run one after the other, so the oldest key stays gone."""
+    from custom_components.oidc_provider import http as provider_http
+
+    original = hass.data[DOMAIN]["jwt_kid"]
+    # Keys made in advance, so both rotations have theirs at once
+    new_keys = [provider_http._generate_signing_key() for _ in range(2)]
+    monkeypatch.setattr(provider_http, "_generate_signing_key", new_keys.pop)
+    store = hass.data[DOMAIN]["key_store"]
+    save = store.async_save
+
+    async def slow_save(data: dict) -> None:
+        # A real store write yields to the disk, letting the other rotation run
+        await asyncio.sleep(0.05)
+        await save(data)
+
+    monkeypatch.setattr(store, "async_save", slow_save)
+
+    await asyncio.gather(_rotate(hass, {}), _rotate(hass, {}))
+
+    keys = list(hass.data[DOMAIN]["jwt_verification_keys"])
+    assert len(keys) == 2
+    assert original not in keys

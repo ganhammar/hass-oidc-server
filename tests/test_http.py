@@ -3,6 +3,7 @@
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 import pytest
@@ -15,10 +16,14 @@ from custom_components.oidc_provider.http import (
     OIDCDiscoveryView,
     OIDCJWKSView,
     OIDCRegisterView,
+    _load_or_generate_keys,
+    _use_signing_keys,
+    async_rotate_signing_key,
 )
 from custom_components.oidc_provider.token_validator import (
     _get_ha_external_url,
     get_issuer_from_request,
+    validate_access_token,
 )
 
 
@@ -440,6 +445,28 @@ async def test_discovery_omits_registration_endpoint_when_registration_is_off(vi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "view_class",
+    [
+        OIDCDiscoveryView,
+        OAuth2AuthorizationServerMetadataView,
+        OAuth2AuthorizationServerMetadataAlternateView,
+    ],
+)
+async def test_discovery_advertises_authorization_response_iss(view_class):
+    """Every discovery document tells clients to expect iss on the response (RFC 9207)."""
+    request = Mock()
+    request.headers = {}
+    request.url.origin.return_value = "https://homeassistant.local"
+    request.app = _app_with_registration(True)
+
+    response = await view_class().get(request)
+
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["authorization_response_iss_parameter_supported"] is True
+
+
+@pytest.mark.asyncio
 async def test_oidc_jwks_endpoint():
     """Test OIDC JWKS endpoint returns public key."""
     # Create mock hass with RSA keys
@@ -457,6 +484,7 @@ async def test_oidc_jwks_endpoint():
         DOMAIN: {
             "jwt_public_key": public_key,
             "jwt_kid": "test-kid-1",
+            "jwt_verification_keys": {"test-kid-1": public_key},
         }
     }
 
@@ -479,6 +507,145 @@ async def test_oidc_jwks_endpoint():
     assert "e" in key  # exponent
 
 
+def _stored_signing_key(kid=None):
+    """Return an RSA private key and the dict the key store holds for it."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    stored = {
+        "private_key_pem": private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode(),
+        "created_at": 1234567890.0,
+    }
+    if kid is not None:
+        stored["kid"] = kid
+    return private_key, stored
+
+
+def _key_store(stored=None):
+    store = Mock()
+    store.async_load = AsyncMock(return_value=stored)
+    store.async_save = AsyncMock()
+    return store
+
+
+async def _published_kids(hass):
+    request = Mock()
+    request.app = {"hass": hass}
+    response = await OIDCJWKSView().get(request)
+    return [key["kid"] for key in json.loads(response.body.decode("utf-8"))["keys"]]
+
+
+def _sign_access_token(private_key, kid):
+    now = int(time.time())
+    payload = {
+        "sub": "user123",
+        "iat": now,
+        "exp": now + 3600,
+        "iss": "https://ha.example.com/oidc",
+        "aud": "test_client",
+        "token_use": "access",
+    }
+    return jwt.encode(payload, private_key, algorithm="RS256", headers={"kid": kid})
+
+
+@pytest.mark.parametrize(("kid", "expected_kid"), [("kid-a", "kid-a"), (None, "1")])
+async def test_signing_key_in_single_key_format_is_loaded_as_is(hass, kid, expected_kid):
+    """A stored key without previous_key is the current key and the only published one."""
+    private_key, stored = _stored_signing_key(kid)
+    store = _key_store(stored)
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}}
+
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+
+    store.async_save.assert_not_called()
+    domain_data = hass.data[DOMAIN]
+    assert domain_data["jwt_kid"] == expected_kid
+    assert (
+        domain_data["jwt_public_key"].public_numbers() == private_key.public_key().public_numbers()
+    )
+    assert domain_data["jwt_verification_keys"] == {expected_kid: domain_data["jwt_public_key"]}
+    assert await _published_kids(hass) == [expected_kid]
+
+    token = _sign_access_token(private_key, expected_kid)
+    assert validate_access_token(hass, token, "https://ha.example.com") is not None
+
+
+async def test_signing_key_is_generated_and_stored_when_none_exists(hass):
+    """Without a stored key a new one is generated, stored and used."""
+    store = _key_store(None)
+    hass.data[DOMAIN] = {}
+
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+
+    saved = store.async_save.call_args[0][0]
+    assert set(saved) == {"private_key_pem", "kid", "created_at"}
+    assert hass.data[DOMAIN]["jwt_kid"] == saved["kid"]
+    assert await _published_kids(hass) == [saved["kid"]]
+
+
+async def _key_rotation_hass(hass):
+    """Set hass up with stored key kid-a and return (store, key a, a token it signed)."""
+    private_key, stored = _stored_signing_key("kid-a")
+    store = _key_store(stored)
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}, "key_store": store}
+    _use_signing_keys(hass, await _load_or_generate_keys(store))
+    return store, private_key, _sign_access_token(private_key, "kid-a")
+
+
+async def test_rotate_signing_key_keeps_previous_key(hass):
+    """The replaced key stays published and keeps verifying until the next rotation."""
+    store, _, token_a = await _key_rotation_hass(hass)
+
+    await async_rotate_signing_key(hass, keep_previous_key=True)
+
+    domain_data = hass.data[DOMAIN]
+    kid_b = domain_data["jwt_kid"]
+    assert kid_b != "kid-a"
+    assert await _published_kids(hass) == [kid_b, "kid-a"]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is not None
+
+    saved = store.async_save.call_args[0][0]
+    assert saved["kid"] == kid_b
+    assert saved["previous_key"]["kid"] == "kid-a"
+    # Only the public half of the replaced key is kept
+    assert set(saved["previous_key"]) == {"kid", "public_key_pem"}
+
+    # What was stored loads back into the same keys after a restart
+    hass.data[DOMAIN] = {"clients": {"test_client": {}}}
+    _use_signing_keys(hass, await _load_or_generate_keys(_key_store(saved)))
+    assert await _published_kids(hass) == [kid_b, "kid-a"]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is not None
+
+    # The next rotation keeps only the key it replaces
+    hass.data[DOMAIN]["key_store"] = store
+    await async_rotate_signing_key(hass, keep_previous_key=True)
+
+    kid_c = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(hass) == [kid_c, kid_b]
+    assert store.async_save.call_args[0][0]["previous_key"]["kid"] == kid_b
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is None
+
+
+async def test_rotate_signing_key_drops_previous_key(hass):
+    """Without keeping it, the replaced key is unpublished and its tokens are refused."""
+    store, _, token_a = await _key_rotation_hass(hass)
+
+    await async_rotate_signing_key(hass, keep_previous_key=False)
+
+    kid_b = hass.data[DOMAIN]["jwt_kid"]
+    assert await _published_kids(hass) == [kid_b]
+    assert "previous_key" not in store.async_save.call_args[0][0]
+    assert validate_access_token(hass, token_a, "https://ha.example.com") is None
+
+    token_b = _sign_access_token(hass.data[DOMAIN]["jwt_private_key"], kid_b)
+    assert validate_access_token(hass, token_b, "https://ha.example.com") is not None
+
+
 def _continue_hass(pending=None, clients=None):
     hass = Mock()
     hass.data = {
@@ -493,9 +660,13 @@ def _continue_hass(pending=None, clients=None):
     return hass
 
 
+CONTINUE_ISSUER = "https://ha.example.com/oidc"
+
+
 def _continue_request(hass, *, query=None, body=None):
     request = MagicMock()
     request.query = query or {}
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "ha.example.com"}
     request.app = {"hass": hass}
     request.__getitem__.return_value = Mock(id="user123")
     request.json = AsyncMock(return_value=body if body is not None else {})
@@ -667,7 +838,7 @@ async def test_oidc_continue_view_url_encodes_state():
         _continue_request(hass, body={"request_id": "req123", "approve": True})
     )
     data = json.loads(response.body.decode("utf-8"))
-    assert data["redirect_url"].endswith("&state=a%26b%3Dc%23d%2Be")
+    assert "&state=a%26b%3Dc%23d%2Be&" in data["redirect_url"]
     assert data["redirect_url"].startswith("https://example.com/callback?code=")
 
     hass = _continue_hass(pending={"req123": _pending(state=state)})
@@ -677,6 +848,7 @@ async def test_oidc_continue_view_url_encodes_state():
     data = json.loads(response.body.decode("utf-8"))
     assert data["redirect_url"] == (
         "https://example.com/callback?error=access_denied&state=a%26b%3Dc%23d%2Be"
+        "&iss=https%3A%2F%2Fha.example.com%2Foidc"
     )
 
 
@@ -714,7 +886,10 @@ async def test_oidc_continue_view_success():
 
     # Verify redirect URL
     assert data["redirect_url"].startswith("https://example.com/callback?code=")
-    assert "state=state123" in data["redirect_url"]
+    query = parse_qs(urlparse(data["redirect_url"]).query)
+    assert query["state"] == ["state123"]
+    # The issuer is named on the response (RFC 9207) as tokens and discovery name it
+    assert query["iss"] == [CONTINUE_ISSUER]
 
     # Verify authorization code was created for the authenticated user
     codes = hass.data[DOMAIN]["authorization_codes"]
@@ -740,7 +915,10 @@ async def test_oidc_continue_view_deny():
 
     assert response.status == 200
     data = json.loads(response.body.decode("utf-8"))
-    assert data["redirect_url"] == "https://example.com/callback?error=access_denied&state=state123"
+    assert data["redirect_url"] == (
+        "https://example.com/callback?error=access_denied&state=state123"
+        "&iss=https%3A%2F%2Fha.example.com%2Foidc"
+    )
     assert hass.data[DOMAIN]["authorization_codes"] == {}
     assert "req123" not in hass.data[DOMAIN]["pending_auth_requests"]
 
@@ -1360,6 +1538,110 @@ async def test_oidc_token_view_binds_aud_to_resource():
     saved = mock_token_store.async_save.call_args[0][0]["refresh_tokens"]
     assert saved
     assert all(rt["resource"] == resource for rt in saved.values())
+
+
+@pytest.mark.asyncio
+async def test_oidc_token_view_issues_jwt_access_token_profile():
+    """Access tokens follow the RFC 9068 JWT profile and keep token_use."""
+    import base64
+
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.http import OIDCTokenView
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    mock_token_store = Mock()
+    mock_token_store.async_save = AsyncMock()
+    resource = "https://ha.example.com/api/mcp"
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"test_client": {"client_secret_hash": hash_client_secret("test_secret")}},
+            "authorization_codes": {
+                "valid_code": {
+                    "client_id": "test_client",
+                    "redirect_uri": "https://example.com/callback",
+                    "user_id": "user123",
+                    "scope": "openid profile",
+                    "resource": resource,
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "refresh_tokens": {},
+            "rate_limit_attempts": {},
+            "jwt_private_key": private_key,
+            "jwt_kid": "test-kid-1",
+            "token_store": mock_token_store,
+        }
+    }
+    mock_user = Mock()
+    mock_user.name = "Test User"
+    mock_user.groups = []
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
+
+    def token_request(form):
+        request = MagicMock()
+        request.app = {"hass": hass}
+        request.remote = "127.0.0.1"
+        credentials = base64.b64encode(b"test_client:test_secret").decode("utf-8")
+        request.headers = {
+            "Authorization": f"Basic {credentials}",
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "ha.example.com",
+        }
+        request.post = AsyncMock(return_value=form)
+        return request
+
+    view = OIDCTokenView()
+    response = await view.post(
+        token_request(
+            {
+                "grant_type": "authorization_code",
+                "code": "valid_code",
+                "redirect_uri": "https://example.com/callback",
+            }
+        )
+    )
+    assert response.status == 200
+    issued = json.loads(response.body.decode("utf-8"))
+    response = await view.post(
+        token_request({"grant_type": "refresh_token", "refresh_token": issued["refresh_token"]})
+    )
+    assert response.status == 200
+    refreshed = json.loads(response.body.decode("utf-8"))
+
+    claims = []
+    for token in (issued["access_token"], refreshed["access_token"]):
+        assert jwt.get_unverified_header(token) == {
+            "alg": "RS256",
+            "kid": "test-kid-1",
+            "typ": "at+jwt",
+        }
+        decoded = jwt.decode(
+            token,
+            private_key.public_key(),
+            algorithms=["RS256"],
+            audience=resource,
+            issuer="https://ha.example.com/oidc",
+        )
+        assert decoded["sub"] == "user123"
+        assert decoded["client_id"] == "test_client"
+        assert decoded["azp"] == "test_client"
+        assert decoded["scope"] == "openid profile"
+        assert decoded["token_use"] == "access"
+        assert decoded["exp"] - decoded["iat"] == 3600
+        claims.append(decoded)
+
+    assert claims[0]["jti"] and claims[1]["jti"]
+    assert claims[0]["jti"] != claims[1]["jti"]
+
+    # The ID token keeps the generic JWT typ, so it never passes as an access token
+    assert jwt.get_unverified_header(issued["id_token"])["typ"] == "JWT"
 
 
 @pytest.mark.asyncio
@@ -2611,7 +2893,7 @@ async def test_oidc_userinfo_endpoint():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock user
     mock_user = Mock()
@@ -2686,7 +2968,7 @@ async def test_oidc_userinfo_accepts_resource_bound_token():
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -2723,6 +3005,64 @@ async def test_oidc_userinfo_accepts_resource_bound_token():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "token_use", "status"),
+    [
+        ({"typ": "at+jwt"}, "access", 200),
+        # Access tokens signed without the RFC 9068 typ carry token_use=access
+        ({}, "access", 200),
+        ({}, "id", 401),
+        ({}, None, 401),
+        ({"typ": "at+jwt"}, "id", 401),
+    ],
+)
+async def test_oidc_userinfo_accepts_only_access_tokens(headers, token_use, status):
+    """UserInfo tells access tokens apart by typ, or by token_use without it."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "http://localhost/oidc",
+        "aud": "test_client",
+        "scope": "openid",
+    }
+    if token_use is not None:
+        payload["token_use"] = token_use
+    token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
+
+    mock_user = Mock()
+    mock_user.id = "user123"
+    hass = Mock()
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=mock_user)
+    hass.data = {DOMAIN: {"jwt_public_key": private_key.public_key(), "clients": {}}}
+
+    mock_url = Mock()
+    mock_url.origin.return_value = "http://localhost"
+    request = Mock()
+    request.app = {"hass": hass}
+    request.headers = {"Authorization": f"Bearer {token}"}
+    request.url = mock_url
+
+    response = await OIDCUserInfoView().get(request)
+
+    assert response.status == status
+    data = json.loads(response.body.decode("utf-8"))
+    if status == 200:
+        assert data == {"sub": "user123"}
+    else:
+        assert data["error"] == "invalid_token"
+
+
+@pytest.mark.asyncio
 async def test_oidc_userinfo_includes_groups_when_scope_requested():
     """Test UserInfo endpoint includes groups when groups scope is requested."""
     from cryptography.hazmat.backends import default_backend
@@ -2751,7 +3091,7 @@ async def test_oidc_userinfo_includes_groups_when_scope_requested():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock admin user
     mock_user = Mock()
@@ -2820,7 +3160,7 @@ async def test_oidc_userinfo_groups_for_owner():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     # Mock owner user (owner is also in admin group)
     mock_user = Mock()
@@ -2889,7 +3229,7 @@ async def test_oidc_userinfo_groups_for_regular_user():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "regular123"
@@ -2957,7 +3297,7 @@ async def test_oidc_userinfo_groups_for_read_only_user():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "readonly123"
@@ -3025,7 +3365,7 @@ async def test_oidc_userinfo_only_returns_sub_without_scopes():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -3096,7 +3436,7 @@ async def test_oidc_userinfo_returns_email_when_username_is_email():
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    token = jwt.encode(payload, private_key_pem, algorithm="RS256")
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
 
     mock_user = Mock()
     mock_user.id = "user123"
@@ -3446,7 +3786,9 @@ async def test_oidc_userinfo_rejects_token_without_audience():
         "exp": int(time.time()) + 3600,
         # Missing "aud" claim
     }
-    invalid_token = jwt.encode(token_payload, private_pem, algorithm="RS256")
+    invalid_token = jwt.encode(
+        token_payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"}
+    )
 
     hass = Mock()
     hass.data = {
@@ -3498,7 +3840,9 @@ async def test_oidc_userinfo_rejects_token_with_invalid_audience():
         "exp": int(time.time()) + 3600,
         "aud": "nonexistent_client",  # Not registered
     }
-    invalid_token = jwt.encode(token_payload, private_pem, algorithm="RS256")
+    invalid_token = jwt.encode(
+        token_payload, private_pem, algorithm="RS256", headers={"typ": "at+jwt"}
+    )
 
     hass = Mock()
     hass.data = {

@@ -1,5 +1,6 @@
 """HTTP endpoints for OIDC Provider."""
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -29,6 +30,7 @@ from .client_manager import (
 )
 from .const import (
     ACCESS_TOKEN_EXPIRY,
+    ACCESS_TOKEN_TYPE,
     AUTHORIZATION_CODE_EXPIRY,
     CODE_CHALLENGE_METHOD_S256,
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
@@ -69,7 +71,7 @@ from .const import (
     TOKEN_USE_ID,
 )
 from .security import verify_client_secret
-from .token_validator import get_issuer_from_request
+from .token_validator import decode_access_token, get_issuer_from_request
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +89,16 @@ def _normalize_resource(resource: str | None) -> str | None:
         _LOGGER.warning("Ignoring malformed resource indicator: %s", resource)
         return None
     return resource
+
+
+def _issuer_for(request: web.Request) -> str:
+    """Return the issuer identifier for a request.
+
+    It is the base URL with an /oidc suffix, as RFC 8414 requires: the issuer
+    URL concatenated with /.well-known/oauth-authorization-server must return
+    the auth-server metadata, and that metadata lives under /oidc.
+    """
+    return f"{get_issuer_from_request(request)}/oidc"
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -311,11 +323,22 @@ def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
 
 
 def _is_issued_jwt(hass: HomeAssistant, token: str) -> bool:
-    """Return whether a token is a JWT this provider signed, expired or not."""
+    """Return whether a token is a JWT this provider signed, expired or not.
+
+    It is checked with the published key its kid names, so a token signed with
+    a key kept from a rotation counts too.
+    """
     try:
+        kid = jwt.get_unverified_header(token).get("kid")
+        if kid is None:
+            key = hass.data[DOMAIN]["jwt_public_key"]
+        else:
+            key = hass.data[DOMAIN].get("jwt_verification_keys", {}).get(kid)
+        if key is None:
+            return False
         jwt.decode(
             token,
-            hass.data[DOMAIN]["jwt_public_key"],
+            key,
             algorithms=["RS256"],
             options={"verify_exp": False, "verify_aud": False, "verify_iss": False},
         )
@@ -394,52 +417,109 @@ def _prune_expired(entries: dict[str, dict[str, Any]]) -> None:
         del entries[key]
 
 
-async def _load_or_generate_keys(hass: HomeAssistant) -> tuple[Any, str]:
-    """Load existing RSA keys from storage or generate new ones.
+def _generate_signing_key() -> dict[str, Any]:
+    """Generate an RSA signing key in its stored form: private_key_pem, kid and created_at."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return {
+        "private_key_pem": private_pem.decode(),
+        "kid": str(uuid.uuid4()),
+        "created_at": time.time(),
+    }
 
-    Returns:
-        Tuple of (private_key, kid)
+
+async def _load_or_generate_keys(store: Store) -> dict[str, Any]:
+    """Load the stored signing keys, generating and storing a signing key if there is none.
+
+    The stored dict holds the current signing key at its top level
+    (private_key_pem, kid, created_at). After a rotation that kept the key it
+    replaced, previous_key holds that key's kid and public_key_pem. A dict
+    without previous_key is a single current key, and releases that predate
+    rotation read the same top-level fields.
     """
-    store = Store(hass, STORAGE_VERSION, STORAGE_KEY_KEYS)
     stored_keys = await store.async_load()
 
     if stored_keys and "private_key_pem" in stored_keys:
-        # Load existing key
         _LOGGER.info("Loading existing RSA key from storage")
-        private_key = serialization.load_pem_private_key(
-            stored_keys["private_key_pem"].encode(),
-            password=None,
-            backend=default_backend(),
-        )
-        kid = stored_keys.get("kid", "1")  # Fallback to "1" for old keys
-    else:
-        # Generate new key
-        _LOGGER.info("Generating new RSA key pair for JWT signing")
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048, backend=default_backend()
+        return stored_keys
+
+    _LOGGER.info("Generating new RSA key pair for JWT signing")
+    stored_keys = _generate_signing_key()
+    await store.async_save(stored_keys)
+    _LOGGER.info("RSA key pair generated and saved to storage with kid: %s", stored_keys["kid"])
+    return stored_keys
+
+
+def _use_signing_keys(hass: HomeAssistant, stored_keys: dict[str, Any]) -> None:
+    """Make the stored keys the ones tokens are signed and verified with.
+
+    jwt_private_key, jwt_public_key and jwt_kid are the current key, which signs
+    every token. jwt_verification_keys maps the kid of every published key, the
+    current one first, to its public key.
+    """
+    private_key = serialization.load_pem_private_key(
+        stored_keys["private_key_pem"].encode(),
+        password=None,
+        backend=default_backend(),
+    )
+    kid = stored_keys.get("kid", "1")  # Fallback to "1" for old keys
+    verification_keys = {kid: private_key.public_key()}
+
+    previous_key = stored_keys.get("previous_key")
+    if previous_key:
+        verification_keys[previous_key["kid"]] = serialization.load_pem_public_key(
+            previous_key["public_key_pem"].encode(), backend=default_backend()
         )
 
-        # Generate unique key ID
-        kid = str(uuid.uuid4())
+    domain_data = hass.data[DOMAIN]
+    domain_data["jwt_private_key"] = private_key
+    domain_data["jwt_public_key"] = verification_keys[kid]
+    domain_data["jwt_kid"] = kid
+    domain_data["jwt_verification_keys"] = verification_keys
 
-        # Save to storage
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
 
-        await store.async_save(
-            {
-                "private_key_pem": private_pem.decode(),
-                "kid": kid,
-                "created_at": time.time(),
+async def async_rotate_signing_key(hass: HomeAssistant, keep_previous_key: bool) -> None:
+    """Replace the signing key with a new one and persist the result.
+
+    With keep_previous_key the replaced key stays published and keeps verifying
+    the tokens it signed until the next rotation, so they work until they
+    expire. Without it the replaced key is dropped at once and every token it
+    signed is refused, which is the response to a leaked key.
+
+    Rotations run one at a time. Two at once could each keep the key that was
+    current when they started, so the key replaced by the first would come
+    back as the previous key of the second.
+    """
+    domain_data = hass.data[DOMAIN]
+    async with domain_data.setdefault("key_rotation_lock", asyncio.Lock()):
+        stored_keys = await hass.async_add_executor_job(_generate_signing_key)
+        replaced_kid = domain_data["jwt_kid"]
+
+        if keep_previous_key:
+            public_pem = domain_data["jwt_public_key"].public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            stored_keys["previous_key"] = {
+                "kid": replaced_kid,
+                "public_key_pem": public_pem.decode(),
             }
-        )
 
-        _LOGGER.info("RSA key pair generated and saved to storage with kid: %s", kid)
+        await domain_data["key_store"].async_save(stored_keys)
+        _use_signing_keys(hass, stored_keys)
 
-    return private_key, kid
+    _LOGGER.info(
+        "Rotated the JWT signing key to kid %s; the previous key %s was %s",
+        stored_keys["kid"],
+        replaced_kid,
+        "kept for verification" if keep_previous_key else "dropped",
+    )
 
 
 def _resolve_user_groups(user: Any) -> list[str]:
@@ -467,12 +547,11 @@ def _looks_like_email(value: str) -> bool:
 
 async def setup_http_endpoints(hass: HomeAssistant) -> None:
     """Set up the OIDC HTTP endpoints."""
-    # Load or generate RSA key pair for JWT signing
+    # Load or generate the RSA keys tokens are signed and verified with
     if "jwt_private_key" not in hass.data[DOMAIN]:
-        private_key, kid = await _load_or_generate_keys(hass)
-        hass.data[DOMAIN]["jwt_private_key"] = private_key
-        hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
-        hass.data[DOMAIN]["jwt_kid"] = kid
+        key_store = Store(hass, STORAGE_VERSION, STORAGE_KEY_KEYS)
+        hass.data[DOMAIN]["key_store"] = key_store
+        _use_signing_keys(hass, await _load_or_generate_keys(key_store))
 
     # Initialize rate limiting storage
     if "rate_limit_attempts" not in hass.data[DOMAIN]:
@@ -607,6 +686,9 @@ class OIDCContinueView(HomeAssistantView):
         def build_redirect(**params: str) -> str:
             if state:
                 params["state"] = state
+            # Every response names the issuer so the client can detect a mix-up
+            # with another authorization server (RFC 9207).
+            params["iss"] = _issuer_for(request)
             return f"{redirect_uri}{separator}{urlencode(params)}"
 
         if body.get("approve") is not True:
@@ -685,6 +767,7 @@ class OIDCDiscoveryView(HomeAssistantView):
                 "at_hash",
             ],
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             discovery["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -714,6 +797,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             metadata["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -749,6 +833,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
             "scopes_supported": SUPPORTED_SCOPES,
+            "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
             metadata["registration_endpoint"] = f"{base_url}/oidc/register"
@@ -1474,25 +1559,22 @@ class OIDCTokenView(HomeAssistantView):
         client_id: str,
         audience: str | None = None,
     ) -> str:
-        """Generate JWT access token."""
+        """Generate a JWT access token (RFC 9068)."""
         now = int(time.time())
-
-        # Use dynamic issuer based on the actual base URL. The /oidc suffix is
-        # required by RFC 8414: the issuer URL concatenated with
-        # /.well-known/oauth-authorization-server must return the auth-server
-        # metadata, and that metadata lives under /oidc.
-        base_url = get_issuer_from_request(request)
-        issuer = f"{base_url}/oidc"
+        issuer = _issuer_for(request)
 
         # When a resource indicator was supplied (RFC 8707), bind aud to that
         # resource and record the client in azp. Otherwise fall back to the
-        # client_id as the audience for backward compatibility.
+        # client_id as the audience for backward compatibility. token_use marks
+        # the token as an access token for validators that do not check typ.
         payload = {
             "sub": user_id,
             "iat": now,
             "exp": now + ACCESS_TOKEN_EXPIRY,
             "iss": issuer,
             "aud": audience or client_id,
+            "client_id": client_id,
+            "jti": str(uuid.uuid4()),
             "scope": scope,
             "token_use": TOKEN_USE_ACCESS,
         }
@@ -1514,7 +1596,9 @@ class OIDCTokenView(HomeAssistantView):
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        return jwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": kid})
+        return jwt.encode(
+            payload, private_pem, algorithm="RS256", headers={"kid": kid, "typ": ACCESS_TOKEN_TYPE}
+        )
 
     async def _generate_id_token(
         self,
@@ -1530,8 +1614,7 @@ class OIDCTokenView(HomeAssistantView):
     ) -> str:
         """Generate an OIDC ID Token (OIDC Core 1.0 §2)."""
         now = int(time.time())
-        base_url = get_issuer_from_request(request)
-        issuer = f"{base_url}/oidc"
+        issuer = _issuer_for(request)
 
         payload: dict[str, Any] = {
             "iss": issuer,
@@ -1612,37 +1695,8 @@ class OIDCUserInfoView(HomeAssistantView):
         access_token = auth_header[7:]  # Remove "Bearer " prefix
 
         try:
-            # Verify and decode the JWT
-            public_key = hass.data[DOMAIN]["jwt_public_key"]
-            public_pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            )
-
-            # Decode and verify the JWT with issuer verification. The /oidc
-            # suffix matches what the token endpoint signs into the iss claim
-            # (RFC 8414).
-            expected_issuer = f"{get_issuer_from_request(request)}/oidc"
-
-            payload = jwt.decode(
-                access_token,
-                public_pem,
-                algorithms=["RS256"],
-                issuer=expected_issuer,
-                options={
-                    "verify_aud": False,  # We verify manually below
-                    "verify_signature": True,
-                    "verify_exp": True,
-                },
-            )
-
-            # Reject id_tokens at the userinfo endpoint. Only access tokens
-            # are accepted here. Tokens issued before the token_use claim
-            # existed have no token_use; treat absent as access for backward
-            # compatibility, but explicitly reject token_use="id".
-            if payload.get("token_use") == TOKEN_USE_ID:
-                _LOGGER.warning("ID token presented at userinfo endpoint")
-                return web.json_response({"error": "invalid_token"}, status=401)
+            # Verify the signature, expiry and issuer, and refuse ID tokens
+            payload = decode_access_token(hass.data[DOMAIN], access_token, _issuer_for(request))
 
             # Verify the audience claim exists. Access tokens are audience-bound
             # either to a registered client_id (legacy) or to a protected
@@ -1705,11 +1759,6 @@ class OIDCJWKSView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         """Handle JWKS request."""
         hass = request.app["hass"]
-        public_key = hass.data[DOMAIN]["jwt_public_key"]
-        kid = hass.data[DOMAIN]["jwt_kid"]
-
-        # Get the public key numbers
-        public_numbers = public_key.public_numbers()
 
         # Convert modulus (n) and exponent (e) to base64url format
         def int_to_base64url(value: int) -> str:
@@ -1719,8 +1768,11 @@ class OIDCJWKSView(HomeAssistantView):
             # Base64url encode (no padding)
             return base64.urlsafe_b64encode(value_bytes).decode("utf-8").rstrip("=")
 
-        jwks = {
-            "keys": [
+        # Every key that verifies tokens is published, the signing key first
+        keys = []
+        for kid, public_key in hass.data[DOMAIN]["jwt_verification_keys"].items():
+            public_numbers = public_key.public_numbers()
+            keys.append(
                 {
                     "kty": "RSA",
                     "use": "sig",
@@ -1729,10 +1781,9 @@ class OIDCJWKSView(HomeAssistantView):
                     "n": int_to_base64url(public_numbers.n),  # Modulus
                     "e": int_to_base64url(public_numbers.e),  # Exponent
                 }
-            ]
-        }
+            )
 
-        return web.json_response(jwks)
+        return web.json_response({"keys": keys})
 
 
 def _registration_refusal(hass: HomeAssistant, remote: str | None) -> web.Response | None:
