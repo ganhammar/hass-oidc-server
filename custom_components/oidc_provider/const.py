@@ -74,5 +74,26 @@ CONF_REQUIRE_PKCE = "require_pkce"
 DEFAULT_ALLOW_DYNAMIC_REGISTRATION = False
 CONF_ALLOW_DYNAMIC_REGISTRATION = "allow_dynamic_registration"
 
+# Client ID Metadata Documents: a client_id that is an HTTPS URL is resolved by
+# fetching the client's metadata from it. On by default, since it lets clients
+# such as Claude sign in without dynamic registration and every sign-in through
+# such a client stops on the consent screen.
+DEFAULT_ALLOW_CLIENT_METADATA_DOCUMENTS = True
+CONF_ALLOW_CLIENT_METADATA_DOCUMENTS = "allow_client_metadata_documents"
+CIMD_MAX_DOCUMENT_BYTES = 5 * 1024  # The draft's recommended limit
+CIMD_FETCH_TIMEOUT = 5  # seconds
+CIMD_FETCHES_PER_MINUTE = 30  # Fetches that miss the cache, across all callers
+CIMD_FETCHES_PER_MINUTE_PER_ADDRESS = 5  # The same, for one remote address
+CIMD_CACHE_MIN_TTL = 60  # seconds
+CIMD_CACHE_DEFAULT_TTL = 3600  # seconds, when the response sets no max-age
+CIMD_CACHE_MAX_TTL = 86400  # seconds
+CIMD_CACHE_MAX_ENTRIES = 100
+
+# Authorization requests waiting for the user to sign in and decide. Anyone can
+# start one, so new ones are refused beyond these many, overall and from one
+# remote address, rather than cancelling sign-ins already under way.
+MAX_PENDING_AUTH_REQUESTS = 1000
+MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS = 20
+
 # Frontend panel serving the login flow (hidden from the sidebar)
 PANEL_URL_PATH = "oidc_login"

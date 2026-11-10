@@ -8,7 +8,10 @@ from custom_components.oidc_provider.config_flow import (
     OIDCProviderConfigFlow,
     OIDCProviderOptionsFlow,
 )
-from custom_components.oidc_provider.const import CONF_ALLOW_DYNAMIC_REGISTRATION
+from custom_components.oidc_provider.const import (
+    CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
+)
 
 
 def _schema_default(schema, key):
@@ -50,7 +53,10 @@ class TestOIDCProviderConfigFlow:
         assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
         assert result["title"] == "OIDC Provider"
         assert result["data"] == {}
-        assert result["options"] == {CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+        assert result["options"] == {
+            CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: True,
+            CONF_ALLOW_DYNAMIC_REGISTRATION: False,
+        }
 
     async def test_user_flow_records_dynamic_registration_choice(self):
         """The setup choice for dynamic registration lands in the entry options."""
@@ -65,7 +71,10 @@ class TestOIDCProviderConfigFlow:
 
         assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
         assert result["data"] == {}
-        assert result["options"] == {CONF_ALLOW_DYNAMIC_REGISTRATION: True}
+        assert result["options"] == {
+            CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: True,
+            CONF_ALLOW_DYNAMIC_REGISTRATION: True,
+        }
 
     async def test_user_flow_shows_form_when_no_input(self):
         """Test user flow shows form when no input provided."""
@@ -103,7 +112,7 @@ class TestOIDCProviderConfigFlow:
         """Test config flow version is set."""
         flow = OIDCProviderConfigFlow()
         assert flow.VERSION == 1
-        assert flow.MINOR_VERSION == 2
+        assert flow.MINOR_VERSION == 3
 
     def test_async_get_options_flow_returns_options_flow(self):
         """Test async_get_options_flow returns options flow instance."""
@@ -114,7 +123,7 @@ class TestOIDCProviderConfigFlow:
             assert isinstance(options_flow, OIDCProviderOptionsFlow)
 
     async def test_user_flow_form_offers_dynamic_registration_off(self):
-        """The setup form asks about dynamic registration and defaults it to off."""
+        """The setup form defaults metadata documents on and dynamic registration off."""
         mock_hass = Mock()
         mock_hass.config_entries = Mock()
         mock_hass.config_entries.async_entries = Mock(return_value=[])
@@ -124,7 +133,11 @@ class TestOIDCProviderConfigFlow:
 
         result = await flow.async_step_user(user_input=None)
 
-        assert list(result["data_schema"].schema) == [CONF_ALLOW_DYNAMIC_REGISTRATION]
+        assert list(result["data_schema"].schema) == [
+            CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
+            CONF_ALLOW_DYNAMIC_REGISTRATION,
+        ]
+        assert _schema_default(result["data_schema"], CONF_ALLOW_CLIENT_METADATA_DOCUMENTS) is True
         assert _schema_default(result["data_schema"], CONF_ALLOW_DYNAMIC_REGISTRATION) is False
 
 
@@ -188,6 +201,14 @@ class TestOIDCProviderOptionsFlow:
         result = await flow.async_step_init(user_input=None)
 
         assert _schema_default(result["data_schema"], CONF_ALLOW_DYNAMIC_REGISTRATION) is False
+
+    async def test_init_step_defaults_metadata_documents_on(self):
+        """An entry with no recorded setting shows metadata documents as on."""
+        flow = _options_flow({})
+
+        result = await flow.async_step_init(user_input=None)
+
+        assert _schema_default(result["data_schema"], CONF_ALLOW_CLIENT_METADATA_DOCUMENTS) is True
 
     async def test_init_step_saves_dynamic_registration_choice(self):
         """Submitting the options form stores both settings."""

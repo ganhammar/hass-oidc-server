@@ -377,3 +377,43 @@ async def test_create_client_strips_client_name(mock_hass):
         mock_hass, client_name="  Padded  ", redirect_uris=["https://example.com/callback"]
     )
     assert result["client_name"] == "Padded"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://сlaude.ai/callback",
+        "https://app.example.com/callback#section",
+        "http://localhost/callback#",
+    ],
+)
+def test_redirect_uris_must_be_ascii_without_fragment(uri):
+    """Look-alike hosts would mislead the consent screen; fragments are not allowed (RFC 6749)."""
+    from custom_components.oidc_provider.client_manager import validate_redirect_uris
+
+    with pytest.raises(ValueError):
+        validate_redirect_uris([uri])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Claude\nInjected", "Evil\u202eedoc", "Zero\u200bWidth", "Tab\there", "Line\u2028sep"],
+)
+def test_client_name_rejects_control_and_formatting_characters(name):
+    """Names anyone can choose must not reorder or break the text around them."""
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    with pytest.raises(ValueError):
+        validate_client_name(name)
+
+
+def test_client_name_allows_ordinary_unicode():
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    assert validate_client_name("Café Assistant 日本") == "Café Assistant 日本"
+    # Emoji joined with a zero-width joiner stay usable, but a joiner alone is no name
+    with pytest.raises(ValueError):
+        validate_client_name("\u200d\u200d")
+    assert (
+        validate_client_name("\U0001f468\u200d\U0001f4bb Dev") == "\U0001f468\u200d\U0001f4bb Dev"
+    )

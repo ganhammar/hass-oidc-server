@@ -38,7 +38,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 from custom_components.oidc_provider.config_flow import OIDCProviderConfigFlow
-from custom_components.oidc_provider.const import CONF_ALLOW_DYNAMIC_REGISTRATION, DOMAIN
+from custom_components.oidc_provider.const import (
+    CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
+    CONF_ALLOW_DYNAMIC_REGISTRATION,
+    DOMAIN,
+)
 from custom_components.oidc_provider.token_validator import validate_access_token
 
 # The issuer is derived from the request Host. Pin it with forwarded headers so
@@ -110,12 +114,13 @@ async def _authorize_and_get_code(
     client_id: str,
     code_challenge: str,
     resource: str | None,
+    redirect_uri: str = REDIRECT_URI,
 ) -> str:
     """Drive /authorize -> /continue browser-free and return the authorization code."""
     params = {
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "scope": "openid profile",
         "state": "test-state",
         "code_challenge": code_challenge,
@@ -553,7 +558,11 @@ async def test_entry_from_earlier_release_keeps_registration_on(
     entry = await _setup_entry(hass, minor_version=1, options={"require_pkce": True})
 
     assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
-    assert entry.options == {"require_pkce": True, CONF_ALLOW_DYNAMIC_REGISTRATION: True}
+    assert entry.options == {
+        "require_pkce": True,
+        CONF_ALLOW_DYNAMIC_REGISTRATION: True,
+        CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: True,
+    }
 
     client = await hass_client()
     await _register_client(client)
@@ -572,7 +581,11 @@ async def test_entry_with_saved_choice_keeps_it_on_migration(
     )
 
     assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
-    assert entry.options == {CONF_ALLOW_DYNAMIC_REGISTRATION: False}
+    # Metadata documents follow, so the install still admits only its own clients
+    assert entry.options == {
+        CONF_ALLOW_DYNAMIC_REGISTRATION: False,
+        CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: False,
+    }
     await _assert_registration_refused(await hass_client())
 
 
@@ -597,7 +610,10 @@ async def test_setup_flow_records_registration_choice(
     entry = result["result"]
     assert entry.state is ConfigEntryState.LOADED
     assert entry.minor_version == OIDCProviderConfigFlow.MINOR_VERSION
-    assert entry.options == {CONF_ALLOW_DYNAMIC_REGISTRATION: enabled}
+    assert entry.options == {
+        CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: True,
+        CONF_ALLOW_DYNAMIC_REGISTRATION: enabled,
+    }
     assert hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is enabled
 
 
@@ -621,3 +637,253 @@ async def test_options_flow_turns_registration_off_without_reload(
     await _assert_registration_refused(client)
     # The client that registered while it was on is still there
     assert len(hass.data[DOMAIN]["clients"]) == 1
+
+
+CIMD_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata"
+CIMD_DOCUMENT = {
+    "client_id": CIMD_CLIENT_ID,
+    "client_name": "Claude Code",
+    "client_uri": "https://claude.ai",
+    "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "token_endpoint_auth_method": "none",
+}
+LOOPBACK_REDIRECT_URI = "http://localhost:53682/callback"
+
+
+@pytest.fixture
+def metadata_document(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Serve CIMD_DOCUMENT for every metadata fetch and record the URLs fetched."""
+    fetched: list[str] = []
+
+    async def fetch(client_id: str) -> tuple[dict, float]:
+        fetched.append(client_id)
+        return dict(CIMD_DOCUMENT), 300
+
+    monkeypatch.setattr("custom_components.oidc_provider.cimd._fetch_document", fetch)
+    return fetched
+
+
+async def test_metadata_document_client_signs_in_without_registering(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    metadata_document: list[str],
+) -> None:
+    """Claude Code signs in with its metadata document URL as client_id and no secret."""
+    client = await hass_client()
+
+    resp = await client.get(DISCOVERY_PATHS[0], headers=FORWARDED)
+    discovery = await resp.json()
+    assert discovery["client_id_metadata_document_supported"] is True
+    assert "none" in discovery["token_endpoint_auth_methods_supported"]
+
+    verifier, challenge = _pkce_pair()
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CIMD_CLIENT_ID,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid profile",
+            "state": "test-state",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": RESOURCE,
+        },
+        headers=FORWARDED,
+    )
+    assert resp.status == 200, await resp.text()
+    request_id = re.search(r"oidc_request_id', '([^']+)'", await resp.text()).group(1)
+    assert metadata_document == [CIMD_CLIENT_ID]
+
+    # The consent screen names the client and the host vouching for it
+    resp = await client.get("/oidc/continue", params={"request_id": request_id})
+    details = await resp.json()
+    assert details["client_name"] == "Claude Code"
+    assert details["client_host"] == "claude.ai"
+    assert details["consent_required"] is True
+    assert details["redirect_is_loopback"] is True
+
+    resp = await client.post(
+        "/oidc/continue", json={"request_id": request_id, "approve": True}, headers=FORWARDED
+    )
+    redirect_url = (await resp.json())["redirect_url"]
+    assert redirect_url.startswith(f"{LOOPBACK_REDIRECT_URI}?code=")
+    code = re.search(r"[?&]code=([^&]+)", redirect_url).group(1)
+
+    status, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=CIMD_CLIENT_ID,
+        client_secret="",
+        code_verifier=verifier,
+        redirect_uri=LOOPBACK_REDIRECT_URI,
+    )
+    assert status == 200, body
+    payload = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=RESOURCE
+    )
+    assert payload is not None
+
+    resp = await client.post(
+        "/oidc/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": body["refresh_token"],
+            "client_id": CIMD_CLIENT_ID,
+        },
+        headers=FORWARDED,
+    )
+    assert resp.status == 200, await resp.text()
+
+
+async def test_public_client_must_use_pkce_even_when_not_required(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    metadata_document: list[str],
+) -> None:
+    """Without a secret, PKCE is what binds the code, so public clients always need it."""
+    hass.data[DOMAIN]["require_pkce"] = False
+    client = await hass_client()
+
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CIMD_CLIENT_ID,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid",
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400
+    assert "PKCE" in await resp.text()
+
+
+async def test_metadata_documents_turned_off(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    metadata_document: list[str],
+) -> None:
+    """With the option off, URL client_ids are unknown and discovery does not offer them."""
+    hass.data[DOMAIN][CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] = False
+    client = await hass_client()
+
+    resp = await client.get(DISCOVERY_PATHS[0], headers=FORWARDED)
+    assert "client_id_metadata_document_supported" not in await resp.json()
+
+    _, challenge = _pkce_pair()
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": CIMD_CLIENT_ID,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400
+    assert metadata_document == []
+
+
+async def test_dynamically_registered_public_client(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """A client registering with auth method none gets no secret and signs in with PKCE."""
+    client = await hass_client()
+    resp = await client.post(
+        "/oidc/register",
+        json={
+            "client_name": "Public MCP Client",
+            "redirect_uris": [REDIRECT_URI],
+            "token_endpoint_auth_method": "none",
+        },
+        headers=FORWARDED,
+    )
+    assert resp.status == 201
+    registration = await resp.json()
+    assert "client_secret" not in registration
+
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client, client_id=registration["client_id"], code_challenge=challenge, resource=RESOURCE
+    )
+    status, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret="",
+        code_verifier=verifier,
+    )
+    assert status == 200, body
+
+
+@pytest.mark.parametrize(
+    "cap", ["MAX_PENDING_AUTH_REQUESTS", "MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS"]
+)
+async def test_pending_authorizations_are_capped(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    cap: str,
+) -> None:
+    """Past a cap new authorizations are refused, and the ones under way are kept."""
+    monkeypatch.setattr(f"custom_components.oidc_provider.http.{cap}", 2)
+    client = await hass_client()
+    registration = await _register_client(client)
+
+    statuses = []
+    for _ in range(3):
+        _, challenge = _pkce_pair()
+        resp = await client.get(
+            "/oidc/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registration["client_id"],
+                "redirect_uri": REDIRECT_URI,
+                "scope": "openid",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+            headers=FORWARDED,
+        )
+        statuses.append(resp.status)
+
+    assert statuses == [200, 200, 429]
+    assert len(hass.data[DOMAIN]["pending_auth_requests"]) == 2
+
+
+@pytest.mark.parametrize(
+    "client_id", ["https://[evil.com]/x", "https://[::1/x", "https://ex\\ample.com/x"]
+)
+async def test_malformed_url_client_id_is_refused_cleanly(
+    setup_provider: None, hass_client: ClientSessionGenerator, client_id: str
+) -> None:
+    """A client_id that is not a valid URL gets a 400, not a server error."""
+    client = await hass_client()
+    _, challenge = _pkce_pair()
+
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400

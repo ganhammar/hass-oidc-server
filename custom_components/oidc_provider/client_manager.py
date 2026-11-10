@@ -2,6 +2,7 @@
 
 import logging
 import secrets
+import unicodedata
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,19 +17,38 @@ DOMAIN = "oidc_provider"
 MAX_CLIENT_NAME_LENGTH = 100
 
 
+# Joins emoji such as 👨‍💻 into one character. It is a formatting character but
+# can neither reorder text nor break a line.
+_ZERO_WIDTH_JOINER = "\u200d"
+
+
+def _is_disallowed_name_character(char: str) -> bool:
+    """Return whether a character may not appear in a client name."""
+    if char == _ZERO_WIDTH_JOINER:
+        return False
+    category = unicodedata.category(char)
+    return category[0] == "C" or category in ("Zl", "Zp")
+
+
 def validate_client_name(client_name: Any) -> str:
     """Return the client name if it is a usable display string.
 
-    The name is shown on the consent screen, so it must be a non-empty string
-    of bounded length.
+    The name is shown on the consent screen and in notifications, and anyone
+    can choose it through dynamic registration or a metadata document. So it
+    must be a non-empty string of bounded length on one line, without control
+    or formatting characters: a right-to-left override could reorder the text
+    around it, and a line break could add headings to a notification.
 
     Raises:
-        ValueError: If the name is not a string, is blank, or is too long
+        ValueError: If the name is not a string, is blank, too long, or holds
+            control, formatting or line separator characters
     """
-    if not isinstance(client_name, str) or not client_name.strip():
+    if not isinstance(client_name, str) or not client_name.replace(_ZERO_WIDTH_JOINER, "").strip():
         raise ValueError("client_name must be a non-empty string")
     if len(client_name) > MAX_CLIENT_NAME_LENGTH:
         raise ValueError(f"client_name must be at most {MAX_CLIENT_NAME_LENGTH} characters")
+    if any(_is_disallowed_name_character(c) for c in client_name):
+        raise ValueError("client_name must not contain control or formatting characters")
     return client_name.strip()
 
 
@@ -36,12 +56,20 @@ def validate_redirect_uris(redirect_uris: list[Any]) -> None:
     """Check that every redirect URI is an absolute http(s) URL we can display safely.
 
     Raises:
-        ValueError: If any URI is malformed, uses a disallowed scheme, carries
-            userinfo, or has an out-of-range port
+        ValueError: If any URI is malformed, not ASCII, uses a disallowed scheme,
+            carries userinfo or a fragment, or has an out-of-range port
     """
     for uri in redirect_uris:
         if not isinstance(uri, str):
             raise ValueError("Each redirect_uri must be a string")
+        # The host is shown on the consent screen, where a Unicode look-alike
+        # of another domain would read as that domain. International domain
+        # names are accepted in their ASCII (punycode) form.
+        if not uri.isascii():
+            raise ValueError(f"Redirect URI must be ASCII, with punycode host names: {uri}")
+        # RFC 6749 §3.1.2: a redirection endpoint must not include a fragment
+        if "#" in uri:
+            raise ValueError(f"Redirect URI must not contain a fragment: {uri}")
         try:
             parsed = urlparse(uri)
         except Exception as e:
@@ -109,10 +137,12 @@ async def create_client(
     client_name = validate_client_name(client_name)
     validate_redirect_uris(redirect_uris)
 
-    # Generate client credentials
+    # Generate client credentials. A public client (token_endpoint_auth_method
+    # none) gets no secret; it proves its grants with PKCE.
     client_id = secrets.token_urlsafe(32)
-    client_secret = secrets.token_urlsafe(48)
-    client_secret_hash = hash_client_secret(client_secret)
+    client_secret = None
+    if token_endpoint_auth_method != "none":
+        client_secret = secrets.token_urlsafe(48)
 
     # Store client in hass.data
     if "clients" not in hass.data[DOMAIN]:
@@ -120,13 +150,16 @@ async def create_client(
 
     hass.data[DOMAIN]["clients"][client_id] = {
         "client_name": client_name,
-        "client_secret_hash": client_secret_hash,
         "redirect_uris": redirect_uris,
         "grant_types": grant_types,
         "response_types": response_types,
         "token_endpoint_auth_method": token_endpoint_auth_method,
         "consent_required": consent_required,
     }
+    if client_secret is not None:
+        hass.data[DOMAIN]["clients"][client_id]["client_secret_hash"] = hash_client_secret(
+            client_secret
+        )
 
     # Persist to storage
     store = hass.data[DOMAIN]["store"]
@@ -136,9 +169,8 @@ async def create_client(
 
     # Return client information including the plain text secret
     # (only time it's available)
-    return {
+    client_info = {
         "client_id": client_id,
-        "client_secret": client_secret,
         "client_name": client_name,
         "redirect_uris": redirect_uris,
         "grant_types": grant_types,
@@ -146,3 +178,6 @@ async def create_client(
         "token_endpoint_auth_method": token_endpoint_auth_method,
         "consent_required": consent_required,
     }
+    if client_secret is not None:
+        client_info["client_secret"] = client_secret
+    return client_info

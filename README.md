@@ -8,8 +8,9 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 - **Integrates with Home Assistant's native authentication** including TOTP/2FA
 - **JWT-based access tokens** with RSA signing
 - **Support for authorization code flow** with refresh tokens
+- **Claude and other MCP clients connect without registration** through Client ID Metadata Documents
 - **Easy client registration** via Home Assistant services
-- **Consent screen** for dynamically registered clients, styled like the Home Assistant login
+- **Consent screen** for clients you did not register yourself, styled like the Home Assistant login
 - **No external dependencies** - runs entirely within Home Assistant
 
 This integration acts as an OIDC abstraction layer on top of Home Assistant's built-in authentication system. It does not create new user accounts or add additional login methods—users authenticate with their existing Home Assistant credentials through the standard login interface.
@@ -35,18 +36,21 @@ This integration acts as an OIDC abstraction layer on top of Home Assistant's bu
 1. Go to **Settings** → **Devices & Services**
 1. Click **Add Integration**
 1. Search for "OIDC Provider"
-1. Choose whether to **Allow dynamic client registration** (see below), then click **Submit**
+1. Choose whether to **Allow client metadata documents** and **Allow dynamic client registration** (see below), then click **Submit**
 
 ### Options
 
 Change these later under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**. Changes apply immediately, without a restart.
 
-- **Require PKCE** (default: on): authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires.
-- **Allow dynamic client registration** (default: off for new installs): lets clients register themselves at `/oidc/register` (RFC 7591). MCP clients such as Claude use this to connect without a client you created for them. Every sign-in through a dynamically registered client stops on the [consent screen](#consent-screen).
+- **Require PKCE** (default: on): authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires. Public clients, which have no secret, always need it.
+- **Allow client metadata documents** (default: on for new installs): accepts clients whose client ID is an HTTPS URL serving their metadata, as described in [Client ID Metadata Documents](#client-id-metadata-documents). This is how Claude connects. Turning it off ends those clients' sessions at their next token refresh.
+- **Allow dynamic client registration** (default: off for new installs): lets clients register themselves at `/oidc/register` (RFC 7591). Only needed for clients that support neither client metadata documents nor a client you register for them. Every sign-in through a dynamically registered client stops on the [consent screen](#consent-screen).
 
 While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
 
 Installs set up before version 1.7.0 keep dynamic client registration on, since it was always on before, so clients that register themselves keep connecting after the upgrade. Turn it off in the options if you do not need it.
+
+Installs set up before version 1.8.0 start with client metadata documents matching their dynamic client registration setting, so an install that admitted only clients you registered keeps doing so. Turn it on in the options to let Claude connect without registration.
 
 If you switch from a fork of this integration that stores the same setting, a value you saved there is kept. An entry where it was never saved looks the same as an install from before 1.7.0, so registration is turned on; check the setting after switching.
 
@@ -85,9 +89,23 @@ Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
 
 **Important**: Save these credentials securely. The client secret cannot be retrieved later.
 
+### Client ID Metadata Documents
+
+A client can identify itself with an HTTPS URL as its client ID instead of registering ([draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), used by the MCP authorization specification). When a sign-in starts, Home Assistant fetches the client's name and allowed redirect URIs from that URL. Claude, Claude Code and other MCP clients prefer this over dynamic client registration, so with this option on you can leave dynamic client registration off and register nothing.
+
+These clients are public: they have no secret and prove their sign-ins with PKCE. Every sign-in through one stops on the [consent screen](#consent-screen), which shows the host that serves the document, such as `claude.ai`, next to the client's name.
+
+The fetch is limited to keep the endpoint from being used against your network:
+
+- Only `https` URLs in normalized form with a host name and a path, without a query or fragment, are accepted. IP addresses in any notation are refused, and international host names must be given in punycode, so a look-alike cannot pass for another domain on the consent screen
+- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made. IPv6 addresses that embed an IPv4 address, such as NAT64, count as that IPv4 address
+- Redirects are not followed, documents larger than 5 KB are refused, and the request times out after 5 seconds. A failed fetch is answered with the same message whatever the cause, so it reveals nothing about your network
+- Documents are cached for their `Cache-Control` lifetime, between 1 minute and 1 day, and not at all when marked `no-store` or `no-cache`. At most 30 uncached fetches run per minute, and at most 5 for any one address
+- A document must not contain a client secret, must use `none` as its token endpoint authentication method, and must list its redirect URIs
+
 ### Consent Screen
 
-Clients registered through the dynamic registration endpoint (`/oidc/register`, when [enabled](#options)) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. Denying sends the client an `access_denied` error.
+Clients that registered themselves through `/oidc/register` (when [enabled](#options)) and clients identified by a [metadata document](#client-id-metadata-documents) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the host serving its metadata document if it has one, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. When that site is on the user's own computer, as with Claude Code, the screen says so. Denying sends the client an `access_denied` error.
 
 Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Use the `update_client` action with `consent_required: false` for the ones you registered yourself.
 
@@ -137,14 +155,15 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 
 ### Using with Claude Connectors
 
-1. Register a client as described above
-2. In Claude, configure a custom connector with:
-   - **OIDC Discovery URL**: `https://your-ha-instance/oidc/.well-known/openid-configuration`
-   - **Client ID**: The generated client ID
-   - **Client Secret**: The generated client secret
-3. When prompted, log in with your Home Assistant credentials (TOTP/2FA supported)
+With [client metadata documents](#client-id-metadata-documents) on (the default), there is nothing to register:
 
-With [dynamic client registration](#options) on, Claude can register itself instead, so you can skip step 1 and leave the client ID and secret empty. You then approve it on the consent screen when you sign in.
+1. In Claude, add a custom connector with your MCP server's URL and leave the client ID and secret empty
+2. When prompted, log in with your Home Assistant credentials (TOTP/2FA supported)
+3. Approve Claude on the consent screen
+
+Claude Code works the same way, returning to a port on your computer that the consent screen points out.
+
+To use a client you registered yourself instead, register one as described above and enter its client ID and secret in the connector settings.
 
 ## Security Considerations
 
@@ -154,6 +173,8 @@ With [dynamic client registration](#options) on, Claude can register itself inst
 - **Access Tokens**: Valid for 1 hour by default
 - **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session
 - **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
+- **Client Metadata Documents**: Anyone who can reach your instance can start a sign-in that makes Home Assistant fetch a URL. The fetch only reaches public addresses over HTTPS and is size, time and rate limited, as [described above](#client-id-metadata-documents). Sign-ins through these clients always go through the consent screen
+- **Public Clients**: Clients without a secret, from metadata documents or registered with `token_endpoint_auth_method: none`, must use PKCE whatever the PKCE option says. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) match on any port, as RFC 8252 requires for native apps
 - **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes
