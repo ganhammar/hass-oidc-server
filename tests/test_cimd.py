@@ -91,6 +91,10 @@ class TestClientIdUrl:
             "https://\u0441laude.ai/oauth/claude-code-client-metadata",
             # Encoded dot segments that normalization would resolve
             "https://example.com/trusted/%2e%2e/attacker/client",
+            # Malformed hosts that make URL parsers raise
+            "https://[evil.com]/x",
+            "https://[::1/x",
+            "https://ex\\ample.com/x",
         ],
     )
     def test_invalid_urls_are_refused(self, client_id):
@@ -186,6 +190,14 @@ class TestPublicAddressResolver:
             "flags": 0,
         }
 
+    async def test_nat64_of_a_public_address_is_public(self):
+        resolver = PublicAddressResolver()
+        results = [self._result("64:ff9b::808:808")]  # 8.8.8.8
+        with patch.object(resolver._resolver, "resolve", AsyncMock(return_value=results)):
+            resolved = await resolver.resolve("example.com", 443)
+
+        assert [r["host"] for r in resolved] == ["64:ff9b::808:808"]
+
     async def test_keeps_only_public_addresses(self):
         resolver = PublicAddressResolver()
         results = [self._result(a) for a in ("10.0.0.1", "93.184.215.14", "127.0.0.1")]
@@ -197,7 +209,10 @@ class TestPublicAddressResolver:
     @pytest.mark.parametrize(
         "address",
         ["127.0.0.1", "10.1.2.3", "192.168.1.10", "169.254.1.1", "100.64.0.1", "::1", "fd00::1"]
-        + ["::ffff:192.168.1.10"],
+        + ["::ffff:192.168.1.10"]
+        # 10.0.0.5 through NAT64 and the IPv4-compatible and 6to4 forms, local
+        # NAT64, and site-local, which Python counts as global
+        + ["64:ff9b::a00:5", "::a00:5", "2002:a00:5::1", "64:ff9b:1::1", "fec0::1"],
     )
     async def test_refuses_names_resolving_only_to_special_use_addresses(self, address):
         resolver = PublicAddressResolver()
@@ -400,6 +415,19 @@ class TestResolveClient:
                 await async_resolve_client(hass, CLIENT_ID, "203.0.113.9")
 
         assert fetch.await_count == CIMD_FETCHES_PER_MINUTE
+
+    async def test_used_entries_outlast_unused_ones(self):
+        """A cache hit moves the entry last, so it is not the next one evicted."""
+        hass = _hass()
+        cache = hass.data[DOMAIN].setdefault("cimd_cache", {})
+        with patch.object(
+            cimd, "_fetch_document", AsyncMock(return_value=(CLAUDE_CODE_DOCUMENT, 300))
+        ):
+            await async_resolve_client(hass, CLIENT_ID)
+            cache["https://example.com/other"] = (10_000_000_000, {})
+            await async_resolve_client(hass, CLIENT_ID)
+
+        assert list(cache) == ["https://example.com/other", CLIENT_ID]
 
     async def test_cache_is_bounded(self):
         hass = _hass()

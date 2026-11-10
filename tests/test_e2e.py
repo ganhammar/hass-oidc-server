@@ -869,18 +869,22 @@ async def test_dynamically_registered_public_client(
     assert status == 200, body
 
 
+@pytest.mark.parametrize(
+    "cap", ["MAX_PENDING_AUTH_REQUESTS", "MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS"]
+)
 async def test_pending_authorizations_are_capped(
     setup_provider: None,
     hass: HomeAssistant,
     hass_client: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
+    cap: str,
 ) -> None:
-    """Anyone can start an authorization, so the oldest pending ones give way past the cap."""
-    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_PENDING_AUTH_REQUESTS", 2)
+    """Past a cap new authorizations are refused, and the ones under way are kept."""
+    monkeypatch.setattr(f"custom_components.oidc_provider.http.{cap}", 2)
     client = await hass_client()
     registration = await _register_client(client)
 
-    request_ids = []
+    statuses = []
     for _ in range(3):
         _, challenge = _pkce_pair()
         resp = await client.get(
@@ -895,9 +899,10 @@ async def test_pending_authorizations_are_capped(
             },
             headers=FORWARDED,
         )
-        request_ids.append(re.search(r"oidc_request_id', '([^']+)'", await resp.text()).group(1))
+        statuses.append(resp.status)
 
-    assert list(hass.data[DOMAIN]["pending_auth_requests"]) == request_ids[1:]
+    assert statuses == [200, 200, 429]
+    assert len(hass.data[DOMAIN]["pending_auth_requests"]) == 2
 
 
 async def _signed_in(client: ClientSessionGenerator) -> tuple[dict, dict]:
@@ -1010,3 +1015,29 @@ async def test_client_services_show_and_end_sessions(
 
     assert registration["client_id"] not in hass.data[DOMAIN]["clients"]
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.parametrize(
+    "client_id", ["https://[evil.com]/x", "https://[::1/x", "https://ex\\ample.com/x"]
+)
+async def test_malformed_url_client_id_is_refused_cleanly(
+    setup_provider: None, hass_client: ClientSessionGenerator, client_id: str
+) -> None:
+    """A client_id that is not a valid URL gets a 400, not a server error."""
+    client = await hass_client()
+    _, challenge = _pkce_pair()
+
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400

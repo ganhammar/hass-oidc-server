@@ -489,3 +489,21 @@ def test_count_dynamic_clients(mock_hass):
         "c": {},
     }
     assert count_dynamic_clients(mock_hass) == 1
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Claude\nInjected", "Evil\u202eedoc", "Zero\u200bWidth", "Tab\there", "Line\u2028sep"],
+)
+def test_client_name_rejects_control_and_formatting_characters(name):
+    """Names anyone can choose must not reorder or break the text around them."""
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    with pytest.raises(ValueError):
+        validate_client_name(name)
+
+
+def test_client_name_allows_ordinary_unicode():
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    assert validate_client_name("Café Assistant 日本") == "Café Assistant 日本"

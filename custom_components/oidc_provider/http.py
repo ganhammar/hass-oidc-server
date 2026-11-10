@@ -44,6 +44,7 @@ from .const import (
     ID_TOKEN_EXPIRY,
     MAX_DYNAMIC_CLIENTS,
     MAX_PENDING_AUTH_REQUESTS,
+    MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS,
     MAX_TOKEN_ATTEMPTS,
     PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
@@ -292,8 +293,8 @@ def _revoke_session(hass: HomeAssistant, key: str) -> bool:
 def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
     """Return the session key and client_id a refresh token belongs to.
 
-    The token may be the current one of its session or one it replaced, which
-    is traced through its family prefix.
+    The token may be the current one of its session, one the session retired
+    in the grace period, or an older one traced through its family prefix.
     """
     refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
     data = refresh_tokens.get(token)
@@ -301,9 +302,23 @@ def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
         return _session_key(token, data), data["client_id"]
     family = _refresh_token_family(token)
     for stored_token, data in refresh_tokens.items():
-        if data.get("previous") == token or (family and data.get("family") == family):
+        if token in data.get("retired", {}) or (family and data.get("family") == family):
             return _session_key(stored_token, data), data["client_id"]
     return None
+
+
+def _is_issued_jwt(hass: HomeAssistant, token: str) -> bool:
+    """Return whether a token is a JWT this provider signed, expired or not."""
+    try:
+        jwt.decode(
+            token,
+            hass.data[DOMAIN]["jwt_public_key"],
+            algorithms=["RS256"],
+            options={"verify_exp": False, "verify_aud": False, "verify_iss": False},
+        )
+    except (jwt.InvalidTokenError, KeyError):
+        return False
+    return True
 
 
 def _client_display(hass: HomeAssistant, client_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -850,12 +865,21 @@ class OIDCAuthorizationView(HomeAssistantView):
         if "pending_auth_requests" not in hass.data[DOMAIN]:
             hass.data[DOMAIN]["pending_auth_requests"] = {}
 
-        # Clean up expired pending requests. Anyone can start one, so beyond
-        # the cap the oldest are dropped to keep memory bounded.
+        # Clean up expired pending requests. Anyone can start one, so new ones
+        # are refused past the caps; sign-ins already under way are kept.
         pending = hass.data[DOMAIN]["pending_auth_requests"]
         _prune_expired(pending)
-        while len(pending) >= MAX_PENDING_AUTH_REQUESTS:
-            del pending[next(iter(pending))]
+        from_address = sum(1 for req in pending.values() if req.get("remote") == request.remote)
+        if (
+            len(pending) >= MAX_PENDING_AUTH_REQUESTS
+            or from_address >= MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS
+        ):
+            _LOGGER.debug("Refused authorization request from %s: too many pending", request.remote)
+            return web.Response(
+                text="Too many sign-ins in progress. Try again in a few minutes.",
+                status=429,
+                headers={"Retry-After": "60"},
+            )
 
         hass.data[DOMAIN]["pending_auth_requests"][auth_request_id] = {
             "client_id": client_id,
@@ -870,6 +894,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             # A metadata document client is not stored, so the consent step
             # reads the client the document described from here.
             "metadata_client": metadata_client,
+            "remote": request.remote,
             "expires_at": time.time() + 600,  # 10 minutes
         }
 
@@ -1066,7 +1091,18 @@ class OIDCTokenView(HomeAssistantView):
     requires_auth = False
 
     async def post(self, request: web.Request) -> web.Response:
-        """Handle token request."""
+        """Handle token request.
+
+        Responses carry tokens or say why none were issued, so no cache may keep
+        them (RFC 6749 §5.1).
+        """
+        response = await self._token_response(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+    async def _token_response(self, request: web.Request) -> web.Response:
+        """Answer a token request."""
         hass = request.app["hass"]
         data = await request.post()
 
@@ -1272,10 +1308,12 @@ class OIDCTokenView(HomeAssistantView):
         """Handle refresh token grant for the authenticated client.
 
         Every successful refresh replaces the presented refresh token with a new
-        one in the same family (RFC 9700 §4.14.2). The replaced token is still
-        answered for REFRESH_TOKEN_REUSE_GRACE seconds with the token that
-        replaced it. Presented after that, or by another client, it means the
-        session's tokens have leaked, and the whole family is revoked.
+        one in the same family (RFC 9700 §4.14.2). Every token the session
+        retired in the last REFRESH_TOKEN_REUSE_GRACE seconds is still answered
+        with the current one, so a delayed duplicate from a client refreshing in
+        several places does not end the session. Presented after that, or by
+        another client, a retired token means the session's tokens have leaked,
+        and the whole family is revoked.
         """
         refresh_token = data.get("refresh_token") or ""
         refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
@@ -1313,13 +1351,14 @@ class OIDCTokenView(HomeAssistantView):
         # REFRESH_TOKEN_EXPIRY from sign-in however often it is refreshed.
         family = token_data.get("family") or secrets.token_urlsafe(16)
         new_refresh_token = _new_refresh_token(family)
-        new_token_data = {
-            **token_data,
-            "family": family,
-            "issued_at": now,
-            "previous": refresh_token,
-            "rotated_at": now,
+        # The tokens the session retired within the grace period, with when
+        retired = {
+            token: retired_at
+            for token, retired_at in token_data.get("retired", {}).items()
+            if now - retired_at <= REFRESH_TOKEN_REUSE_GRACE
         }
+        retired[refresh_token] = now
+        new_token_data = {**token_data, "family": family, "issued_at": now, "retired": retired}
         del refresh_tokens[refresh_token]
         refresh_tokens[new_refresh_token] = new_token_data
         await _save_refresh_tokens(hass)
@@ -1335,16 +1374,17 @@ class OIDCTokenView(HomeAssistantView):
             (
                 (token, data)
                 for token, data in refresh_tokens.items()
-                if refresh_token and data.get("previous") == refresh_token
+                if refresh_token and refresh_token in data.get("retired", {})
             ),
             None,
         )
 
         if successor is not None:
             successor_token, successor_data = successor
+            retired_at = successor_data["retired"][refresh_token]
             if (
                 successor_data["client_id"] == client_id
-                and time.time() - successor_data["rotated_at"] <= REFRESH_TOKEN_REUSE_GRACE
+                and time.time() - retired_at <= REFRESH_TOKEN_REUSE_GRACE
                 and successor_data["expires_at"] >= time.time()
             ):
                 return await self._refresh_response(_request, hass, successor_token, successor_data)
@@ -1852,7 +1892,8 @@ class OIDCRevocationView(HomeAssistantView):
         """Revoke the session a refresh token belongs to.
 
         Access tokens are self-contained JWTs that expire within the hour and
-        cannot be revoked one by one; like unknown tokens they are answered
+        cannot be revoked one by one, so presenting one is answered with
+        unsupported_token_type (RFC 7009 §2.2.1). Unknown tokens are answered
         with 200 (RFC 7009 §2.2).
         """
         hass = request.app["hass"]
@@ -1869,6 +1910,15 @@ class OIDCRevocationView(HomeAssistantView):
 
         session = _find_session(hass, token)
         if session is None:
+            if _is_issued_jwt(hass, token):
+                return web.json_response(
+                    {
+                        "error": "unsupported_token_type",
+                        "error_description": "Access tokens expire within an hour and "
+                        "cannot be revoked; revoke the refresh token to end the session",
+                    },
+                    status=400,
+                )
             return web.Response(status=200)
         key, owner = session
 
