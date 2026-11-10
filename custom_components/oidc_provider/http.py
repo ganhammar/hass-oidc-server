@@ -1,5 +1,6 @@
 """HTTP endpoints for OIDC Provider."""
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -322,11 +323,22 @@ def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
 
 
 def _is_issued_jwt(hass: HomeAssistant, token: str) -> bool:
-    """Return whether a token is a JWT this provider signed, expired or not."""
+    """Return whether a token is a JWT this provider signed, expired or not.
+
+    It is checked with the published key its kid names, so a token signed with
+    a key kept from a rotation counts too.
+    """
     try:
+        kid = jwt.get_unverified_header(token).get("kid")
+        if kid is None:
+            key = hass.data[DOMAIN]["jwt_public_key"]
+        else:
+            key = hass.data[DOMAIN].get("jwt_verification_keys", {}).get(kid)
+        if key is None:
+            return False
         jwt.decode(
             token,
-            hass.data[DOMAIN]["jwt_public_key"],
+            key,
             algorithms=["RS256"],
             options={"verify_exp": False, "verify_aud": False, "verify_iss": False},
         )
@@ -479,20 +491,28 @@ async def async_rotate_signing_key(hass: HomeAssistant, keep_previous_key: bool)
     the tokens it signed until the next rotation, so they work until they
     expire. Without it the replaced key is dropped at once and every token it
     signed is refused, which is the response to a leaked key.
+
+    Rotations run one at a time. Two at once could each keep the key that was
+    current when they started, so the key replaced by the first would come
+    back as the previous key of the second.
     """
-    stored_keys = await hass.async_add_executor_job(_generate_signing_key)
     domain_data = hass.data[DOMAIN]
-    replaced_kid = domain_data["jwt_kid"]
+    async with domain_data.setdefault("key_rotation_lock", asyncio.Lock()):
+        stored_keys = await hass.async_add_executor_job(_generate_signing_key)
+        replaced_kid = domain_data["jwt_kid"]
 
-    if keep_previous_key:
-        public_pem = domain_data["jwt_public_key"].public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        stored_keys["previous_key"] = {"kid": replaced_kid, "public_key_pem": public_pem.decode()}
+        if keep_previous_key:
+            public_pem = domain_data["jwt_public_key"].public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            stored_keys["previous_key"] = {
+                "kid": replaced_kid,
+                "public_key_pem": public_pem.decode(),
+            }
 
-    await domain_data["key_store"].async_save(stored_keys)
-    _use_signing_keys(hass, stored_keys)
+        await domain_data["key_store"].async_save(stored_keys)
+        _use_signing_keys(hass, stored_keys)
 
     _LOGGER.info(
         "Rotated the JWT signing key to kid %s; the previous key %s was %s",

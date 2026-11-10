@@ -69,7 +69,7 @@ To register a new OIDC client (e.g., for Claude Connectors):
    - **Redirect URIs**: Comma-separated list of allowed redirect URIs
    - **Require consent** (optional): Ask the user to approve each authorization. Off by default, since a client you register yourself is trusted
 4. Click **"Perform Action"**
-5. Check the Home Assistant logs for the generated **Client ID** and **Client Secret**
+5. Copy the generated **Client ID** and **Client Secret** from the action's response
 
 Example action call:
 
@@ -80,14 +80,20 @@ data:
   redirect_uris: "https://claude.ai/callback,https://app.claude.com/callback,https://claude.ai/api/mcp/auth_callback"
 ```
 
-The logs will display:
+The response holds the credentials:
 
+```yaml
+client_id: client_xxxxxxxxxxxxx
+client_secret: yyyyyyyyyyyyyyyyyyyyyyyy
+client_name: Claude Connector
+redirect_uris:
+  - https://claude.ai/callback
+  - https://app.claude.com/callback
+  - https://claude.ai/api/mcp/auth_callback
+consent_required: false
 ```
-Registered OIDC client: Claude Connector
-Client ID: client_xxxxxxxxxxxxx
-Client Secret: yyyyyyyyyyyyyyyyyyyyyyyy
-Redirect URIs: ['https://claude.ai/callback', 'https://app.claude.com/callback']
-```
+
+Called from an automation or script without a response variable, the action posts the credentials in a notification instead. Every Home Assistant user can read notifications, so dismiss it once you have saved the secret.
 
 **Important**: Save these credentials securely. The client secret cannot be retrieved later.
 
@@ -203,7 +209,7 @@ To use a client you registered yourself instead, register one as described above
 - **Client Secrets**: Store client secrets securely and never commit them to version control
 - **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. A replaced token keeps working for one minute after it was replaced, so a retried request, or one sent from another worker of the same client, does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700). Token responses are never cached (`Cache-Control: no-store`)
 - **Access Tokens**: Valid for 1 hour by default
-- **Client Actions**: Registering, updating, revoking and listing clients, and rotating the signing key, require a Home Assistant administrator. Automations and scripts, which run without a user, can still call them
+- **Client Actions**: Registering, updating, revoking and listing clients, and rotating the signing key, require a Home Assistant administrator. Automations, which run without a user, can still call them. A script runs as the user who started it, so it can call them only when an administrator starts it
 - **Signing Key**: Kept until you [rotate it](#rotating-the-signing-key). Rotate with `keep_previous_key: false` if it may have leaked
 - **Issuer Identification**: Authorization responses name the issuer (`iss`, RFC 9207) so clients that talk to several authorization servers can detect a mix-up
 - **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session

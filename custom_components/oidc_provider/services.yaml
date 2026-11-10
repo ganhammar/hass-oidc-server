@@ -1,6 +1,6 @@
 register_client:
   name: Register OIDC Client
-  description: Register a new OIDC client application
+  description: Register a new OIDC client application. The client ID and secret are returned in the response; called without a response variable, they are posted in a notification instead, which every user can read.
   fields:
     client_name:
       name: Client Name

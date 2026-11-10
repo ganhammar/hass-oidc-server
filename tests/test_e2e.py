@@ -38,7 +38,7 @@ from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import Unauthorized
+from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry, MockUser
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
@@ -1402,3 +1402,87 @@ async def test_malformed_url_client_id_is_refused_cleanly(
     )
 
     assert resp.status == 400
+
+
+async def test_register_client_returns_credentials_without_a_notification(
+    setup_provider: None, hass: HomeAssistant, hass_admin_user: MockUser
+) -> None:
+    """Asked for a response, register_client returns the secret instead of posting it."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+    posted: list[dict] = []
+    hass.bus.async_listen(
+        "call_service",
+        lambda event: (
+            posted.append(event.data)
+            if event.data.get("domain") == "persistent_notification"
+            else None
+        ),
+    )
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        "register_client",
+        {"client_name": "Responder", "redirect_uris": REDIRECT_URI},
+        blocking=True,
+        return_response=True,
+        context=Context(user_id=hass_admin_user.id),
+    )
+    await hass.async_block_till_done()
+
+    assert response["client_secret"]
+    assert response["client_id"] in hass.data[DOMAIN]["clients"]
+    assert posted == []
+
+    # Without a response to carry them, the credentials go to a notification
+    await hass.services.async_call(
+        DOMAIN,
+        "register_client",
+        {"client_name": "Notified", "redirect_uris": REDIRECT_URI},
+        blocking=True,
+        context=Context(user_id=hass_admin_user.id),
+    )
+    await hass.async_block_till_done()
+    assert [call["service"] for call in posted] == ["create"]
+
+
+async def test_register_client_failure_is_raised_when_a_response_is_asked_for(
+    setup_provider: None, hass: HomeAssistant
+) -> None:
+    """A caller waiting for the credentials gets the error, not just a notification."""
+    assert await async_setup_component(hass, "persistent_notification", {})
+
+    with pytest.raises(HomeAssistantError, match="must use HTTPS"):
+        await hass.services.async_call(
+            DOMAIN,
+            "register_client",
+            {"client_name": "Bad", "redirect_uris": "http://app.example.com/cb"},
+            blocking=True,
+            return_response=True,
+        )
+
+
+async def test_concurrent_rotations_do_not_bring_back_the_replaced_key(
+    setup_provider: None, hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two rotations at once run one after the other, so the oldest key stays gone."""
+    from custom_components.oidc_provider import http as provider_http
+
+    original = hass.data[DOMAIN]["jwt_kid"]
+    # Keys made in advance, so both rotations have theirs at once
+    new_keys = [provider_http._generate_signing_key() for _ in range(2)]
+    monkeypatch.setattr(provider_http, "_generate_signing_key", new_keys.pop)
+    store = hass.data[DOMAIN]["key_store"]
+    save = store.async_save
+
+    async def slow_save(data: dict) -> None:
+        # A real store write yields to the disk, letting the other rotation run
+        await asyncio.sleep(0.05)
+        await save(data)
+
+    monkeypatch.setattr(store, "async_save", slow_save)
+
+    await asyncio.gather(_rotate(hass, {}), _rotate(hass, {}))
+
+    keys = list(hass.data[DOMAIN]["jwt_verification_keys"])
+    assert len(keys) == 2
+    assert original not in keys

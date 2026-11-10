@@ -392,6 +392,7 @@ class TestRegisterClientService:
 
         # Call the service
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Test Client",
             "redirect_uris": "http://localhost:8080/callback",
@@ -431,6 +432,7 @@ class TestRegisterClientService:
         register_handler = mock_hass.services.async_register.call_args_list[0][0][2]
 
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Existing Client",
             "redirect_uris": "http://localhost:8080/callback",
@@ -462,6 +464,7 @@ class TestRegisterClientService:
         register_handler = mock_hass.services.async_register.call_args_list[0][0][2]
 
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Spoof",
             "redirect_uris": "https://ha.example.com@attacker.example/callback",

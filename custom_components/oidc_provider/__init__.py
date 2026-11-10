@@ -12,7 +12,7 @@ from homeassistant.components.frontend import (
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import Unauthorized, UnknownUser
+from homeassistant.exceptions import HomeAssistantError, Unauthorized, UnknownUser
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
@@ -217,7 +217,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register services
     async def handle_register_client(call):
-        """Handle register_client service."""
+        """Handle register_client service.
+
+        Called for a response, as from Developer Tools, it returns the client
+        ID and secret there. Otherwise it shows them in a notification, which
+        every Home Assistant user can read, so that is only the fallback.
+        """
+
+        async def fail(message: str, notification_id: str) -> None:
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "OIDC Client Registration Failed",
+                    "message": f"❌ {message}",
+                    "notification_id": notification_id,
+                },
+            )
+            if call.return_response:
+                raise HomeAssistantError(message)
+
         try:
             _LOGGER.debug("handle_register_client called with data: %s", call.data)
 
@@ -232,16 +251,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if existing_client["client_name"] == client_name:
                     error_msg = f"Client with name '{client_name}' already exists"
                     _LOGGER.error(error_msg)
-                    await hass.services.async_call(
-                        "persistent_notification",
-                        "create",
-                        {
-                            "title": "OIDC Client Registration Failed",
-                            "message": f"❌ {error_msg}\n\nPlease choose a different client name.",
-                            "notification_id": f"oidc_client_error_{client_name}",
-                        },
+                    await fail(
+                        f"{error_msg}. Please choose a different client name.",
+                        f"oidc_client_error_{client_name}",
                     )
-                    return
+                    return None
 
             # Create client using shared client_manager
             client_info = await create_client(
@@ -252,6 +266,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             client_id = client_info["client_id"]
             client_secret = client_info["client_secret"]
+
+            _LOGGER.info(
+                "Registered OIDC client: %s | Client ID: %s | Redirect URIs: %s",
+                client_name,
+                client_id,
+                redirect_uris,
+            )
+            if call.return_response:
+                return {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "client_name": client_info["client_name"],
+                    "redirect_uris": redirect_uris,
+                    "consent_required": consent_required,
+                }
 
             # Create persistent notification with credentials
             try:
@@ -274,24 +303,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info("Notification created for client registration")
             except Exception as notif_error:
                 _LOGGER.error("Failed to create notification: %s", notif_error)
-
-            _LOGGER.info(
-                "Registered OIDC client: %s | Client ID: %s | Redirect URIs: %s",
-                client_name,
-                client_id,
-                redirect_uris,
-            )
+            return None
         except ValueError as e:
             _LOGGER.error("Error registering OIDC client: %s", e)
-            await hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "OIDC Client Registration Failed",
-                    "message": f"❌ {e}",
-                    "notification_id": "oidc_client_error_invalid",
-                },
-            )
+            await fail(str(e), "oidc_client_error_invalid")
+            return None
+        except HomeAssistantError:
+            raise
         except Exception as e:
             _LOGGER.error("Error registering OIDC client: %s", e, exc_info=True)
 
@@ -461,7 +479,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await async_rotate_signing_key(hass, keep_previous_key=call.data[ATTR_KEEP_PREVIOUS_KEY])
 
     hass.services.async_register(
-        DOMAIN, "register_client", _admin_only(hass, handle_register_client)
+        DOMAIN,
+        "register_client",
+        _admin_only(hass, handle_register_client),
+        supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(DOMAIN, "revoke_client", _admin_only(hass, handle_revoke_client))
     hass.services.async_register(DOMAIN, "update_client", _admin_only(hass, handle_update_client))
