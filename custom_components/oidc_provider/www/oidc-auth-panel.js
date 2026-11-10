@@ -1,5 +1,7 @@
 // OIDC login panel. Shows the consent screen for a pending authorization
-// request and completes the redirect back to the client.
+// request and completes the redirect back to the client. Opened without a
+// pending request, it lists the applications signed in as the current user
+// and lets them end those sessions.
 //
 // The layout mirrors Home Assistant's own login page (ha-authorize): a
 // centered column with the HA icon above a card, built from HA's CSS
@@ -11,6 +13,9 @@ const SCOPE_DESCRIPTIONS = {
   email: 'Your email address',
   groups: 'Your group memberships',
 };
+
+const SESSIONS_ERROR_HINT =
+  'Your connected applications could not be loaded or changed. Reload the page to try again.';
 
 const STYLES = `
   .oidc-page {
@@ -78,6 +83,16 @@ const STYLES = `
   .action + .action {
     margin-top: 8px;
   }
+  .oidc-session {
+    padding: 12px 0;
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+  }
+  .oidc-session .action {
+    margin-top: 8px;
+  }
+  .oidc-session-meta {
+    color: var(--secondary-text-color, #727272);
+  }
 `;
 
 function escapeHtml(value) {
@@ -108,10 +123,12 @@ class OidcLoginPanel extends HTMLElement {
   async connectedCallback() {
     const requestId = sessionStorage.getItem('oidc_request_id');
     if (!requestId) {
-      this._renderCard(`
-        <h1>No pending request</h1>
-        <p>There is no authorization request waiting for you. Start again from the application that sent you here.</p>
-      `);
+      try {
+        await this._waitForHass();
+        await this._renderSessions();
+      } catch (error) {
+        this._renderError(error, SESSIONS_ERROR_HINT);
+      }
       return;
     }
 
@@ -131,7 +148,20 @@ class OidcLoginPanel extends HTMLElement {
         await this._decide(true);
       }
     } catch (error) {
-      this._renderError(error);
+      if (error.status !== 400) {
+        this._renderError(error);
+        return;
+      }
+      // The stored request has expired or was already used. It stays in this
+      // tab's storage until cleared, so clear it and show the applications.
+      sessionStorage.removeItem('oidc_request_id');
+      try {
+        await this._renderSessions(
+          'That sign-in request is no longer valid. To sign in, start again from the application.'
+        );
+      } catch (sessionsError) {
+        this._renderError(sessionsError, SESSIONS_ERROR_HINT);
+      }
     }
   }
 
@@ -142,10 +172,11 @@ class OidcLoginPanel extends HTMLElement {
     });
 
     // A client identified by a metadata document is vouched for only by the
-    // host serving that document, so the host is shown next to its name.
+    // host serving that document, so the host is shown next to its name. bdi
+    // keeps right-to-left text in a name from reordering what follows it.
     const clientLabel = details.client_host
-      ? `<b>${escapeHtml(details.client_name)}</b> from <b>${escapeHtml(details.client_host)}</b>`
-      : `<b>${escapeHtml(details.client_name)}</b>`;
+      ? `<b><bdi>${escapeHtml(details.client_name)}</bdi></b> from <b><bdi>${escapeHtml(details.client_host)}</bdi></b>`
+      : `<b><bdi>${escapeHtml(details.client_name)}</bdi></b>`;
     // Any program on a computer can listen on a loopback address, so a sign-in
     // that returns there is only safe when the user started it themselves.
     const loopbackNote = details.redirect_is_loopback
@@ -155,7 +186,7 @@ class OidcLoginPanel extends HTMLElement {
     this._renderCard(
       `
         <h1>Approve access?</h1>
-        <p>If you continue, you will be sent to <b>${escapeHtml(details.redirect_host)}</b>. The application will be able to see:</p>
+        <p>If you continue, you will be sent to <b><bdi>${escapeHtml(details.redirect_host)}</bdi></b>. The application will be able to see:</p>
         <ul>${scopes.join('')}</ul>
         ${loopbackNote}
         <div class="action">
@@ -214,17 +245,69 @@ class OidcLoginPanel extends HTMLElement {
     window.location.href = data.redirect_url;
   }
 
-  async _fetchJson(url, init = {}) {
-    const response = await fetch(url, {
-      ...init,
-      headers: {
-        ...(init.headers || {}),
-        Authorization: `Bearer ${this._accessToken()}`,
-      },
+  async _renderSessions(notice = '') {
+    const { sessions } = await this._fetchJson('/oidc/sessions');
+    const formatTime = (seconds) => (seconds ? new Date(seconds * 1000).toLocaleString() : 'never');
+    const items = sessions.map((session) => {
+      const host = session.client_host ? ` from <bdi>${escapeHtml(session.client_host)}</bdi>` : '';
+      return `
+        <div class="oidc-session">
+          <b><bdi>${escapeHtml(session.client_name)}</bdi></b>${host}
+          <div class="oidc-session-meta">Signed in ${escapeHtml(formatTime(session.signed_in_at))}, last used ${escapeHtml(formatTime(session.last_used_at))}</div>
+          <div class="action">
+            <ha-button appearance="plain" variant="danger" data-session="${escapeHtml(session.session_id)}">Sign out</ha-button>
+          </div>
+        </div>
+      `;
     });
+
+    this._renderCard(
+      `
+      <h1>Connected applications</h1>
+      ${
+        items.length
+          ? `<p>These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.</p>${items.join('')}`
+          : '<p>No applications are signed in with your Home Assistant account.</p>'
+      }
+    `,
+      notice ? `<ha-alert alert-type="info">${escapeHtml(notice)}</ha-alert>` : ''
+    );
+
+    for (const button of this.querySelectorAll('ha-button[data-session]')) {
+      button.addEventListener('click', () => this._endSession(button.dataset.session));
+    }
+  }
+
+  async _endSession(sessionId) {
+    for (const button of this.querySelectorAll('ha-button')) {
+      button.disabled = true;
+    }
+    try {
+      await this._fetchJson(`/oidc/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      await this._renderSessions();
+    } catch (error) {
+      this._renderError(error, SESSIONS_ERROR_HINT);
+    }
+  }
+
+  async _fetchJson(url, init = {}) {
+    // fetchWithAuth renews the Home Assistant access token when it has
+    // expired, which a tab left open for a while needs.
+    const response =
+      typeof this._hass?.fetchWithAuth === 'function'
+        ? await this._hass.fetchWithAuth(url, init)
+        : await fetch(url, {
+            ...init,
+            headers: {
+              ...(init.headers || {}),
+              Authorization: `Bearer ${this._accessToken()}`,
+            },
+          });
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`${response.status} ${text}`.trim());
+      const error = new Error(`${response.status} ${text}`.trim());
+      error.status = response.status;
+      throw error;
     }
     return response.json();
   }
@@ -255,11 +338,14 @@ class OidcLoginPanel extends HTMLElement {
     });
   }
 
-  _renderError(error) {
+  _renderError(
+    error,
+    hint = 'The authorization could not be completed. Close this page and try again from the application.'
+  ) {
     this._renderCard(
       `
         <h1>Something went wrong</h1>
-        <p>The authorization could not be completed. Close this page and try again from the application.</p>
+        <p>${escapeHtml(hint)}</p>
       `,
       `<ha-alert alert-type="error">${escapeHtml(error.message)}</ha-alert>`
     );

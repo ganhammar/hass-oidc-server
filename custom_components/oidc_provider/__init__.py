@@ -1,6 +1,7 @@
 """OIDC Provider integration for Home Assistant."""
 
 import logging
+import re
 import time
 
 from homeassistant.components.frontend import (
@@ -9,7 +10,7 @@ from homeassistant.components.frontend import (
 )
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 
@@ -25,9 +26,24 @@ from .const import (
     PANEL_URL_PATH,
     STORAGE_KEY_TOKENS,
 )
-from .http import setup_http_endpoints
+from .http import client_sessions, revoke_client_sessions, setup_http_endpoints
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _markdown_text(value: str) -> str:
+    """Return a value as a Markdown code span for a notification.
+
+    Client names and redirect URIs come from whoever registered the client,
+    which with dynamic registration or metadata documents can be anyone. In a
+    code span Markdown adds no links, headings or formatting, bare URLs
+    included. Backticks and line breaks, which could end the span, become
+    plain characters.
+    """
+    text = re.sub(r"[\r\n]+", " ", value).replace("`", "'")
+    return f"`{text}`"
+
+
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.clients"
 
@@ -243,8 +259,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("Error registering OIDC client: %s", e, exc_info=True)
 
     async def handle_revoke_client(call):
-        """Handle revoke_client service."""
+        """Handle revoke_client service.
+
+        Removes a registered client and ends every session it holds. A client
+        identified by a metadata document URL is not stored, so revoking it ends
+        its sessions; it can sign in again unless metadata documents are off.
+        """
         client_id = call.data.get("client_id")
+        ended = await revoke_client_sessions(hass, client_id)
 
         if client_id in hass.data[DOMAIN]["clients"]:
             del hass.data[DOMAIN]["clients"][client_id]
@@ -253,9 +275,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             store = hass.data[DOMAIN]["store"]
             await store.async_save({"clients": hass.data[DOMAIN]["clients"]})
 
-            _LOGGER.info(f"Revoked OIDC client: {client_id}")
+            _LOGGER.info("Revoked OIDC client %s and ended %d sessions", client_id, ended)
+        elif ended:
+            _LOGGER.info("Ended %d sessions of OIDC client %s", ended, client_id)
         else:
-            _LOGGER.warning(f"Client ID not found: {client_id}")
+            _LOGGER.warning("Client ID not found: %s", client_id)
 
     async def handle_update_client(call):
         """Handle update_client service."""
@@ -318,10 +342,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("Updated OIDC client: %s with new redirect URIs: %s", client_id, redirect_uris)
 
     async def handle_list_clients(call):
-        """Handle list_clients service."""
-        clients = hass.data[DOMAIN].get("clients", {})
+        """Handle list_clients service.
 
-        if not clients:
+        Shows a notification, and returns the same listing when the caller asks
+        for a response.
+        """
+        clients = hass.data[DOMAIN].get("clients", {})
+        sessions = client_sessions(hass)
+        # Clients that are not stored, such as metadata document clients, are
+        # known only through their sessions.
+        unstored = {
+            client_id: info for client_id, info in sessions.items() if client_id not in clients
+        }
+        listing = [
+            {
+                "client_id": client_id,
+                "client_name": client_data["client_name"],
+                "redirect_uris": client_data["redirect_uris"],
+                "consent_required": bool(client_data.get("consent_required", True)),
+                "active_sessions": sessions.get(client_id, {}).get("active_sessions", 0),
+            }
+            for client_id, client_data in clients.items()
+        ] + [
+            {
+                "client_id": client_id,
+                "client_name": info["client_name"],
+                "client_host": info["client_host"],
+                "active_sessions": info["active_sessions"],
+            }
+            for client_id, info in unstored.items()
+        ]
+
+        if not clients and not unstored:
             await hass.services.async_call(
                 "persistent_notification",
                 "create",
@@ -331,18 +383,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "notification_id": "oidc_list_clients",
                 },
             )
-            return
+            return {"clients": []} if call.return_response else None
 
-        message_parts = ["**Registered OIDC Clients:**\n"]
+        message_parts = ["**Registered OIDC Clients:**\n"] if clients else []
         for client_id, client_data in clients.items():
             consent_label = "yes" if client_data.get("consent_required", True) else "no"
+            active = sessions.get(client_id, {}).get("active_sessions", 0)
+            redirect_uris = ", ".join(client_data["redirect_uris"])
             message_parts.append(
-                f"\n**{client_data['client_name']}**\n"
-                f"- Client ID: `{client_id}`\n"
-                f"- Redirect URIs: {', '.join(client_data['redirect_uris'])}\n"
+                f"\n**{_markdown_text(client_data['client_name'])}**\n"
+                f"- Client ID: {_markdown_text(client_id)}\n"
+                f"- Redirect URIs: {_markdown_text(redirect_uris)}\n"
                 f"- Consent required: {consent_label}\n"
+                f"- Active sessions: {active}\n"
                 f"- ⚠️ Client Secret: Hidden (cannot be retrieved)\n"
             )
+        if unstored:
+            message_parts.append("\n**Signed in through a metadata document:**\n")
+            for client_id, info in unstored.items():
+                message_parts.append(
+                    f"\n**{_markdown_text(info['client_name'])}**\n"
+                    f"- Client ID: {_markdown_text(client_id)}\n"
+                    f"- Active sessions: {info['active_sessions']}\n"
+                )
 
         await hass.services.async_call(
             "persistent_notification",
@@ -353,12 +416,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "notification_id": "oidc_list_clients",
             },
         )
-        _LOGGER.info("Listed %d OIDC clients", len(clients))
+        _LOGGER.info("Listed %d OIDC clients", len(listing))
+        return {"clients": listing} if call.return_response else None
 
     hass.services.async_register(DOMAIN, "register_client", handle_register_client)
     hass.services.async_register(DOMAIN, "revoke_client", handle_revoke_client)
     hass.services.async_register(DOMAIN, "update_client", handle_update_client)
-    hass.services.async_register(DOMAIN, "list_clients", handle_list_clients)
+    hass.services.async_register(
+        DOMAIN, "list_clients", handle_list_clients, supports_response=SupportsResponse.OPTIONAL
+    )
 
     _LOGGER.info("OIDC Provider initialized")
     return True

@@ -3708,3 +3708,177 @@ def test_consent_screen_shows_hosts_in_ascii(host, shown):
     from custom_components.oidc_provider.http import _ascii_host
 
     assert _ascii_host(host) == shown
+
+
+async def _post_revoke(hass, token, client_id="test_client", secret="test_secret"):
+    """Present a token at the revocation endpoint. Returns (status, body text)."""
+    from custom_components.oidc_provider.http import OIDCRevocationView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    form = {"client_id": client_id, "client_secret": secret}
+    if token is not None:
+        form["token"] = token
+    request.post = AsyncMock(return_value=form)
+    response = await OIDCRevocationView().post(request)
+    return response.status, response.body.decode("utf-8") if response.body else ""
+
+
+@pytest.mark.asyncio
+async def test_revocation_ends_the_session_of_a_refresh_token():
+    """Revoking a refresh token ends every token of its session (RFC 7009 §2.1)."""
+    hass, token_store = _rotation_hass(
+        {"fam1.a": _stored_token(), "fam1.b": _stored_token(), "fam2.x": _stored_token("fam2")}
+    )
+
+    status, _ = await _post_revoke(hass, "fam1.a")
+
+    assert status == 200
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.x"]
+    token_store.async_save.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["fam1.a", "legacy_token"])
+async def test_revocation_of_a_replaced_token_ends_its_session(token):
+    """A replaced refresh token still identifies its session, by prefix or as retired."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(retired={"legacy_token": time.time()})})
+
+    status, _ = await _post_revoke(hass, token)
+
+    assert status == 200
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_revocation_of_an_access_token_is_unsupported():
+    """Access tokens cannot be revoked, which RFC 7009 §2.2.1 says to report."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    private_key = hass.data[DOMAIN]["jwt_private_key"]
+    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
+    access_token = jwt.encode({"sub": "user123"}, private_key, algorithm="RS256")
+
+    status, body = await _post_revoke(hass, access_token)
+
+    assert (status, json.loads(body)["error"]) == (400, "unsupported_token_type")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
+
+
+@pytest.mark.asyncio
+async def test_revocation_of_an_unknown_token_succeeds_and_changes_nothing():
+    """Unknown tokens, including access tokens, are answered with 200 (RFC 7009 §2.2)."""
+    hass, token_store = _rotation_hass({"fam1.a": _stored_token()})
+
+    status, _ = await _post_revoke(hass, "eyJhbGciOiJSUzI1NiJ9.e30.sig")
+
+    assert status == 200
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
+    token_store.async_save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_revocation_by_another_client_is_refused_and_revokes():
+    """Only the token's client may revoke it; another client holding it means it leaked."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+
+    status, body = await _post_revoke(hass, "fam1.a", "other_client", "other_secret")
+
+    assert status == 400
+    assert json.loads(body)["error"] == "unauthorized_client"
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_revocation_requires_client_authentication_and_a_token():
+    """The revocation endpoint authenticates the client like the token endpoint."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+
+    status, _ = await _post_revoke(hass, "fam1.a", "test_client", "wrong")
+    assert status == 401
+    status, body = await _post_revoke(hass, None)
+    assert (status, json.loads(body)["error"]) == (400, "invalid_request")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
+
+
+@pytest.mark.asyncio
+async def test_public_client_revokes_without_a_secret():
+    """A metadata document client revokes its own session with its client_id alone."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token(client_id=CIMD_CLIENT_ID)})
+
+    status, _ = await _post_revoke(hass, "fam1.a", CIMD_CLIENT_ID, "")
+
+    assert status == 200
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+def test_user_sessions_groups_tokens_by_sign_in():
+    """A user's tokens are listed once per session, with the client named."""
+    from custom_components.oidc_provider.http import user_sessions
+
+    hass, _ = _rotation_hass(
+        {
+            "fam1.a": _stored_token(issued_at=100, auth_time=50),
+            "fam1.b": _stored_token(issued_at=200, auth_time=50),
+            "fam2.x": _stored_token(
+                "fam2",
+                client_id=CIMD_CLIENT_ID,
+                client_name="Claude Code",
+                issued_at=300,
+            ),
+            "fam3.y": _stored_token("fam3", user_id="someone_else"),
+            "fam4.z": _stored_token("fam4", expires_at=time.time() - 1),
+            "legacy": {**_stored_token(), "family": None},
+        }
+    )
+    hass.data[DOMAIN]["clients"]["test_client"]["client_name"] = "Test App"
+
+    sessions = user_sessions(hass, "user123")
+
+    assert [s["client_name"] for s in sessions] == ["Claude Code", "Test App", "Test App"]
+    claude, test_app, legacy = sessions
+    assert claude["client_host"] == "claude.ai"
+    assert test_app["client_host"] is None
+    assert (test_app["signed_in_at"], test_app["last_used_at"]) == (50, 200)
+    assert legacy["last_used_at"] is None
+    assert "fam1" not in test_app["session_id"]
+    assert len({s["session_id"] for s in sessions}) == 3
+
+
+@pytest.mark.asyncio
+async def test_user_ends_only_their_own_session():
+    """The sessions endpoint ends a session of the signed-in user and no one else's."""
+    from custom_components.oidc_provider.http import OIDCSessionView, user_sessions
+
+    hass, token_store = _rotation_hass(
+        {"fam1.a": _stored_token(), "fam2.x": _stored_token("fam2", user_id="someone_else")}
+    )
+    [own] = user_sessions(hass, "user123")
+    [other] = user_sessions(hass, "someone_else")
+
+    def request_as(user_id):
+        request = MagicMock()
+        request.app = {"hass": hass}
+        request.__getitem__.return_value = Mock(id=user_id)
+        return request
+
+    response = await OIDCSessionView().delete(request_as("user123"), other["session_id"])
+    assert response.status == 404
+    response = await OIDCSessionView().delete(request_as("user123"), own["session_id"])
+    assert response.status == 200
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.x"]
+    token_store.async_save.assert_called_once()
+
+
+def test_discovery_advertises_revocation():
+    """Every discovery document names the revocation endpoint and its auth methods."""
+    from custom_components.oidc_provider.http import _revocation_metadata
+
+    hass = Mock()
+    hass.data = {DOMAIN: {CONF_ALLOW_DYNAMIC_REGISTRATION: False}}
+
+    metadata = _revocation_metadata(hass, "https://ha.example.com")
+
+    assert metadata["revocation_endpoint"] == "https://ha.example.com/oidc/revoke"
+    assert "none" in metadata["revocation_endpoint_auth_methods_supported"]

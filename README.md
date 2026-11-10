@@ -141,6 +141,14 @@ data:
   client_id: "client_xxxxxxxxxxxxx"
 ```
 
+Revoking a client also ends every session it holds, so its refresh tokens stop working at once; access tokens it already has expire within the hour. A client that signed in with a [metadata document](#client-id-metadata-documents) is not stored, so revoking its URL client ID ends its sessions, and it can ask the user again on its next sign-in unless you turn metadata documents off.
+
+**"List OIDC Clients"** shows the number of active sessions for each client, including clients that signed in with a metadata document, and returns the same list as a response when called from a script or **Developer Tools**.
+
+### Connected Applications
+
+Each user can see the applications signed in with their Home Assistant account at `https://your-ha-instance/oidc_login`, with when each signed in and was last used, and sign any of them out. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
+
 ### OIDC Endpoints
 
 Once installed, your Home Assistant instance exposes the following OIDC endpoints:
@@ -151,6 +159,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Token**: `https://your-ha-instance/oidc/token`
 - **UserInfo**: `https://your-ha-instance/oidc/userinfo`
 - **JWKS**: `https://your-ha-instance/oidc/jwks`
+- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it. Access tokens cannot be revoked and are answered with `unsupported_token_type`; they expire within the hour
 - **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
 
 ### Using with Claude Connectors

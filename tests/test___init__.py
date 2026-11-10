@@ -981,3 +981,14 @@ class TestOptions:
 
         assert mock_hass.data[DOMAIN][CONF_REQUIRE_PKCE] is False
         assert mock_hass.data[DOMAIN][CONF_ALLOW_DYNAMIC_REGISTRATION] is False
+
+
+def test_markdown_text_cannot_add_links_or_formatting():
+    """Client-supplied text is escaped before it goes into a notification."""
+    from custom_components.oidc_provider import _markdown_text
+
+    assert _markdown_text("[Claude](https://evil.example) *now*") == (
+        "`[Claude](https://evil.example) *now*`"
+    )
+    # Neither a backtick nor a line break can end the code span
+    assert _markdown_text("a`b\n# Heading") == "`a'b # Heading`"
