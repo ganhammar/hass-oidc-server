@@ -169,7 +169,7 @@ To use a client you registered yourself instead, register one as described above
 
 - **HTTPS Required**: Your Home Assistant instance must be accessible via HTTPS with a valid certificate for OIDC to work with external services
 - **Client Secrets**: Store client secrets securely and never commit them to version control
-- **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. The replaced token keeps working for one minute, so a retried request does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700)
+- **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. A replaced token keeps working for one minute after it was replaced, so a retried request, or one sent from another worker of the same client, does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700). Token responses are never cached (`Cache-Control: no-store`)
 - **Access Tokens**: Valid for 1 hour by default
 - **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session
 - **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
