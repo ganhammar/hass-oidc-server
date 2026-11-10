@@ -31,7 +31,6 @@ from .http import client_sessions, revoke_client_sessions, setup_http_endpoints
 _LOGGER = logging.getLogger(__name__)
 
 
-
 def _markdown_text(value: str) -> str:
     """Return a value as a Markdown code span for a notification.
 
