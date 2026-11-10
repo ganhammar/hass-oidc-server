@@ -95,14 +95,14 @@ class TestAsyncSetupEntry:
         mock_store,
         mock_token_store,
     ):
-        """Stale dynamic clients are pruned once refresh tokens are loaded."""
+        """Dynamic clients that never got a token are pruned at setup."""
         now = time.time()
         old = now - 8 * 86400
         mock_store.async_load = AsyncMock(
             return_value={
                 "clients": {
                     "stale": {"registration": "dynamic", "created_at": old},
-                    "in_use": {"registration": "dynamic", "created_at": old},
+                    "in_use": {"registration": "dynamic", "created_at": old, "used_at": old},
                     "manual": {"created_at": old},
                 }
             }
@@ -392,6 +392,7 @@ class TestRegisterClientService:
 
         # Call the service
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Test Client",
             "redirect_uris": "http://localhost:8080/callback",
@@ -431,6 +432,7 @@ class TestRegisterClientService:
         register_handler = mock_hass.services.async_register.call_args_list[0][0][2]
 
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Existing Client",
             "redirect_uris": "http://localhost:8080/callback",
@@ -462,6 +464,7 @@ class TestRegisterClientService:
         register_handler = mock_hass.services.async_register.call_args_list[0][0][2]
 
         call = Mock()
+        call.return_response = False
         call.data = {
             "client_name": "Spoof",
             "redirect_uris": "https://ha.example.com@attacker.example/callback",
@@ -1006,6 +1009,19 @@ class TestMigrateEntry:
             is True
         )
 
+    async def test_minor_version_2_without_a_saved_choice_migrates(self, mock_hass):
+        """An entry saved by a release before 1.7.0 after a downgrade lacks the choice."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(1, 2, {CONF_REQUIRE_PKCE: True})
+
+        assert await async_migrate_entry(mock_hass, entry) is True
+
+        mock_hass.config_entries.async_update_entry.assert_called_once_with(
+            entry,
+            options={CONF_REQUIRE_PKCE: True, CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: False},
+            minor_version=3,
+        )
+
     async def test_current_entry_is_left_alone(self, mock_hass):
         """An entry already at minor version 3 keeps its recorded choices."""
         mock_hass.config_entries = Mock()
@@ -1091,6 +1107,7 @@ def test_markdown_text_cannot_add_links_or_formatting():
     from custom_components.oidc_provider import _markdown_text
 
     assert _markdown_text("[Claude](https://evil.example) *now*") == (
-        r"\[Claude\]\(https://evil.example\) \*now\*"
+        "`[Claude](https://evil.example) *now*`"
     )
-    assert _markdown_text("Test MCP Client") == "Test MCP Client"
+    # Neither a backtick nor a line break can end the code span
+    assert _markdown_text("a`b\n# Heading") == "`a'b # Heading`"

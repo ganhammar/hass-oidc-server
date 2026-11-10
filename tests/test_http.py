@@ -2380,7 +2380,7 @@ async def test_oidc_token_view_refresh_token():
     refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
     assert data["refresh_token"] != "valid_refresh_token"
     assert list(refresh_tokens) == [data["refresh_token"]]
-    assert refresh_tokens[data["refresh_token"]]["previous"] == "valid_refresh_token"
+    assert list(refresh_tokens[data["refresh_token"]]["retired"]) == ["valid_refresh_token"]
     mock_token_store.async_save.assert_called_once()
 
 
@@ -2489,11 +2489,51 @@ async def test_replaced_refresh_token_within_grace_gets_the_current_token():
 
 
 @pytest.mark.asyncio
+async def test_late_duplicate_of_an_older_token_gets_the_current_one():
+    """A is replaced by B and B by C; a delayed request with A within the minute gets C."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    _, first = await _post_refresh_grant(hass, "fam1.a")
+    _, second = await _post_refresh_grant(hass, first["refresh_token"])
+
+    status, late = await _post_refresh_grant(hass, "fam1.a")
+
+    assert status == 200
+    assert late["refresh_token"] == second["refresh_token"]
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == [second["refresh_token"]]
+
+
+@pytest.mark.asyncio
+async def test_token_responses_are_not_cached():
+    """Token responses carry Cache-Control: no-store, errors included (RFC 6749 §5.1)."""
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    for token in ("fam1.a", "unknown"):
+        request = MagicMock()
+        request.app = {"hass": hass}
+        request.remote = "127.0.0.1"
+        request.headers = {}
+        request.url = Mock()
+        request.url.origin.return_value = "http://localhost"
+        request.post = AsyncMock(
+            return_value={
+                "grant_type": "refresh_token",
+                "client_id": "test_client",
+                "client_secret": "test_secret",
+                "refresh_token": token,
+            }
+        )
+        response = await OIDCTokenView().post(request)
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
 async def test_replaced_refresh_token_after_grace_revokes_the_family():
     """A replaced token presented after the grace period revokes the whole session."""
     hass, token_store = _rotation_hass(
         {
-            "fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time() - 61),
+            "fam1.b": _stored_token(retired={"fam1.a": time.time() - 61}),
             "fam2.x": _stored_token(family="fam2"),
         }
     )
@@ -2506,9 +2546,9 @@ async def test_replaced_refresh_token_after_grace_revokes_the_family():
 
 
 @pytest.mark.asyncio
-async def test_older_token_of_a_family_revokes_it():
-    """A token two rotations old is not remembered, so its family prefix revokes the session."""
-    hass, _ = _rotation_hass({"fam1.c": _stored_token(previous="fam1.b", rotated_at=time.time())})
+async def test_token_retired_before_the_grace_period_revokes_the_family():
+    """A token retired too long ago is not remembered, so its family prefix revokes the session."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(retired={"fam1.b": time.time()})})
 
     status, _ = await _post_refresh_grant(hass, "fam1.a")
 
@@ -2519,7 +2559,7 @@ async def test_older_token_of_a_family_revokes_it():
 @pytest.mark.asyncio
 async def test_replaced_refresh_token_from_another_client_revokes_the_family():
     """Another client presenting a replaced token, even within the grace period, revokes it."""
-    hass, _ = _rotation_hass({"fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time())})
+    hass, _ = _rotation_hass({"fam1.b": _stored_token(retired={"fam1.a": time.time()})})
 
     status, _ = await _post_refresh_grant(hass, "fam1.a", "other_client", "other_secret")
 
@@ -3942,14 +3982,6 @@ async def test_client_with_a_secret_stays_confidential_whatever_its_method():
     assert status == 200
 
 
-def _register_hass():
-    store = Mock()
-    store.async_save = AsyncMock()
-    hass = Mock()
-    hass.data = {DOMAIN: {"clients": {}, "store": store, CONF_ALLOW_DYNAMIC_REGISTRATION: True}}
-    return hass
-
-
 async def _register(hass, body):
     request = Mock()
     request.app = {"hass": hass}
@@ -4045,14 +4077,29 @@ async def test_revocation_ends_the_session_of_a_refresh_token():
 
 
 @pytest.mark.asyncio
-async def test_revocation_of_a_replaced_token_ends_its_session():
-    """A replaced refresh token still identifies its session."""
-    hass, _ = _rotation_hass({"fam1.c": _stored_token(previous="fam1.b")})
+@pytest.mark.parametrize("token", ["fam1.a", "legacy_token"])
+async def test_revocation_of_a_replaced_token_ends_its_session(token):
+    """A replaced refresh token still identifies its session, by prefix or as retired."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(retired={"legacy_token": time.time()})})
 
-    status, _ = await _post_revoke(hass, "fam1.a")
+    status, _ = await _post_revoke(hass, token)
 
     assert status == 200
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_revocation_of_an_access_token_is_unsupported():
+    """Access tokens cannot be revoked, which RFC 7009 §2.2.1 says to report."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    private_key = hass.data[DOMAIN]["jwt_private_key"]
+    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
+    access_token = jwt.encode({"sub": "user123"}, private_key, algorithm="RS256")
+
+    status, body = await _post_revoke(hass, access_token)
+
+    assert (status, json.loads(body)["error"]) == (400, "unsupported_token_type")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam1.a"]
 
 
 @pytest.mark.asyncio
@@ -4224,7 +4271,25 @@ async def test_oidc_register_view_rate_limited():
     assert json.loads(response.body)["error"] == "temporarily_unavailable"
     assert 2900 <= int(response.headers["Retry-After"]) <= 3001
     assert hass.data[DOMAIN]["clients"] == {}
-    request.json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_rate_limited_per_address():
+    """One address may register 5 clients an hour, leaving the rest for everyone else."""
+    from custom_components.oidc_provider.const import REGISTRATION_RATE_LIMIT_PER_ADDRESS
+
+    hass = _register_hass()
+    for _ in range(REGISTRATION_RATE_LIMIT_PER_ADDRESS):
+        assert (await OIDCRegisterView().post(_register_request(hass))).status == 201
+
+    refused = await OIDCRegisterView().post(_register_request(hass))
+    other = _register_request(hass)
+    other.remote = "198.51.100.20"
+    allowed = await OIDCRegisterView().post(other)
+
+    assert refused.status == 429
+    assert "Retry-After" in refused.headers
+    assert allowed.status == 201
 
 
 @pytest.mark.asyncio
@@ -4242,9 +4307,11 @@ async def test_oidc_register_view_rate_limit_window_slides():
 
 @pytest.mark.asyncio
 async def test_oidc_register_view_client_cap():
-    """Registration is refused once 200 dynamic clients exist, without Retry-After."""
+    """Registration is refused once 200 unused dynamic clients exist, without Retry-After."""
     now = time.time()
     clients = {f"c{i}": {"registration": "dynamic", "created_at": now} for i in range(200)}
+    # Clients a user has approved do not count toward the cap
+    clients["approved"] = {"registration": "dynamic", "created_at": now, "used_at": now}
     hass = _register_hass(clients=clients)
     request = _register_request(hass)
 
@@ -4253,7 +4320,7 @@ async def test_oidc_register_view_client_cap():
     assert response.status == 429
     assert json.loads(response.body)["error"] == "temporarily_unavailable"
     assert "Retry-After" not in response.headers
-    assert len(hass.data[DOMAIN]["clients"]) == 200
+    assert len(hass.data[DOMAIN]["clients"]) == 201
 
 
 @pytest.mark.asyncio
@@ -4288,7 +4355,7 @@ async def test_oidc_register_view_refusals_log_at_debug(caplog):
 
 
 async def _concurrent_registrations(hass, count):
-    """Send registrations whose bodies arrive only once all have passed the checks."""
+    """Send registrations, from distinct addresses, whose bodies all arrive at once."""
     import asyncio
 
     release = asyncio.Event()
@@ -4298,10 +4365,10 @@ async def _concurrent_registrations(hass, count):
         return {"client_name": "Flood", "redirect_uris": ["https://app.example.com/cb"]}
 
     tasks = []
-    for _ in range(count):
+    for i in range(count):
         request = Mock()
         request.app = {"hass": hass}
-        request.remote = "198.51.100.1"
+        request.remote = f"198.51.100.{i}"
         request.json = slow_json
         tasks.append(asyncio.create_task(OIDCRegisterView().post(request)))
     for _ in range(5):
@@ -4312,7 +4379,7 @@ async def _concurrent_registrations(hass, count):
 
 @pytest.mark.asyncio
 async def test_concurrent_registrations_cannot_pass_the_rate_limit():
-    """Slots are taken before the body is read, so a burst cannot all get through."""
+    """Checks and the stored client come with no await between, so a burst cannot pass."""
     from custom_components.oidc_provider.const import REGISTRATION_RATE_LIMIT_MAX
 
     hass = _register_hass()
@@ -4327,13 +4394,35 @@ async def test_concurrent_registrations_cannot_pass_the_rate_limit():
 @pytest.mark.asyncio
 async def test_concurrent_registrations_cannot_pass_the_client_limit(monkeypatch):
     """Registrations in progress count toward the client limit."""
-    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_DYNAMIC_CLIENTS", 3)
+    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_UNUSED_DYNAMIC_CLIENTS", 3)
     hass = _register_hass()
 
     statuses = await _concurrent_registrations(hass, 8)
 
     assert statuses.count(201) == 3
     assert len(hass.data[DOMAIN]["clients"]) == 3
-    # Refused registrations give their rate limit slot back
+    # Refused registrations take no rate limit slot
     assert len(hass.data[DOMAIN]["registration_times"]) == 3
-    assert hass.data[DOMAIN]["registrations_in_progress"] == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_registration_body_holds_no_slot():
+    """A request still sending its body has not taken a slot from anyone."""
+    import asyncio
+
+    hass = _register_hass()
+    never = asyncio.Event()
+
+    async def stalled_json():
+        await never.wait()
+
+    stalled = _register_request(hass)
+    stalled.json = stalled_json
+    task = asyncio.create_task(OIDCRegisterView().post(stalled))
+    await asyncio.sleep(0)
+
+    response = await OIDCRegisterView().post(_register_request(hass))
+
+    assert response.status == 201
+    assert len(hass.data[DOMAIN]["registration_times"]) == 1
+    task.cancel()

@@ -1,5 +1,6 @@
 """HTTP endpoints for OIDC Provider."""
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -21,10 +22,11 @@ from homeassistant.helpers.storage import Store
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import (
-    count_dynamic_clients,
+    count_unused_dynamic_clients,
     create_client,
     prune_dynamic_clients,
     validate_client_name,
+    validate_redirect_uris,
 )
 from .const import (
     ACCESS_TOKEN_EXPIRY,
@@ -43,15 +45,18 @@ from .const import (
     GROUP_OWNER,
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
-    MAX_DYNAMIC_CLIENTS,
     MAX_PENDING_AUTH_REQUESTS,
+    MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS,
     MAX_TOKEN_ATTEMPTS,
+    MAX_UNUSED_DYNAMIC_CLIENTS,
     PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
     RATE_LIMIT_WINDOW,
     REFRESH_TOKEN_EXPIRY,
     REFRESH_TOKEN_REUSE_GRACE,
+    REGISTRATION_DYNAMIC,
     REGISTRATION_RATE_LIMIT_MAX,
+    REGISTRATION_RATE_LIMIT_PER_ADDRESS,
     REGISTRATION_RATE_LIMIT_WINDOW,
     RESPONSE_TYPE_CODE,
     SCOPE_EMAIL,
@@ -303,8 +308,8 @@ def _revoke_session(hass: HomeAssistant, key: str) -> bool:
 def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
     """Return the session key and client_id a refresh token belongs to.
 
-    The token may be the current one of its session or one it replaced, which
-    is traced through its family prefix.
+    The token may be the current one of its session, one the session retired
+    in the grace period, or an older one traced through its family prefix.
     """
     refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
     data = refresh_tokens.get(token)
@@ -312,9 +317,34 @@ def _find_session(hass: HomeAssistant, token: str) -> tuple[str, str] | None:
         return _session_key(token, data), data["client_id"]
     family = _refresh_token_family(token)
     for stored_token, data in refresh_tokens.items():
-        if data.get("previous") == token or (family and data.get("family") == family):
+        if token in data.get("retired", {}) or (family and data.get("family") == family):
             return _session_key(stored_token, data), data["client_id"]
     return None
+
+
+def _is_issued_jwt(hass: HomeAssistant, token: str) -> bool:
+    """Return whether a token is a JWT this provider signed, expired or not.
+
+    It is checked with the published key its kid names, so a token signed with
+    a key kept from a rotation counts too.
+    """
+    try:
+        kid = jwt.get_unverified_header(token).get("kid")
+        if kid is None:
+            key = hass.data[DOMAIN]["jwt_public_key"]
+        else:
+            key = hass.data[DOMAIN].get("jwt_verification_keys", {}).get(kid)
+        if key is None:
+            return False
+        jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            options={"verify_exp": False, "verify_aud": False, "verify_iss": False},
+        )
+    except (jwt.InvalidTokenError, KeyError):
+        return False
+    return True
 
 
 def _client_display(hass: HomeAssistant, client_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -461,20 +491,28 @@ async def async_rotate_signing_key(hass: HomeAssistant, keep_previous_key: bool)
     the tokens it signed until the next rotation, so they work until they
     expire. Without it the replaced key is dropped at once and every token it
     signed is refused, which is the response to a leaked key.
+
+    Rotations run one at a time. Two at once could each keep the key that was
+    current when they started, so the key replaced by the first would come
+    back as the previous key of the second.
     """
-    stored_keys = await hass.async_add_executor_job(_generate_signing_key)
     domain_data = hass.data[DOMAIN]
-    replaced_kid = domain_data["jwt_kid"]
+    async with domain_data.setdefault("key_rotation_lock", asyncio.Lock()):
+        stored_keys = await hass.async_add_executor_job(_generate_signing_key)
+        replaced_kid = domain_data["jwt_kid"]
 
-    if keep_previous_key:
-        public_pem = domain_data["jwt_public_key"].public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        stored_keys["previous_key"] = {"kid": replaced_kid, "public_key_pem": public_pem.decode()}
+        if keep_previous_key:
+            public_pem = domain_data["jwt_public_key"].public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            stored_keys["previous_key"] = {
+                "kid": replaced_kid,
+                "public_key_pem": public_pem.decode(),
+            }
 
-    await domain_data["key_store"].async_save(stored_keys)
-    _use_signing_keys(hass, stored_keys)
+        await domain_data["key_store"].async_save(stored_keys)
+        _use_signing_keys(hass, stored_keys)
 
     _LOGGER.info(
         "Rotated the JWT signing key to kid %s; the previous key %s was %s",
@@ -915,12 +953,21 @@ class OIDCAuthorizationView(HomeAssistantView):
         if "pending_auth_requests" not in hass.data[DOMAIN]:
             hass.data[DOMAIN]["pending_auth_requests"] = {}
 
-        # Clean up expired pending requests. Anyone can start one, so beyond
-        # the cap the oldest are dropped to keep memory bounded.
+        # Clean up expired pending requests. Anyone can start one, so new ones
+        # are refused past the caps; sign-ins already under way are kept.
         pending = hass.data[DOMAIN]["pending_auth_requests"]
         _prune_expired(pending)
-        while len(pending) >= MAX_PENDING_AUTH_REQUESTS:
-            del pending[next(iter(pending))]
+        from_address = sum(1 for req in pending.values() if req.get("remote") == request.remote)
+        if (
+            len(pending) >= MAX_PENDING_AUTH_REQUESTS
+            or from_address >= MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS
+        ):
+            _LOGGER.debug("Refused authorization request from %s: too many pending", request.remote)
+            return web.Response(
+                text="Too many sign-ins in progress. Try again in a few minutes.",
+                status=429,
+                headers={"Retry-After": "60"},
+            )
 
         hass.data[DOMAIN]["pending_auth_requests"][auth_request_id] = {
             "client_id": client_id,
@@ -935,6 +982,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             # A metadata document client is not stored, so the consent step
             # reads the client the document described from here.
             "metadata_client": metadata_client,
+            "remote": request.remote,
             "expires_at": time.time() + 600,  # 10 minutes
         }
 
@@ -1131,7 +1179,18 @@ class OIDCTokenView(HomeAssistantView):
     requires_auth = False
 
     async def post(self, request: web.Request) -> web.Response:
-        """Handle token request."""
+        """Handle token request.
+
+        Responses carry tokens or say why none were issued, so no cache may keep
+        them (RFC 6749 §5.1).
+        """
+        response = await self._token_response(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+    async def _token_response(self, request: web.Request) -> web.Response:
+        """Answer a token request."""
         hass = request.app["hass"]
         data = await request.post()
 
@@ -1299,6 +1358,17 @@ class OIDCTokenView(HomeAssistantView):
         # Persist refresh tokens to storage
         await _save_refresh_tokens(hass)
 
+        # A dynamically registered client that has had a token issued was
+        # approved by a user and is never pruned, even after its sessions end.
+        stored_client = hass.data[DOMAIN].get("clients", {}).get(client_id)
+        if (
+            stored_client is not None
+            and stored_client.get("registration") == REGISTRATION_DYNAMIC
+            and "used_at" not in stored_client
+        ):
+            stored_client["used_at"] = time.time()
+            await hass.data[DOMAIN]["store"].async_save({"clients": hass.data[DOMAIN]["clients"]})
+
         response_body: dict[str, Any] = {
             "access_token": access_token,
             "token_type": "Bearer",
@@ -1337,10 +1407,12 @@ class OIDCTokenView(HomeAssistantView):
         """Handle refresh token grant for the authenticated client.
 
         Every successful refresh replaces the presented refresh token with a new
-        one in the same family (RFC 9700 §4.14.2). The replaced token is still
-        answered for REFRESH_TOKEN_REUSE_GRACE seconds with the token that
-        replaced it. Presented after that, or by another client, it means the
-        session's tokens have leaked, and the whole family is revoked.
+        one in the same family (RFC 9700 §4.14.2). Every token the session
+        retired in the last REFRESH_TOKEN_REUSE_GRACE seconds is still answered
+        with the current one, so a delayed duplicate from a client refreshing in
+        several places does not end the session. Presented after that, or by
+        another client, a retired token means the session's tokens have leaked,
+        and the whole family is revoked.
         """
         refresh_token = data.get("refresh_token") or ""
         refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
@@ -1378,13 +1450,14 @@ class OIDCTokenView(HomeAssistantView):
         # REFRESH_TOKEN_EXPIRY from sign-in however often it is refreshed.
         family = token_data.get("family") or secrets.token_urlsafe(16)
         new_refresh_token = _new_refresh_token(family)
-        new_token_data = {
-            **token_data,
-            "family": family,
-            "issued_at": now,
-            "previous": refresh_token,
-            "rotated_at": now,
+        # The tokens the session retired within the grace period, with when
+        retired = {
+            token: retired_at
+            for token, retired_at in token_data.get("retired", {}).items()
+            if now - retired_at <= REFRESH_TOKEN_REUSE_GRACE
         }
+        retired[refresh_token] = now
+        new_token_data = {**token_data, "family": family, "issued_at": now, "retired": retired}
         del refresh_tokens[refresh_token]
         refresh_tokens[new_refresh_token] = new_token_data
         await _save_refresh_tokens(hass)
@@ -1400,16 +1473,17 @@ class OIDCTokenView(HomeAssistantView):
             (
                 (token, data)
                 for token, data in refresh_tokens.items()
-                if refresh_token and data.get("previous") == refresh_token
+                if refresh_token and refresh_token in data.get("retired", {})
             ),
             None,
         )
 
         if successor is not None:
             successor_token, successor_data = successor
+            retired_at = successor_data["retired"][refresh_token]
             if (
                 successor_data["client_id"] == client_id
-                and time.time() - successor_data["rotated_at"] <= REFRESH_TOKEN_REUSE_GRACE
+                and time.time() - retired_at <= REFRESH_TOKEN_REUSE_GRACE
                 and successor_data["expires_at"] >= time.time()
             ):
                 return await self._refresh_response(_request, hass, successor_token, successor_data)
@@ -1711,6 +1785,57 @@ class OIDCJWKSView(HomeAssistantView):
         return web.json_response({"keys": keys})
 
 
+def _registration_refusal(hass: HomeAssistant, remote: str | None) -> web.Response | None:
+    """Count a registration against the limits, or return the refusal to send.
+
+    Registrations are limited per hour overall and per remote address, so one
+    caller cannot use up the hourly allowance. Dynamically registered clients
+    that have not had a token yet are capped as well. Clients that have had one
+    were approved by a user and do not count.
+    """
+    now = time.time()
+    window_start = now - REGISTRATION_RATE_LIMIT_WINDOW
+    recent = hass.data[DOMAIN].setdefault("registration_times", [])
+    recent[:] = [t for t in recent if t > window_start]
+    by_address = hass.data[DOMAIN].setdefault("registration_times_by_address", {})
+    for address in list(by_address):
+        by_address[address] = [t for t in by_address[address] if t > window_start]
+        if not by_address[address]:
+            del by_address[address]
+    address_recent = by_address.setdefault(remote or "", [])
+
+    limited = None
+    if len(address_recent) >= REGISTRATION_RATE_LIMIT_PER_ADDRESS:
+        limited = address_recent
+    elif len(recent) >= REGISTRATION_RATE_LIMIT_MAX:
+        limited = recent
+    if limited is not None:
+        retry_after = max(1, int(limited[0] + REGISTRATION_RATE_LIMIT_WINDOW - now) + 1)
+        _LOGGER.debug("Refused dynamic client registration from %s: rate limited", remote)
+        return web.json_response(
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "Too many client registrations, try again later",
+            },
+            status=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if count_unused_dynamic_clients(hass) >= MAX_UNUSED_DYNAMIC_CLIENTS:
+        _LOGGER.debug("Refused dynamic client registration from %s: client limit reached", remote)
+        return web.json_response(
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "Too many registered clients, try again later",
+            },
+            status=429,
+        )
+
+    recent.append(now)
+    address_recent.append(now)
+    return None
+
+
 class OIDCRegisterView(HomeAssistantView):
     """OAuth 2.0 Dynamic Client Registration endpoint (RFC 7591)."""
 
@@ -1736,56 +1861,6 @@ class OIDCRegisterView(HomeAssistantView):
                 status=403,
             )
 
-        # Sliding window over successful registrations, shared by all callers.
-        # A slot is taken before anything awaits, so concurrent requests cannot
-        # all pass the check, and it is given back when the registration fails.
-        now = time.time()
-        recent = hass.data[DOMAIN].setdefault("registration_times", [])
-        recent[:] = [t for t in recent if t > now - REGISTRATION_RATE_LIMIT_WINDOW]
-        if len(recent) >= REGISTRATION_RATE_LIMIT_MAX:
-            retry_after = max(1, int(recent[0] + REGISTRATION_RATE_LIMIT_WINDOW - now) + 1)
-            _LOGGER.debug(
-                "Refused dynamic client registration from %s: rate limited", request.remote
-            )
-            return web.json_response(
-                {
-                    "error": "temporarily_unavailable",
-                    "error_description": "Too many client registrations, try again later",
-                },
-                status=429,
-                headers={"Retry-After": str(retry_after)},
-            )
-        recent.append(now)
-
-        await prune_dynamic_clients(hass)
-        # Registrations still being processed count toward the client limit,
-        # so concurrent requests cannot together go past it.
-        in_progress = hass.data[DOMAIN].get("registrations_in_progress", 0)
-        if count_dynamic_clients(hass) + in_progress >= MAX_DYNAMIC_CLIENTS:
-            recent.remove(now)
-            _LOGGER.debug(
-                "Refused dynamic client registration from %s: client limit reached",
-                request.remote,
-            )
-            return web.json_response(
-                {
-                    "error": "temporarily_unavailable",
-                    "error_description": "Too many registered clients, try again later",
-                },
-                status=429,
-            )
-
-        hass.data[DOMAIN]["registrations_in_progress"] = in_progress + 1
-        try:
-            response = await self._register(request, hass)
-        finally:
-            hass.data[DOMAIN]["registrations_in_progress"] -= 1
-        if response.status != 201 and now in recent:
-            recent.remove(now)
-        return response
-
-    async def _register(self, request: web.Request, hass: HomeAssistant) -> web.Response:
-        """Validate the registration request and create the client."""
         try:
             data = await request.json()
         except Exception:
@@ -1846,29 +1921,35 @@ class OIDCRegisterView(HomeAssistantView):
                 status=400,
             )
 
-        # Create client using shared client_manager
         try:
-            client_info = await create_client(
-                hass,
-                client_name=client_name,
-                redirect_uris=redirect_uris,
-                grant_types=grant_types,
-                response_types=response_types,
-                token_endpoint_auth_method=token_endpoint_auth_method,
-                # Anyone can reach this endpoint, so the registrant is not
-                # vouched for by the operator and the user decides per login.
-                consent_required=True,
-                dynamic=True,
-            )
+            validate_redirect_uris(redirect_uris)
         except ValueError as e:
             return web.json_response(
-                {
-                    "error": "invalid_redirect_uri",
-                    "error_description": str(e),
-                },
+                {"error": "invalid_redirect_uri", "error_description": str(e)},
                 status=400,
             )
 
+        # The limits are checked only now, once the request is known to be
+        # valid, so a caller sending its body slowly holds no slot. From the
+        # checks to create_client storing the client nothing awaits, so
+        # concurrent requests cannot together pass them.
+        await prune_dynamic_clients(hass)
+        refusal = _registration_refusal(hass, request.remote)
+        if refusal is not None:
+            return refusal
+
+        client_info = await create_client(
+            hass,
+            client_name=client_name,
+            redirect_uris=redirect_uris,
+            grant_types=grant_types,
+            response_types=response_types,
+            token_endpoint_auth_method=token_endpoint_auth_method,
+            # Anyone can reach this endpoint, so the registrant is not
+            # vouched for by the operator and the user decides per login.
+            consent_required=True,
+            dynamic=True,
+        )
         return web.json_response(client_info, status=201)
 
 
@@ -1883,7 +1964,8 @@ class OIDCRevocationView(HomeAssistantView):
         """Revoke the session a refresh token belongs to.
 
         Access tokens are self-contained JWTs that expire within the hour and
-        cannot be revoked one by one; like unknown tokens they are answered
+        cannot be revoked one by one, so presenting one is answered with
+        unsupported_token_type (RFC 7009 §2.2.1). Unknown tokens are answered
         with 200 (RFC 7009 §2.2).
         """
         hass = request.app["hass"]
@@ -1900,6 +1982,15 @@ class OIDCRevocationView(HomeAssistantView):
 
         session = _find_session(hass, token)
         if session is None:
+            if _is_issued_jwt(hass, token):
+                return web.json_response(
+                    {
+                        "error": "unsupported_token_type",
+                        "error_description": "Access tokens expire within an hour and "
+                        "cannot be revoked; revoke the refresh token to end the session",
+                    },
+                    status=400,
+                )
             return web.Response(status=200)
         key, owner = session
 
