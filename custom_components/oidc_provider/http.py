@@ -38,6 +38,7 @@ from .const import (
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
     MAX_PENDING_AUTH_REQUESTS,
+    MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS,
     MAX_TOKEN_ATTEMPTS,
     PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
@@ -706,12 +707,21 @@ class OIDCAuthorizationView(HomeAssistantView):
         if "pending_auth_requests" not in hass.data[DOMAIN]:
             hass.data[DOMAIN]["pending_auth_requests"] = {}
 
-        # Clean up expired pending requests. Anyone can start one, so beyond
-        # the cap the oldest are dropped to keep memory bounded.
+        # Clean up expired pending requests. Anyone can start one, so new ones
+        # are refused past the caps; sign-ins already under way are kept.
         pending = hass.data[DOMAIN]["pending_auth_requests"]
         _prune_expired(pending)
-        while len(pending) >= MAX_PENDING_AUTH_REQUESTS:
-            del pending[next(iter(pending))]
+        from_address = sum(1 for req in pending.values() if req.get("remote") == request.remote)
+        if (
+            len(pending) >= MAX_PENDING_AUTH_REQUESTS
+            or from_address >= MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS
+        ):
+            _LOGGER.debug("Refused authorization request from %s: too many pending", request.remote)
+            return web.Response(
+                text="Too many sign-ins in progress. Try again in a few minutes.",
+                status=429,
+                headers={"Retry-After": "60"},
+            )
 
         hass.data[DOMAIN]["pending_auth_requests"][auth_request_id] = {
             "client_id": client_id,
@@ -726,6 +736,7 @@ class OIDCAuthorizationView(HomeAssistantView):
             # A metadata document client is not stored, so the consent step
             # reads the client the document described from here.
             "metadata_client": metadata_client,
+            "remote": request.remote,
             "expires_at": time.time() + 600,  # 10 minutes
         }
 

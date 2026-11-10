@@ -90,8 +90,10 @@ CIMD_CACHE_MAX_TTL = 86400  # seconds
 CIMD_CACHE_MAX_ENTRIES = 100
 
 # Authorization requests waiting for the user to sign in and decide. Anyone can
-# start one, so the oldest are dropped beyond this many.
+# start one, so new ones are refused beyond these many, overall and from one
+# remote address, rather than cancelling sign-ins already under way.
 MAX_PENDING_AUTH_REQUESTS = 1000
+MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS = 20
 
 # Frontend panel serving the login flow (hidden from the sidebar)
 PANEL_URL_PATH = "oidc_login"

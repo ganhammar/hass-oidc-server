@@ -71,7 +71,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info(
         "Migrated config entry to minor version 3; dynamic client registration %s, "
         "client metadata documents %s",
-        "enabled" if options[CONF_ALLOW_DYNAMIC_REGISTRATION] else "disabled",
+        # An entry saved by a release before 1.7.0 after a downgrade can lack
+        # the dynamic registration choice; it then has the default.
+        (
+            "enabled"
+            if options.get(CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION)
+            else "disabled"
+        ),
         "enabled" if options[CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] else "disabled",
     )
 

@@ -88,6 +88,15 @@ def _check_client_id_url(client_id: str) -> None:
     # a Unicode look-alike of another domain would read as that domain.
     if not client_id.isascii():
         raise ClientMetadataError("client_id must be ASCII, with a punycode host name")
+    try:
+        _check_client_id_parts(client_id)
+    except ValueError as err:
+        # urllib and yarl raise for malformed hosts such as [evil.com]
+        raise ClientMetadataError("client_id is not a valid URL") from err
+
+
+def _check_client_id_parts(client_id: str) -> None:
+    """Check the parts of a client_id URL. Malformed URLs raise ValueError."""
     parts = urlsplit(client_id)
     if parts.scheme != "https" or not parts.hostname:
         raise ClientMetadataError("client_id must be an https URL with a host")
@@ -101,10 +110,7 @@ def _check_client_id_url(client_id: str) -> None:
         raise ClientMetadataError("client_id must contain a path")
     if any(segment in (".", "..") for segment in parts.path.split("/")):
         raise ClientMetadataError("client_id must not contain dot segments")
-    try:
-        parts.port
-    except ValueError as err:
-        raise ClientMetadataError("client_id has an invalid port") from err
+    parts.port  # raises ValueError for a port outside 0-65535
     # aiohttp connects to IP literals without consulting the resolver, so the
     # public-address check below cannot cover them.
     if _is_ip_literal(parts.hostname):
@@ -116,10 +122,36 @@ def _check_client_id_url(client_id: str) -> None:
         raise ClientMetadataError("client_id must be in normalized form")
 
 
+# IPv6 prefixes that carry an IPv4 address in their last 32 bits, which is
+# where such an address really leads: NAT64 (RFC 6052) and the deprecated
+# IPv4-compatible form (RFC 4291 §2.5.5.1)
+_IPV4_EMBEDDING_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("::/96"),
+)
+# Not reachable from the internet, though Python counts them as global:
+# local-use NAT64 (RFC 8215) and site-local addresses (RFC 3879)
+_NON_PUBLIC_NETWORKS = (
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("fec0::/10"),
+)
+
+
 def _is_public_address(address: str) -> bool:
+    """Return whether an address is reachable on the public internet.
+
+    An IPv6 address that embeds an IPv4 address counts as that IPv4 address,
+    so 64:ff9b::a00:5 is treated as the private 10.0.0.5 it translates to.
+    """
     ip = ipaddress.ip_address(address)
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if any(ip in network for network in _NON_PUBLIC_NETWORKS):
+            return False
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is None and any(ip in network for network in _IPV4_EMBEDDING_NETWORKS):
+            embedded = ipaddress.IPv4Address(ip.packed[-4:])
+        if embedded is not None:
+            return embedded.is_global
     return ip.is_global
 
 
@@ -278,6 +310,9 @@ async def async_resolve_client(
     cache: dict[str, tuple[float, dict[str, Any]]] = hass.data[DOMAIN].setdefault("cimd_cache", {})
     cached = cache.get(client_id)
     if cached and cached[0] > now:
+        # Moving a used entry to the end keeps it from being the next evicted,
+        # so documents nobody uses cannot push out the ones that are
+        cache[client_id] = cache.pop(client_id)
         return cached[1]
 
     _take_fetch_slot(hass, remote, now)

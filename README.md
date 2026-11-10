@@ -98,7 +98,7 @@ These clients are public: they have no secret and prove their sign-ins with PKCE
 The fetch is limited to keep the endpoint from being used against your network:
 
 - Only `https` URLs in normalized form with a host name and a path, without a query or fragment, are accepted. IP addresses in any notation are refused, and international host names must be given in punycode, so a look-alike cannot pass for another domain on the consent screen
-- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made
+- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made. IPv6 addresses that embed an IPv4 address, such as NAT64, count as that IPv4 address
 - Redirects are not followed, documents larger than 5 KB are refused, and the request times out after 5 seconds. A failed fetch is answered with the same message whatever the cause, so it reveals nothing about your network
 - Documents are cached for their `Cache-Control` lifetime, between 1 minute and 1 day, and not at all when marked `no-store` or `no-cache`. At most 30 uncached fetches run per minute, and at most 5 for any one address
 - A document must not contain a client secret, must use `none` as its token endpoint authentication method, and must list its redirect URIs
