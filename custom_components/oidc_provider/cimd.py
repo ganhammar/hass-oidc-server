@@ -40,6 +40,9 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_AGE = re.compile(r"(?:^|,)\s*max-age\s*=\s*(\d+)", re.IGNORECASE)
+# A DNS host name: dot-separated labels of letters, digits and inner hyphens
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOST_NAME = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
 
 
 class ClientMetadataError(Exception):
@@ -111,6 +114,10 @@ def _check_client_id_parts(client_id: str) -> None:
     if any(segment in (".", "..") for segment in parts.path.split("/")):
         raise ClientMetadataError("client_id must not contain dot segments")
     parts.port  # raises ValueError for a port outside 0-65535
+    # Some URL parsers accept characters no host name has, such as a
+    # backslash, and leave it to the connection to fail.
+    if not _HOST_NAME.fullmatch(parts.hostname):
+        raise ClientMetadataError("client_id must use a valid host name")
     # aiohttp connects to IP literals without consulting the resolver, so the
     # public-address check below cannot cover them.
     if _is_ip_literal(parts.hostname):
