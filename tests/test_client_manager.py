@@ -512,3 +512,11 @@ def test_client_name_allows_ordinary_unicode():
     assert (
         validate_client_name("\U0001f468\u200d\U0001f4bb Dev") == "\U0001f468\u200d\U0001f4bb Dev"
     )
+
+
+def test_redirect_uri_that_does_not_parse_is_refused():
+    """A URI urllib cannot parse, such as one with an unclosed IPv6 host, is refused."""
+    from custom_components.oidc_provider.client_manager import validate_redirect_uris
+
+    with pytest.raises(ValueError, match="Invalid redirect_uri"):
+        validate_redirect_uris(["https://[::1/callback"])

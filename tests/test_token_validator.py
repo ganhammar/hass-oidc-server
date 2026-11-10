@@ -670,3 +670,48 @@ def test_validate_access_token_rejects_unpublished_kid(hass_with_rotated_keys, c
         "not published" in record.getMessage() and "kid='dropped'" in record.getMessage()
         for record in caplog.records
     )
+
+
+def _access_token(private_key, **claims):
+    """Sign an RFC 9068 access token with a valid issuer, expiry and the given claims."""
+    payload = {
+        "sub": "user123",
+        "iss": "http://localhost/oidc",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        **claims,
+    }
+    return jwt.encode(payload, private_key, algorithm="RS256", headers={"typ": "at+jwt"})
+
+
+def test_token_with_a_valid_issuer_but_no_audience_is_refused(mock_hass_with_keys):
+    """A token that passes signature and issuer checks still needs an audience."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    assert validate_access_token(hass, _access_token(private_key), "http://localhost") is None
+
+
+def test_token_for_an_unknown_audience_is_refused_without_an_expected_one(mock_hass_with_keys):
+    """Without an expected audience, the audience must be a registered client."""
+    hass, private_key = mock_hass_with_keys
+    hass.data[DOMAIN]["clients"] = {"test_client": {}}
+
+    known = _access_token(private_key, aud="test_client")
+    unknown = _access_token(private_key, aud="someone_else")
+
+    assert validate_access_token(hass, known, "http://localhost") is not None
+    assert validate_access_token(hass, unknown, "http://localhost") is None
+
+
+def test_unexpected_errors_are_reported_as_invalid(mock_hass_with_keys):
+    """A failure outside token validation itself returns None instead of raising."""
+    from unittest.mock import patch
+
+    hass, private_key = mock_hass_with_keys
+    token = _access_token(private_key, aud="test_client")
+    with patch(
+        "custom_components.oidc_provider.token_validator.decode_access_token",
+        side_effect=RuntimeError("boom"),
+    ):
+        assert validate_access_token(hass, token, "http://localhost") is None
