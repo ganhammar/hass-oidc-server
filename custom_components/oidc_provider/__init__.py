@@ -44,9 +44,10 @@ def _admin_only(hass: HomeAssistant, handler):
 
     The client actions create and remove clients, end the sessions of every
     user and list every client, so they are for administrators only.
-    Calls without a user, from automations and scripts, are allowed, as with
-    Home Assistant's own admin services. That helper cannot return a response
-    on every supported Home Assistant release, so the check is done here.
+    Calls without a user, such as from automations, are allowed, as with Home
+    Assistant's own admin services; a script runs as the user who started it.
+    That helper cannot return a response on every supported Home Assistant
+    release, so the check is done here.
     """
 
     async def checked(call: ServiceCall):
