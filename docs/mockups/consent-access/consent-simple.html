@@ -1,0 +1,1044 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consent: levels (mockup)</title>
+<style>
+  /* Home Assistant's default theme tokens (frontend src/resources/theme) */
+  :root {
+    color-scheme: light;
+    --primary-background-color: #fafafa;
+    --card-background-color: #ffffff;
+    --primary-text-color: #141414;
+    --secondary-text-color: #5e5e5e;
+    --disabled-text-color: #bdbdbd;
+    --divider-color: rgba(0, 0, 0, 0.12);
+    --disabled-color: #bdbdbd;
+    --primary-color: #009ac7;
+    --info-color: #039be5;
+    --warning-color: #ffa600;
+    --input-outlined-idle-border-color: rgba(0, 0, 0, 0.38);
+    --input-outlined-hover-border-color: rgba(0, 0, 0, 0.87);
+    --radio-unchecked-color: rgba(20, 20, 20, 0.54);
+    --fill-primary-loud-resting: #009ac7;
+    --fill-primary-loud-hover: #006787;
+    --fill-primary-quiet-resting: #eff9fe;
+    --fill-neutral-quiet-resting: #f3f3f3;
+    --on-primary-normal: #009ac7;
+    --on-neutral-normal: #5e5e5e;
+    /* Selected state of radios and segments, darker than the primary colour so
+       the label on it keeps 4.5:1 */
+    --selected-color: #006787;
+    --on-selected-color: #ffffff;
+    --font-body: Roboto, Noto, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --primary-background-color: #111111;
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --disabled-text-color: #6f6f6f;
+    --divider-color: rgba(225, 225, 225, 0.12);
+    --disabled-color: #464646;
+    --input-outlined-idle-border-color: rgba(255, 255, 255, 0.38);
+    --input-outlined-hover-border-color: rgba(255, 255, 255, 0.87);
+    --radio-unchecked-color: rgba(225, 225, 225, 0.54);
+    --fill-primary-quiet-resting: #001721;
+    --fill-neutral-quiet-resting: #141414;
+    --on-primary-normal: #37c8fd;
+    --on-neutral-normal: #989898;
+    --selected-color: #7bd4fb;
+    --on-selected-color: #002e3e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --primary-background-color: #111111;
+      --card-background-color: #1c1c1c;
+      --primary-text-color: #e1e1e1;
+      --secondary-text-color: #9b9b9b;
+      --disabled-text-color: #6f6f6f;
+      --divider-color: rgba(225, 225, 225, 0.12);
+      --disabled-color: #464646;
+      --input-outlined-idle-border-color: rgba(255, 255, 255, 0.38);
+      --input-outlined-hover-border-color: rgba(255, 255, 255, 0.87);
+      --radio-unchecked-color: rgba(225, 225, 225, 0.54);
+      --fill-primary-quiet-resting: #001721;
+      --fill-neutral-quiet-resting: #141414;
+      --on-primary-normal: #37c8fd;
+      --on-neutral-normal: #989898;
+      --selected-color: #7bd4fb;
+      --on-selected-color: #002e3e;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { font-size: 14px; }
+  body {
+    margin: 0;
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    background: var(--primary-background-color);
+    color: var(--primary-text-color);
+  }
+  .icon { width: 24px; height: 24px; fill: currentColor; flex: none; }
+
+  /* Page and card, as in oidc-auth-panel.js and ha-authorize */
+  .oidc-page { padding: 32px 0; min-height: 100vh; }
+  .oidc-content { max-width: 400px; margin: 0 auto; padding: 0 16px; box-sizing: content-box; }
+  .oidc-content.wide { max-width: 560px; }
+  .oidc-header { display: flex; justify-content: center; margin-bottom: 32px; }
+  .oidc-header img { width: 56px; height: 56px; }
+  .card-content {
+    background: var(--card-background-color);
+    border: 1px solid var(--divider-color);
+    border-radius: 12px;
+    padding: 16px;
+  }
+  h1 { font-size: 28px; font-weight: 400; line-height: 1.2; margin: 16px 0; }
+  h2 { font-size: 20px; font-weight: 400; line-height: 1.3; margin: 28px 0 4px; }
+  p { font-size: 14px; line-height: 1.6; margin: 0 0 12px; }
+  b { font-weight: 700; }
+  a { color: var(--on-primary-normal); }
+  a:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; border-radius: 2px; }
+
+  /* ha-alert */
+  .ha-alert {
+    position: relative;
+    display: flex;
+    padding: 8px;
+    margin: 16px 0;
+    border-radius: 4px;
+    line-height: 1.45;
+  }
+  .ha-alert.page { background: var(--primary-background-color); }
+  .ha-alert::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 4px;
+    background: var(--alert-color);
+    opacity: 0.12;
+    pointer-events: none;
+  }
+  .ha-alert.warning { --alert-color: var(--warning-color); }
+  .ha-alert.info { --alert-color: var(--info-color); }
+  .ha-alert > .icon { color: var(--alert-color); }
+  .ha-alert .alert-text { margin-inline-start: 8px; align-self: center; overflow-wrap: anywhere; }
+  .ha-alert.compact { margin: 8px 0 0; font-size: 14px; }
+  .ha-alert.compact > .icon { width: 20px; height: 20px; }
+
+  /* ha-button */
+  .ha-button {
+    font: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1;
+    height: 40px;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 9999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 150ms ease-out;
+  }
+  .ha-button .icon { width: 20px; height: 20px; }
+  .ha-button.accent { background: var(--fill-primary-loud-resting); color: #fff; }
+  .ha-button.plain { background: transparent; }
+  .ha-button.plain.brand { color: var(--on-primary-normal); }
+  .ha-button.plain.neutral { color: var(--on-neutral-normal); }
+  @media (hover: hover) {
+    .ha-button.accent:hover { background: var(--fill-primary-loud-hover); }
+    .ha-button.plain.brand:hover { background: var(--fill-primary-quiet-resting); }
+    .ha-button.plain.neutral:hover { background: var(--fill-neutral-quiet-resting); }
+  }
+  .ha-button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+  .action { margin-top: 20px; }
+  .action .ha-button { width: 100%; }
+  .action + .action { margin-top: 8px; }
+  .inline-action { margin: 4px 0 0 -12px; padding: 0 12px; }
+  .back-action { margin: 0 0 0 -12px; padding: 0 12px 0 8px; }
+
+  /* Choices share fieldset resets */
+  fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+  legend { padding: 0; float: left; width: 100%; }
+  legend + * { clear: both; }
+  .prompt { font-size: 14px; line-height: 1.6; margin-bottom: 12px; }
+  .section-label { font-size: 16px; font-weight: 500; line-height: 1.3; margin-bottom: 8px; }
+
+  /* ha-select-box: the four levels */
+  .level-list { display: grid; gap: 12px; }
+  .option {
+    position: relative;
+    display: flex;
+    gap: 12px;
+    padding: 12px;
+    border: 1px solid var(--divider-color);
+    border-radius: 12px;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .option::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    opacity: 0.2;
+    background: transparent;
+    pointer-events: none;
+    transition: background-color 180ms ease-in-out;
+  }
+  @media (hover: hover) {
+    .option:not(.disabled):hover::before { background: var(--divider-color); }
+  }
+  .option:has(input:checked) { border-color: var(--selected-color); }
+  .option:has(input:checked)::before { background: var(--primary-color); }
+  .option:has(input:focus-visible) { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+  .option input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+  .radio {
+    position: relative;
+    flex: none;
+    width: 20px;
+    height: 20px;
+    margin-top: 1px;
+    border-radius: 50%;
+    border: 2px solid var(--radio-unchecked-color);
+    display: grid;
+    place-items: center;
+  }
+  .option input:checked ~ .radio { border-color: var(--selected-color); }
+  .option input:checked ~ .radio::after {
+    content: "";
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--selected-color);
+  }
+  .option .text { position: relative; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .option .label { font-size: 16px; font-weight: 500; line-height: 1.35; }
+  .option .description { font-size: 14px; line-height: 1.45; color: var(--secondary-text-color); }
+  .option .description ul { margin: 2px 0 0; padding-left: 18px; }
+  .badge {
+    display: inline-block;
+    margin-inline-start: 6px;
+    padding: 1px 8px;
+    border-radius: 9999px;
+    border: 1px solid var(--divider-color);
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.5;
+    color: var(--secondary-text-color);
+    vertical-align: 1px;
+    white-space: nowrap;
+  }
+  .level-note { display: none; }
+  .option:has(input:checked) .level-note { display: flex; }
+  .option.disabled { cursor: not-allowed; }
+  .option.disabled .radio,
+  .option.disabled .label,
+  .option.disabled .description { opacity: 0.5; }
+  .limit-reason {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    margin-top: 4px;
+    font-size: 14px;
+    line-height: 1.45;
+    color: var(--secondary-text-color);
+  }
+  .limit-reason .icon { width: 16px; height: 16px; margin-top: 2px; }
+
+  /* ha-control-select: None / Read / Full and the time limit */
+  .segmented {
+    position: relative;
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    height: 40px;
+    border-radius: 10px;
+  }
+  .segmented::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 10px;
+    background: var(--disabled-color);
+    opacity: 0.2;
+  }
+  .seg {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 0 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .seg::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 6px;
+    background: var(--primary-color);
+    opacity: 0;
+    transition: opacity 80ms ease-in-out;
+  }
+  @media (hover: hover) {
+    .seg:not(:has(input:disabled)):not(:has(input:checked)):hover::before { opacity: 0.2; }
+  }
+  .seg input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: inherit; }
+  .seg span, .seg .icon { position: relative; pointer-events: none; }
+  .seg .icon { width: 16px; height: 16px; }
+  .seg .check { display: none; }
+  .seg:has(input:checked) { background: var(--selected-color); color: var(--on-selected-color); }
+  .seg:has(input:checked) .check { display: block; }
+  .seg:has(input:focus-visible) { box-shadow: 0 0 0 2px var(--primary-color); }
+  .seg:has(input:disabled) { cursor: not-allowed; color: var(--disabled-text-color); }
+  .segmented.auto .seg { flex: 1 1 auto; padding: 0 10px; }
+
+  .hint { font-size: 14px; line-height: 1.45; color: var(--secondary-text-color); margin: 8px 0 0; }
+  .time { margin-top: 24px; }
+  .fine-print { margin: 24px 0 0; }
+
+  /* Detailed view */
+  .intro { color: var(--primary-text-color); }
+  .start-from { margin: 20px 0 8px; }
+  .start-from label { display: block; font-size: 12px; color: var(--secondary-text-color); margin-bottom: 4px; }
+  .select-wrap { position: relative; }
+  .select-wrap select {
+    appearance: none;
+    width: 100%;
+    height: 48px;
+    padding: 0 40px 0 12px;
+    font: inherit;
+    font-size: 16px;
+    color: var(--primary-text-color);
+    background: transparent;
+    border: 1px solid var(--input-outlined-idle-border-color);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .select-wrap select:hover { border-color: var(--input-outlined-hover-border-color); }
+  .select-wrap select:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -1px; border-color: transparent; }
+  .select-wrap select option { color: initial; }
+  .select-wrap .icon { position: absolute; right: 10px; top: 12px; pointer-events: none; color: var(--secondary-text-color); }
+  .custom-status:empty { margin: 0; }
+
+  .rows { container-type: inline-size; }
+  .group h2 { margin-bottom: 0; }
+  .area {
+    display: grid;
+    gap: 8px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--divider-color);
+  }
+  .group .area:last-child { border-bottom: 0; }
+  .area-name { font-size: 16px; font-weight: 500; line-height: 1.35; }
+  .area-desc { font-size: 14px; line-height: 1.45; color: var(--secondary-text-color); margin: 0; }
+  .area .segmented.two { width: calc((100% - 16px) * 2 / 3 + 12px); }
+  .area.unavailable .area-name { color: var(--secondary-text-color); }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    justify-self: start;
+    height: 28px;
+    padding: 0 10px 0 8px;
+    border-radius: 9999px;
+    border: 1px solid var(--divider-color);
+    font-size: 14px;
+    color: var(--secondary-text-color);
+  }
+  .pill .icon { width: 16px; height: 16px; }
+  @container (min-width: 460px) {
+    .area { grid-template-columns: minmax(0, 1fr) 216px; column-gap: 16px; align-items: center; }
+    .area > .area-name { grid-column: 1; }
+    .area > .segmented, .area > .pill { grid-column: 2; }
+    .area > .area-detail { grid-column: 1 / -1; }
+  }
+  .files-warning:empty { display: none; }
+  .files-warning p { margin: 0; }
+  .files-warning p + p { margin-top: 6px; }
+
+  .visually-hidden {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  [hidden] { display: none !important; }
+
+  /* Mockup controls, outside the design */
+  .mockup-bar {
+    max-width: 560px;
+    margin: 0 auto 32px;
+    padding: 12px 16px;
+    border: 1px dashed var(--divider-color);
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--secondary-text-color);
+  }
+  .mockup-bar .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-bottom: 8px; }
+  .mockup-bar select, .mockup-bar button { font: inherit; }
+  .mockup-bar code { overflow-wrap: anywhere; color: var(--primary-text-color); }
+  body.embed .mockup-bar { display: none; }
+</style>
+</head>
+<body data-start-view="simple">
+<div class="oidc-page">
+  <div class="oidc-content" id="content">
+    <div class="oidc-header">
+      <img src="data:image/png;base64,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" alt="Home Assistant">
+    </div>
+    <div class="ha-alert warning page" id="app-alert"></div>
+    <div class="card-content" id="card"></div>
+  </div>
+</div>
+
+<aside class="mockup-bar" aria-label="Mockup controls">
+  <div class="row">
+    <strong>Mockup, not part of the design</strong>
+  </div>
+  <div class="row">
+    <label>Situation
+      <select id="mock-scenario">
+        <option value="first">First connection, administrator</option>
+        <option value="returning">Reconnecting, custom choice last time</option>
+        <option value="limited">Household member with limits</option>
+      </select>
+    </label>
+    <label>Theme
+      <select id="mock-theme">
+        <option value="">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+    <button type="button" id="mock-reset">Start again</button>
+  </div>
+  <div>Token scope: <code id="mock-scope"></code></div>
+  <div>Session ends: <code id="mock-ends"></code></div>
+</aside>
+
+<script>
+(() => {
+  'use strict';
+
+  const ICONS = {
+    alert: 'M12,2L1,21H23M12,6L19.53,19H4.47M11,10V14H13V10M11,16V18H13V16',
+    info: 'M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z',
+    check: 'M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z',
+    chevronRight: 'M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z',
+    chevronDown: 'M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z',
+    arrowLeft: 'M20,11V13H8L13.5,18.5L12.08,19.92L4.16,12L12.08,4.08L13.5,5.5L8,11H20Z',
+    lock: 'M12,17C10.89,17 10,16.1 10,15C10,13.89 10.89,13 12,13A2,2 0 0,1 14,15A2,2 0 0,1 12,17M18,20V10H6V20H18M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6C4.89,22 4,21.1 4,20V10C4,8.89 4.89,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z',
+    cancel: 'M12 2C17.5 2 22 6.5 22 12S17.5 22 12 22 2 17.5 2 12 6.5 2 12 2M12 4C10.1 4 8.4 4.6 7.1 5.7L18.3 16.9C19.3 15.5 20 13.8 20 12C20 7.6 16.4 4 12 4M16.9 18.3L5.7 7.1C4.6 8.4 4 10.1 4 12C4 16.4 7.6 20 12 20C13.9 20 15.6 19.4 16.9 18.3Z',
+  };
+  const icon = (name, cls = '') =>
+    `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="${ICONS[name]}"/></svg>`;
+  const esc = (value) =>
+    String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+  // What the authorization request and the resource server tell the screen
+  const APP = { name: 'Claude', host: 'claude.ai', redirectHost: 'claude.ai', sees: 'your name and email address' };
+  const t = (text) => text.replaceAll('{app}', APP.name);
+
+  const VALUES = ['none', 'read', 'full'];
+  const LABEL = { none: 'None', read: 'Read', full: 'Full' };
+  const RANK = { none: 0, read: 1, full: 2 };
+  const lower = (a, b) => (RANK[a] <= RANK[b] ? a : b);
+
+  const GROUPS = [
+    { id: 'devices', name: 'Devices' },
+    { id: 'setup', name: 'Setup' },
+    { id: 'system', name: 'System' },
+  ];
+
+  // Each area: what its current setting means, and the honest limit that
+  // applies to it given the other rows. c.v(id) reads another row.
+  const AREAS = [
+    {
+      id: 'entities', group: 'devices', name: 'Entities and their states', max: 'full',
+      none: '{app} cannot see states or perform actions.',
+      read: '{app} can see states, history, the logbook and statistics.',
+      full: '{app} can also perform actions and fire events, such as turning lights on and off.',
+      note: (c) => c.v('entities') === 'full' && c.othersRestricted('entities')
+        ? 'Actions reach further than devices. An action can also run a script, turn an automation off or restart Home Assistant, whatever the other areas say.'
+        : '',
+    },
+    {
+      id: 'calendars', group: 'devices', name: 'Calendars', max: 'full',
+      none: '{app} cannot see or change calendar events.',
+      read: '{app} can see calendar events.',
+      full: '{app} can also add and delete events.',
+      note: (c) => c.v('calendars') === 'none' && c.v('entities') !== 'none'
+        ? 'Calendars still show up as entities, with their next event.'
+        : '',
+    },
+    {
+      id: 'cameras', group: 'devices', name: 'Cameras and images', max: 'read',
+      none: '{app} cannot fetch camera images or image files.',
+      read: '{app} can see what your cameras show right now, and saved images such as snapshots.',
+      note: (c) => {
+        if (c.v('cameras') !== 'none' || c.v('entities') === 'none') return '';
+        return c.v('entities') === 'full'
+          ? 'Your cameras still show up as entities, and an action can still take a snapshot.'
+          : 'Your cameras still show up as entities.';
+      },
+    },
+    {
+      id: 'automations', group: 'setup', name: 'Automations, scripts and scenes', max: 'full',
+      none: '{app} cannot see or change automations, scripts and scenes.',
+      read: '{app} can see how they are set up and how they last ran.',
+      full: '{app} can also create, change and delete them.',
+      note: (c) => {
+        if (c.v('automations') !== 'none' || c.v('entities') === 'none') return '';
+        return c.v('entities') === 'full'
+          ? 'They still show up as entities, and an action can still run them or turn them off.'
+          : 'They still show up as entities.';
+      },
+    },
+    {
+      id: 'dashboards', group: 'setup', name: 'Dashboards', max: 'full',
+      none: '{app} cannot see or change dashboards.',
+      read: '{app} can see how your dashboards are set up.',
+      full: '{app} can also create, change and delete dashboards.',
+      note: (c) => {
+        if (c.v('dashboards') !== 'full' && c.v('files') === 'full') {
+          return 'Dashboards kept in YAML files can still be changed through Config files.';
+        }
+        if (c.v('dashboards') === 'none' && c.v('files') === 'read') {
+          return 'Dashboards kept in YAML files can still be read through Config files.';
+        }
+        return '';
+      },
+    },
+    {
+      id: 'helpers', group: 'setup', name: 'Helpers', max: 'full',
+      none: '{app} cannot see or change helper settings.',
+      read: '{app} can see your helpers and their settings.',
+      full: '{app} can also create, change and delete helpers.',
+      note: (c) => {
+        if (c.v('helpers') !== 'none' || c.v('entities') === 'none') return '';
+        return c.v('entities') === 'full'
+          ? 'Helpers still show up as entities, and an action can still change their values.'
+          : 'Helpers still show up as entities.';
+      },
+    },
+    {
+      id: 'registries', group: 'setup', name: 'Areas, floors, devices and labels', max: 'full',
+      none: '{app} cannot see or change how your home is organized.',
+      read: '{app} can see your areas, floors, devices and labels.',
+      full: '{app} can also change them, rename entities, and remove entities and devices.',
+    },
+    {
+      id: 'templates', group: 'setup', name: 'Templates', max: 'read',
+      none: '{app} cannot use templates.',
+      read: '{app} can work out values with templates. A template can read any state in your home.',
+      note: (c) => c.v('templates') === 'read' && c.v('entities') === 'none'
+        ? 'Templates can still read the states that Entities and their states hides.'
+        : '',
+    },
+    {
+      id: 'knx', group: 'setup', name: 'KNX', max: 'full',
+      none: '{app} cannot see KNX telegrams or change KNX entities.',
+      read: '{app} can see recent KNX telegrams and group addresses.',
+      full: '{app} can also create and change KNX entities.',
+    },
+    {
+      id: 'diagnostics', group: 'system', name: 'Diagnostics', max: 'full',
+      none: '{app} cannot see system health, repairs or logs.',
+      read: '{app} can see system health, repairs, the list of backups and the error log.',
+      full: '{app} can also restart Home Assistant.',
+    },
+    {
+      id: 'integrations', group: 'system', name: 'Integrations', max: 'full',
+      none: '{app} cannot see or manage integrations.',
+      read: '{app} can see which integrations are set up.',
+      full: '{app} can also add, set up, turn off and remove integrations. Removing one also removes its devices.',
+    },
+    {
+      id: 'files', group: 'system', name: 'Config files', max: 'full',
+      none: '{app} cannot read or change configuration files.',
+      read: '{app} can read your configuration files, such as configuration.yaml. Never secrets.yaml.',
+      full: '{app} can also change, delete and restore them. A backup is made before every change.',
+    },
+    {
+      id: 'appdaemon', group: 'system', name: 'AppDaemon apps', max: 'full',
+      none: '{app} cannot read or change AppDaemon apps.',
+      read: '{app} can read the code and settings of your AppDaemon apps.',
+      full: '{app} can also change, delete and restore them. A backup is made before every change.',
+    },
+  ];
+  const AREA = Object.fromEntries(AREAS.map((a) => [a.id, a]));
+
+  // The four levels are presets: each turns one more group to Full.
+  const LEVELS = [
+    {
+      id: 'read', scope: 'mcp:read', name: 'Look only', fullGroups: [],
+      description: 'See devices, history and settings, without changing anything.',
+      note: (c) => {
+        const files = c.available('files');
+        const apps = c.available('appdaemon');
+        if (files && apps) return 'This includes reading your configuration files and AppDaemon apps. Your secrets.yaml file is never shared.';
+        if (files) return 'This includes reading your configuration files. Your secrets.yaml file is never shared.';
+        if (apps) return 'This includes reading your AppDaemon apps.';
+        return '';
+      },
+    },
+    {
+      id: 'control', scope: 'mcp:control', name: 'Control devices', fullGroups: ['devices'],
+      description: 'Also turn things on and off, perform actions and manage calendar events.',
+      note: () => 'Actions reach further than devices. An action can also run a script, turn an automation off or restart Home Assistant.',
+    },
+    {
+      id: 'configure', scope: 'mcp:configure', name: 'Edit the setup', fullGroups: ['devices', 'setup'],
+      description: 'Also change automations, scripts, scenes, dashboards and helpers, and organize or remove devices and entities.',
+      note: () => 'Actions reach further than devices. An action can also run a script, turn an automation off or restart Home Assistant.',
+    },
+    {
+      id: 'admin', scope: 'mcp:admin', name: 'Administer', fullGroups: ['devices', 'setup', 'system'],
+      description: 'Also add and remove integrations, change configuration files and AppDaemon apps, and restart Home Assistant.',
+      note: () => '',
+    },
+  ];
+  const LEVEL = Object.fromEntries(LEVELS.map((l) => [l.id, l]));
+
+  const OPTION_OFF = "Turned off in the MCP Server integration's options.";
+  const OWNER_EXAMPLE = Object.fromEntries(AREAS.map((a) => [a.id, a.max]));
+  OWNER_EXAMPLE.cameras = 'none';
+  OWNER_EXAMPLE.dashboards = 'read';
+
+  const SCENARIOS = {
+    first: { unavailable: {}, caps: {}, blocked: {}, last: null },
+    returning: { unavailable: {}, caps: {}, blocked: {}, last: { rows: OWNER_EXAMPLE } },
+    limited: {
+      unavailable: { files: OPTION_OFF, appdaemon: OPTION_OFF },
+      caps: {
+        integrations: { max: 'read', reason: "Full is turned off in the MCP Server integration's options." },
+        diagnostics: { max: 'read', reason: 'An administrator has limited this to Read for your account.' },
+      },
+      blocked: { admin: 'Not available for your account. An administrator has limited what you can allow.' },
+      last: null,
+    },
+  };
+
+  const TIMES = [
+    { id: 'hour', label: '1 hour', ms: 3600e3 },
+    { id: 'day', label: '1 day', ms: 86400e3 },
+    { id: 'forever', label: 'Until I sign it out', ms: 30 * 86400e3 },
+  ];
+
+  // ---- State -------------------------------------------------------------
+  const params = new URLSearchParams(location.search);
+  const embedded = params.has('embed');
+  let scenario = SCENARIOS[params.get('scenario')] ? params.get('scenario') : 'first';
+  let state;
+
+  const sc = () => SCENARIOS[scenario];
+  const available = (id) => !sc().unavailable[id];
+  const allowedMax = (id) => {
+    if (!available(id)) return 'none';
+    const cap = sc().caps[id];
+    return cap ? lower(AREA[id].max, cap.max) : AREA[id].max;
+  };
+  const clamp = (rows) => Object.fromEntries(AREAS.map((a) => [a.id, lower(rows[a.id] || 'none', allowedMax(a.id))]));
+  const presetRows = (level) =>
+    clamp(Object.fromEntries(AREAS.map((a) => [a.id, level.fullGroups.includes(a.group) ? a.max : 'read'])));
+  const sameRows = (a, b) => AREAS.every((area) => a[area.id] === b[area.id]);
+  const matchingLevel = (rows) => LEVELS.find((l) => !sc().blocked[l.id] && sameRows(presetRows(l), rows)) || null;
+
+  function freshState() {
+    const last = sc().last;
+    const rows = last ? clamp(last.rows) : presetRows(LEVEL.read);
+    const match = matchingLevel(rows);
+    return {
+      view: document.body.dataset.startView,
+      rows,
+      selected: match ? match.id : 'custom',
+      customRows: match ? null : { ...rows },
+      lastChoice: last ? (match ? match.id : 'custom') : null,
+      time: 'forever',
+      done: null,
+    };
+  }
+
+  const ctx = () => ({
+    v: (id) => state.rows[id],
+    available,
+    othersRestricted: (id) => AREAS.some((a) => a.id !== id && available(a.id) && RANK[state.rows[a.id]] < RANK[a.max]),
+  });
+
+  // A custom choice is described as the closest level and what differs from it
+  function closest(rows) {
+    let best = null;
+    for (const level of LEVELS) {
+      if (sc().blocked[level.id]) continue;
+      const preset = presetRows(level);
+      const diffs = AREAS.filter((a) => available(a.id) && preset[a.id] !== rows[a.id]);
+      if (!best || diffs.length < best.diffs.length) best = { level, diffs };
+    }
+    return best;
+  }
+
+  function summaryHtml(rows) {
+    const { level, diffs } = closest(rows);
+    if (diffs.length > 3) return `Your own choice for each area, closest to ${esc(level.name)}.`;
+    const items = diffs.map((a) => `<li>${esc(a.name)}: ${LABEL[rows[a.id]]}</li>`).join('');
+    return `Like ${esc(level.name)}, except:<ul>${items}</ul>`;
+  }
+
+  function summaryText(rows) {
+    const { level, diffs } = closest(rows);
+    if (diffs.length > 3) return `Custom: your own choice for each area, closest to ${level.name}.`;
+    return `Custom: like ${level.name}, except ${diffs.map((a) => `${a.name}: ${LABEL[rows[a.id]]}`).join(', ')}.`;
+  }
+
+  function scopeString() {
+    const base = ['openid', 'profile', 'email'];
+    const match = matchingLevel(state.rows);
+    if (match) return [...base, match.scope].join(' ');
+    return [...base, ...AREAS.filter((a) => state.rows[a.id] !== 'none').map((a) => `mcp:${a.id}:${state.rows[a.id]}`)].join(' ');
+  }
+
+  function endsText(timeId, now = new Date()) {
+    const time = TIMES.find((x) => x.id === timeId);
+    const end = new Date(now.getTime() + time.ms);
+    const clock = end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const sameDay = end.toDateString() === now.toDateString();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    if (sameDay) return `today at ${clock}`;
+    if (end.toDateString() === tomorrow.toDateString()) return `tomorrow at ${clock}`;
+    return end.toLocaleDateString([], { month: 'long', day: 'numeric' });
+  }
+
+  function timeHint() {
+    if (state.time === 'forever') return t('Access lasts until you sign {app} out, for 30 days at most.');
+    return `Access ends ${endsText(state.time)}.`;
+  }
+
+  // ---- Shared pieces -----------------------------------------------------
+  function renderAlert() {
+    const alert = document.getElementById('app-alert');
+    alert.hidden = false;
+    alert.innerHTML = `
+      ${icon('alert')}
+      <div class="alert-text">You're about to give <b><bdi>${esc(APP.name)}</bdi></b> from <b><bdi>${esc(APP.host)}</bdi></b> access to your Home Assistant instance.</div>`;
+  }
+
+  function timeAndActions() {
+    const segs = TIMES.map((x) => `
+      <label class="seg">
+        <input type="radio" name="time" value="${x.id}" ${state.time === x.id ? 'checked' : ''} aria-describedby="time-hint">
+        ${icon('check', 'check')}<span>${x.label}</span>
+      </label>`).join('');
+    return `
+      <fieldset class="time">
+        <legend class="section-label">Allow access for</legend>
+        <div class="segmented auto">${segs}</div>
+        <p class="hint" id="time-hint">${esc(timeHint())}</p>
+      </fieldset>
+      <p class="fine-print">When you approve, you go back to <b><bdi>${esc(APP.redirectHost)}</bdi></b>. ${esc(APP.name)} will also see ${esc(APP.sees)}.</p>
+      <div class="action"><button type="button" class="ha-button accent" id="approve">Approve</button></div>
+      <div class="action"><button type="button" class="ha-button plain neutral" id="deny">Deny</button></div>`;
+  }
+
+  function wireTimeAndActions(card) {
+    for (const input of card.querySelectorAll('input[name="time"]')) {
+      input.addEventListener('change', () => {
+        state.time = input.value;
+        card.querySelector('#time-hint').textContent = timeHint();
+        report();
+      });
+    }
+    card.querySelector('#approve').addEventListener('click', () => finish(true));
+    card.querySelector('#deny').addEventListener('click', () => finish(false));
+  }
+
+  // ---- Simple view -------------------------------------------------------
+  function levelOption(level) {
+    const blocked = sc().blocked[level.id];
+    const note = level.note(ctx());
+    const describedBy = [`level-${level.id}-desc`, note ? `level-${level.id}-note` : '', blocked ? `level-${level.id}-blocked` : '']
+      .filter(Boolean).join(' ');
+    return `
+      <label class="option${blocked ? ' disabled' : ''}">
+        <input type="radio" name="level" value="${level.id}" ${state.selected === level.id ? 'checked' : ''} ${blocked ? 'disabled' : ''}
+          aria-labelledby="level-${level.id}-label" aria-describedby="${describedBy}">
+        <span class="radio" aria-hidden="true"></span>
+        <span class="text">
+          <span class="label" id="level-${level.id}-label">${esc(level.name)}${state.lastChoice === level.id ? '<span class="badge">Your choice last time</span>' : ''}</span>
+          <span class="description" id="level-${level.id}-desc">${esc(level.description)}</span>
+          ${note ? `<span class="ha-alert info compact level-note" id="level-${level.id}-note">${icon('info')}<span class="alert-text">${esc(note)}</span></span>` : ''}
+          ${blocked ? `<span class="limit-reason" id="level-${level.id}-blocked">${icon('lock')}<span>${esc(blocked)}</span></span>` : ''}
+        </span>
+      </label>`;
+  }
+
+  function customOption() {
+    if (!state.customRows) return '';
+    return `
+      <label class="option">
+        <input type="radio" name="level" value="custom" ${state.selected === 'custom' ? 'checked' : ''}
+          aria-labelledby="level-custom-label" aria-describedby="level-custom-desc">
+        <span class="radio" aria-hidden="true"></span>
+        <span class="text">
+          <span class="label" id="level-custom-label">Custom${state.lastChoice === 'custom' ? '<span class="badge">Your choice last time</span>' : ''}</span>
+          <span class="description" id="level-custom-desc">${summaryHtml(state.customRows)}</span>
+        </span>
+      </label>`;
+  }
+
+  function renderSimple() {
+    const content = document.getElementById('content');
+    content.classList.remove('wide');
+    const card = document.getElementById('card');
+    card.innerHTML = `
+      <h1>Approve access?</h1>
+      <fieldset>
+        <legend class="prompt">${esc(t('Choose what {app} can do in Home Assistant.'))}</legend>
+        <div class="level-list">
+          ${LEVELS.map(levelOption).join('')}
+          ${customOption()}
+        </div>
+      </fieldset>
+      <button type="button" class="ha-button plain brand inline-action" id="to-detailed">
+        Choose in detail ${icon('chevronRight')}
+      </button>
+      ${timeAndActions()}`;
+
+    for (const input of card.querySelectorAll('input[name="level"]')) {
+      input.addEventListener('change', () => {
+        state.selected = input.value;
+        state.rows = input.value === 'custom' ? { ...state.customRows } : presetRows(LEVEL[input.value]);
+        report();
+      });
+    }
+    card.querySelector('#to-detailed').addEventListener('click', () => {
+      state.view = 'detailed';
+      render();
+      document.getElementById('back').focus();
+    });
+    wireTimeAndActions(card);
+  }
+
+  // ---- Detailed view -----------------------------------------------------
+  function areaRow(area) {
+    const nameId = `area-${area.id}-name`;
+    if (!available(area.id)) {
+      return `
+        <div class="area unavailable" role="group" aria-labelledby="${nameId}" aria-describedby="area-${area.id}-desc">
+          <div class="area-name" id="${nameId}">${esc(area.name)}</div>
+          <span class="pill">${icon('cancel')}Not available</span>
+          <div class="area-detail"><p class="area-desc" id="area-${area.id}-desc">${esc(sc().unavailable[area.id])}</p></div>
+        </div>`;
+    }
+    const values = area.max === 'read' ? ['none', 'read'] : VALUES;
+    const cap = sc().caps[area.id];
+    const segs = values.map((value) => {
+      const disabled = RANK[value] > RANK[allowedMax(area.id)];
+      return `
+        <label class="seg">
+          <input type="radio" name="area-${area.id}" value="${value}" ${state.rows[area.id] === value ? 'checked' : ''} ${disabled ? 'disabled' : ''}
+            aria-describedby="area-${area.id}-opt-${value}${disabled ? ` area-${area.id}-cap` : ''}">
+          ${disabled ? icon('lock') : icon('check', 'check')}<span>${LABEL[value]}</span>
+        </label>`;
+    }).join('');
+    const optionDescriptions = values
+      .map((value) => `<span class="visually-hidden" id="area-${area.id}-opt-${value}">${esc(t(area[value]))}</span>`).join('');
+    return `
+      <div class="area" role="radiogroup" aria-labelledby="${nameId}" data-area="${area.id}">
+        <div class="area-name" id="${nameId}">${esc(area.name)}</div>
+        <div class="segmented${values.length === 2 ? ' two' : ''}">${segs}</div>
+        <div class="area-detail">
+          <p class="area-desc" data-desc></p>
+          <div class="ha-alert info compact" data-note hidden>${icon('info')}<span class="alert-text"></span></div>
+          ${cap ? `<div class="limit-reason" id="area-${area.id}-cap">${icon('lock')}<span>${esc(cap.reason)}</span></div>` : ''}
+          ${optionDescriptions}
+        </div>
+      </div>`;
+  }
+
+  function filesWarning() {
+    const files = state.rows.files;
+    const apps = state.rows.appdaemon;
+    // Writing files gets past any area below Full; reading them only gets
+    // past an area set to None, since every other area already allows reading.
+    const others = AREAS.filter((a) => a.id !== 'files' && a.id !== 'appdaemon' && available(a.id));
+    const belowMax = others.some((a) => RANK[state.rows[a.id]] < RANK[a.max]);
+    const anyNone = others.some((a) => state.rows[a.id] === 'none');
+    const parts = [];
+    if (files === 'full' && belowMax) {
+      parts.push(t('Config files reach past the other areas. {app} can change any YAML file, such as configuration.yaml or a dashboard kept in YAML, whatever the other areas say.'));
+    } else if (files === 'read' && anyNone) {
+      parts.push(t('Config files reach past the other areas. {app} can read what is written in your YAML files, such as a dashboard kept in YAML, whatever the other areas say.'));
+    }
+    if (apps === 'full' && belowMax) {
+      parts.push('AppDaemon apps are code. A changed app can do anything AppDaemon can do in Home Assistant, whatever the other areas say.');
+    } else if (apps === 'read' && anyNone) {
+      parts.push('Reading AppDaemon apps can show passwords and settings for other parts of your home, whatever the other areas say.');
+    }
+    if (!parts.length) return '';
+    return `${icon('info')}<div class="alert-text">${parts.map((p) => `<p>${esc(p)}</p>`).join('')}</div>`;
+  }
+
+  function presetSelect() {
+    const options = LEVELS.map((l) => {
+      const blocked = sc().blocked[l.id];
+      return `<option value="${l.id}" ${blocked ? 'disabled' : ''}>${esc(l.name)}${blocked ? ' (not available)' : ''}</option>`;
+    }).join('');
+    return `
+      <div class="start-from">
+        <label for="preset">Start from a level</label>
+        <div class="select-wrap">
+          <select id="preset" aria-describedby="custom-status">${options}<option value="custom" disabled>Custom</option></select>
+          ${icon('chevronDown')}
+        </div>
+        <p class="hint custom-status" id="custom-status" aria-live="polite"></p>
+      </div>`;
+  }
+
+  function renderDetailed() {
+    document.getElementById('content').classList.add('wide');
+    const card = document.getElementById('card');
+    const groups = GROUPS.map((g) => `
+      <section class="group" aria-labelledby="group-${g.id}">
+        <h2 id="group-${g.id}">${esc(g.name)}</h2>
+        ${AREAS.filter((a) => a.group === g.id).map(areaRow).join('')}
+      </section>`).join('');
+    card.innerHTML = `
+      <button type="button" class="ha-button plain neutral back-action" id="back">${icon('arrowLeft')}Back to levels</button>
+      <h1>Choose in detail</h1>
+      <p class="intro">${esc(t("For each area, choose None, Read or Full. Read lets {app} look, and Full also lets it make changes. None hides the area's tools, but the things themselves can still show up elsewhere, for example as entities."))}</p>
+      ${presetSelect()}
+      <div class="rows">${groups}</div>
+      <div class="ha-alert info files-warning" id="files-warning" aria-live="polite"></div>
+      ${timeAndActions()}`;
+
+    card.querySelector('#back').addEventListener('click', () => {
+      state.view = 'simple';
+      render();
+      const checked = document.querySelector('input[name="level"]:checked');
+      (checked || document.querySelector('input[name="level"]')).focus();
+    });
+    card.querySelector('#preset').addEventListener('change', (event) => {
+      const level = LEVEL[event.target.value];
+      state.rows = presetRows(level);
+      state.selected = level.id;
+      for (const area of AREAS) {
+        const input = card.querySelector(`input[name="area-${area.id}"][value="${state.rows[area.id]}"]`);
+        if (input) input.checked = true;
+      }
+      updateDetailed();
+      report();
+    });
+    for (const input of card.querySelectorAll('input[name^="area-"]')) {
+      input.addEventListener('change', () => {
+        state.rows[input.name.slice(5)] = input.value;
+        const match = matchingLevel(state.rows);
+        state.selected = match ? match.id : 'custom';
+        if (!match) state.customRows = { ...state.rows };
+        updateDetailed();
+        report();
+      });
+    }
+    wireTimeAndActions(card);
+    updateDetailed();
+  }
+
+  function updateDetailed() {
+    const card = document.getElementById('card');
+    const c = ctx();
+    for (const area of AREAS) {
+      const row = card.querySelector(`.area[data-area="${area.id}"]`);
+      if (!row) continue;
+      row.querySelector('[data-desc]').textContent = t(area[state.rows[area.id]]);
+      const note = area.note ? area.note(c) : '';
+      const noteEl = row.querySelector('[data-note]');
+      noteEl.hidden = !note;
+      noteEl.querySelector('.alert-text').textContent = note;
+    }
+    card.querySelector('#preset').value = state.selected;
+    card.querySelector('#custom-status').textContent = state.selected === 'custom' ? summaryText(state.rows) : '';
+    card.querySelector('#files-warning').innerHTML = filesWarning();
+  }
+
+  // ---- Result ------------------------------------------------------------
+  function finish(approved) {
+    state.done = approved ? 'approved' : 'denied';
+    document.getElementById('app-alert').hidden = true;
+    const card = document.getElementById('card');
+    document.getElementById('content').classList.remove('wide');
+    card.innerHTML = approved
+      ? `<h1>Access approved</h1>
+         <p>Sending you back to the application.</p>
+         <p class="hint">${esc(t('You can sign {app} out at any time under'))} <a href="connected-applications.html">Connected applications</a>.</p>`
+      : `<h1>Access denied</h1><p>Sending you back to the application.</p>`;
+    report();
+  }
+
+  function render() {
+    renderAlert();
+    if (state.view === 'detailed') renderDetailed();
+    else renderSimple();
+    report();
+  }
+
+  // ---- Mockup plumbing ---------------------------------------------------
+  function report() {
+    const scope = state.done === 'denied' ? '(none, access denied)' : scopeString();
+    const ends = state.time === 'forever' ? `${endsText('forever')}, or when signed out` : endsText(state.time);
+    document.getElementById('mock-scope').textContent = scope;
+    document.getElementById('mock-ends').textContent = ends;
+    if (embedded && window.parent !== window) {
+      window.parent.postMessage({ type: 'mockup-state', scope, ends }, '*');
+    }
+  }
+
+  function applyTheme(theme) {
+    if (theme) document.documentElement.dataset.theme = theme;
+    else delete document.documentElement.dataset.theme;
+    document.getElementById('mock-theme').value = theme || '';
+  }
+
+  function reset(nextScenario) {
+    scenario = nextScenario;
+    document.getElementById('mock-scenario').value = scenario;
+    state = freshState();
+    render();
+  }
+
+  if (embedded) document.body.classList.add('embed');
+  applyTheme(params.get('theme') || '');
+  document.getElementById('mock-theme').addEventListener('change', (e) => applyTheme(e.target.value));
+  document.getElementById('mock-scenario').addEventListener('change', (e) => reset(e.target.value));
+  document.getElementById('mock-reset').addEventListener('click', () => reset(scenario));
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'mockup') return;
+    if ('theme' in data) applyTheme(data.theme);
+    if (data.scenario && data.scenario !== scenario) reset(data.scenario);
+  });
+
+  reset(scenario);
+})();
+</script>
+</body>
+</html>

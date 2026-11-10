@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connected applications (mockup)</title>
+<style>
+  /* Home Assistant's default theme tokens (frontend src/resources/theme) */
+  :root {
+    color-scheme: light;
+    --primary-background-color: #fafafa;
+    --card-background-color: #ffffff;
+    --primary-text-color: #141414;
+    --secondary-text-color: #5e5e5e;
+    --divider-color: rgba(0, 0, 0, 0.12);
+    --primary-color: #009ac7;
+    --fill-danger-quiet-resting: #fff0ef;
+    --fill-neutral-quiet-resting: #f3f3f3;
+    --on-danger-normal: #b30532;
+    --on-neutral-normal: #5e5e5e;
+    --font-body: Roboto, Noto, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --primary-background-color: #111111;
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --divider-color: rgba(225, 225, 225, 0.12);
+    --fill-danger-quiet-resting: #2a040b;
+    --fill-neutral-quiet-resting: #141414;
+    --on-danger-normal: #f3676c;
+    --on-neutral-normal: #989898;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --primary-background-color: #111111;
+      --card-background-color: #1c1c1c;
+      --primary-text-color: #e1e1e1;
+      --secondary-text-color: #9b9b9b;
+      --divider-color: rgba(225, 225, 225, 0.12);
+      --fill-danger-quiet-resting: #2a040b;
+      --fill-neutral-quiet-resting: #141414;
+      --on-danger-normal: #f3676c;
+      --on-neutral-normal: #989898;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { font-size: 14px; }
+  body {
+    margin: 0;
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    background: var(--primary-background-color);
+    color: var(--primary-text-color);
+  }
+  .icon { width: 24px; height: 24px; fill: currentColor; flex: none; }
+
+  /* Page and card, as in oidc-auth-panel.js */
+  .oidc-page { padding: 32px 0; min-height: 100vh; }
+  .oidc-content { max-width: 400px; margin: 0 auto; padding: 0 16px; box-sizing: content-box; }
+  .oidc-header { display: flex; justify-content: center; margin-bottom: 32px; }
+  .oidc-header img { width: 56px; height: 56px; }
+  .card-content {
+    background: var(--card-background-color);
+    border: 1px solid var(--divider-color);
+    border-radius: 12px;
+    padding: 16px;
+  }
+  h1 { font-size: 28px; font-weight: 400; line-height: 1.2; margin: 16px 0; }
+  p { font-size: 14px; line-height: 1.6; margin: 0 0 12px; }
+
+  /* ha-button, plain */
+  .ha-button {
+    font: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1;
+    height: 40px;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 9999px;
+    background: transparent;
+    cursor: pointer;
+    width: 100%;
+    -webkit-tap-highlight-color: transparent;
+    transition: background-color 150ms ease-out;
+  }
+  .ha-button.danger { color: var(--on-danger-normal); }
+  @media (hover: hover) {
+    .ha-button.danger:hover { background: var(--fill-danger-quiet-resting); }
+  }
+  .ha-button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+
+  /* One session, as .oidc-session in the panel */
+  .oidc-session { padding: 12px 0; border-top: 1px solid var(--divider-color); }
+  .oidc-session .action { margin-top: 8px; }
+  .session-name { font-size: 14px; line-height: 1.6; }
+  .oidc-session-meta { color: var(--secondary-text-color); font-size: 14px; line-height: 1.6; }
+  .access { margin-top: 6px; font-size: 14px; line-height: 1.5; }
+  .access-label { color: var(--secondary-text-color); }
+  .access-level { font-weight: 500; }
+  .access-detail { color: var(--secondary-text-color); line-height: 1.5; }
+  .access-detail ul { margin: 2px 0 0; padding-left: 18px; }
+  .ends { display: flex; gap: 6px; align-items: flex-start; margin-top: 4px; line-height: 1.5; }
+  .ends .icon { width: 18px; height: 18px; margin-top: 1px; color: var(--secondary-text-color); }
+  .ends.limited { color: var(--primary-text-color); }
+  .ends.open { color: var(--secondary-text-color); }
+
+  details { margin-top: 6px; }
+  summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    cursor: pointer;
+    list-style: none;
+    font-weight: 500;
+    color: var(--on-neutral-normal);
+    border-radius: 4px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary .icon { width: 20px; height: 20px; transition: transform 150ms ease-out; }
+  details[open] summary .icon { transform: rotate(180deg); }
+  summary:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+  .grant { margin: 8px 0 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; }
+  .grant .group-name { grid-column: 1 / -1; margin-top: 8px; font-weight: 500; color: var(--secondary-text-color); font-size: 12px; }
+  .grant .group-name:first-child { margin-top: 0; }
+  .grant dt, .grant dd { margin: 0; line-height: 1.5; }
+  .grant dd { text-align: end; }
+  .grant dd.none { color: var(--secondary-text-color); }
+
+  /* Mockup controls, outside the design */
+  .mockup-bar {
+    max-width: 400px;
+    margin: 0 auto 32px;
+    padding: 12px 16px;
+    border: 1px dashed var(--divider-color);
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--secondary-text-color);
+  }
+  .mockup-bar .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .mockup-bar .row + .row { margin-top: 8px; }
+  .mockup-bar select, .mockup-bar button { font: inherit; }
+  body.embed .mockup-bar { display: none; }
+</style>
+</head>
+<body>
+<div class="oidc-page">
+  <div class="oidc-content">
+    <div class="oidc-header">
+      <img src="data:image/png;base64,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" alt="Home Assistant">
+    </div>
+    <div class="card-content" id="card"></div>
+  </div>
+</div>
+
+<aside class="mockup-bar" aria-label="Mockup controls">
+  <div class="row"><strong>Mockup, not part of the design</strong></div>
+  <div class="row">
+    <label>Theme
+      <select id="mock-theme">
+        <option value="">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+    <button type="button" id="mock-reset">Bring back signed-out apps</button>
+  </div>
+</aside>
+
+<script>
+(() => {
+  'use strict';
+
+  const ICONS = {
+    clock: 'M12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22C6.47,22 2,17.5 2,12A10,10 0 0,1 12,2M12.5,7V12.25L17,14.92L16.25,16.15L11,13V7H12.5Z',
+    chevronDown: 'M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z',
+  };
+  const icon = (name, cls = '') =>
+    `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="${ICONS[name]}"/></svg>`;
+  const esc = (value) =>
+    String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+  // The same areas, groups and levels as the consent screen
+  const LABEL = { none: 'None', read: 'Read', full: 'Full' };
+  const GROUPS = [
+    { id: 'devices', name: 'Devices' },
+    { id: 'setup', name: 'Setup' },
+    { id: 'system', name: 'System' },
+  ];
+  const AREAS = [
+    { id: 'entities', group: 'devices', name: 'Entities and their states', max: 'full' },
+    { id: 'calendars', group: 'devices', name: 'Calendars', max: 'full' },
+    { id: 'cameras', group: 'devices', name: 'Cameras and images', max: 'read' },
+    { id: 'automations', group: 'setup', name: 'Automations, scripts and scenes', max: 'full' },
+    { id: 'dashboards', group: 'setup', name: 'Dashboards', max: 'full' },
+    { id: 'helpers', group: 'setup', name: 'Helpers', max: 'full' },
+    { id: 'registries', group: 'setup', name: 'Areas, floors, devices and labels', max: 'full' },
+    { id: 'templates', group: 'setup', name: 'Templates', max: 'read' },
+    { id: 'knx', group: 'setup', name: 'KNX', max: 'full' },
+    { id: 'diagnostics', group: 'system', name: 'Diagnostics', max: 'full' },
+    { id: 'integrations', group: 'system', name: 'Integrations', max: 'full' },
+    { id: 'files', group: 'system', name: 'Config files', max: 'full' },
+    { id: 'appdaemon', group: 'system', name: 'AppDaemon apps', max: 'full' },
+  ];
+  const LEVELS = [
+    { id: 'read', name: 'Look only', fullGroups: [] },
+    { id: 'control', name: 'Control devices', fullGroups: ['devices'] },
+    { id: 'configure', name: 'Edit the setup', fullGroups: ['devices', 'setup'] },
+    { id: 'admin', name: 'Administer', fullGroups: ['devices', 'setup', 'system'] },
+  ];
+  const presetRows = (level) =>
+    Object.fromEntries(AREAS.map((a) => [a.id, level.fullGroups.includes(a.group) ? a.max : 'read']));
+
+  function closest(rows) {
+    let best = null;
+    for (const level of LEVELS) {
+      const preset = presetRows(level);
+      const diffs = AREAS.filter((a) => preset[a.id] !== rows[a.id]);
+      if (!best || diffs.length < best.diffs.length) best = { level, diffs };
+    }
+    return best;
+  }
+
+  const OWNER_EXAMPLE = { ...presetRows(LEVELS[3]), cameras: 'none', dashboards: 'read' };
+
+  // Times are relative to now so the page always reads as current
+  const now = Date.now();
+  const MIN = 60e3;
+  const HOUR = 60 * MIN;
+  const DAY = 24 * HOUR;
+  const SESSIONS = [
+    {
+      id: 'a', name: 'Claude', host: 'claude.ai', level: 'control',
+      signedIn: now - 7 * DAY - 3 * HOUR, lastUsed: now - 2 * MIN, limit: null,
+    },
+    {
+      id: 'b', name: 'Visual Studio Code', host: null, level: 'read',
+      signedIn: now - 5 * HOUR, lastUsed: now - 25 * MIN, limit: { label: '1 day', ms: DAY },
+    },
+    {
+      id: 'c', name: 'Claude Code', host: 'claude.ai', custom: OWNER_EXAMPLE,
+      signedIn: now - 1 * DAY - 6 * HOUR, lastUsed: now - 3 * HOUR, limit: null,
+    },
+    {
+      id: 'd', name: 'Grafana', host: null, signInOnly: 'your name and email address',
+      signedIn: now - 12 * DAY, lastUsed: now - 1 * DAY - 2 * HOUR, limit: null,
+    },
+  ];
+  let signedOut = new Set();
+
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+  function ago(time) {
+    const diff = time - now;
+    const abs = Math.abs(diff);
+    if (abs < HOUR) return rtf.format(Math.round(diff / MIN), 'minute');
+    if (abs < DAY) return rtf.format(Math.round(diff / HOUR), 'hour');
+    return rtf.format(Math.round(diff / DAY), 'day');
+  }
+  function when(time) {
+    const date = new Date(time);
+    const today = new Date(now);
+    const clock = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const dayDiff = Math.round((new Date(date.toDateString()) - new Date(today.toDateString())) / DAY);
+    if (dayDiff === 0) return `today at ${clock}`;
+    if (dayDiff === 1) return `tomorrow at ${clock}`;
+    if (dayDiff === -1) return `yesterday at ${clock}`;
+    return date.toLocaleDateString([], { month: 'long', day: 'numeric' });
+  }
+
+  function rowsOf(session) {
+    if (session.custom) return session.custom;
+    return presetRows(LEVELS.find((l) => l.id === session.level));
+  }
+
+  function accessHtml(session) {
+    if (session.signInOnly) {
+      return `<div class="access"><span class="access-label">Access:</span> <span class="access-level">Sign-in only.</span> It sees ${esc(session.signInOnly)}.</div>`;
+    }
+    if (session.custom) {
+      const { level, diffs } = closest(session.custom);
+      const detail = diffs.length > 3
+        ? `Your own choice for each area, closest to ${esc(level.name)}.`
+        : `Like ${esc(level.name)}, except:<ul>${diffs.map((a) => `<li>${esc(a.name)}: ${LABEL[session.custom[a.id]]}</li>`).join('')}</ul>`;
+      return `<div class="access"><span class="access-label">Access:</span> <span class="access-level">Custom</span><div class="access-detail">${detail}</div></div>`;
+    }
+    const level = LEVELS.find((l) => l.id === session.level);
+    return `<div class="access"><span class="access-label">Access:</span> <span class="access-level">${esc(level.name)}</span></div>`;
+  }
+
+  function endsHtml(session) {
+    if (session.limit) {
+      return `<div class="ends limited">${icon('clock')}<span>Allowed for ${esc(session.limit.label)}: access ends ${esc(when(session.signedIn + session.limit.ms))}.</span></div>`;
+    }
+    return `<div class="ends open">${icon('clock')}<span>Access lasts until you sign it out, ${esc(when(session.signedIn + 30 * DAY))} at the latest.</span></div>`;
+  }
+
+  function grantHtml(session) {
+    if (session.signInOnly) return '';
+    const rows = rowsOf(session);
+    const items = GROUPS.map((g) => `
+      <div class="group-name">${esc(g.name)}</div>
+      ${AREAS.filter((a) => a.group === g.id).map((a) => `
+        <dt>${esc(a.name)}</dt><dd class="${rows[a.id]}">${LABEL[rows[a.id]]}</dd>`).join('')}`).join('');
+    return `
+      <details>
+        <summary>What it can do ${icon('chevronDown')}</summary>
+        <dl class="grant">${items}</dl>
+      </details>`;
+  }
+
+  function render() {
+    const card = document.getElementById('card');
+    const sessions = SESSIONS.filter((s) => !signedOut.has(s.id));
+    const items = sessions.map((s) => `
+      <div class="oidc-session">
+        <div class="session-name"><b><bdi>${esc(s.name)}</bdi></b>${s.host ? ` from <bdi>${esc(s.host)}</bdi>` : ''}</div>
+        ${accessHtml(s)}
+        ${endsHtml(s)}
+        <div class="oidc-session-meta">Signed in ${esc(when(s.signedIn))}, last used ${esc(ago(s.lastUsed))}</div>
+        ${grantHtml(s)}
+        <div class="action">
+          <button type="button" class="ha-button danger" data-session="${s.id}" aria-label="Sign out ${esc(s.name)}">Sign out</button>
+        </div>
+      </div>`).join('');
+    card.innerHTML = `
+      <h1>Connected applications</h1>
+      ${sessions.length
+        ? `<p>These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.</p>${items}`
+        : '<p>No applications are signed in with your Home Assistant account.</p>'}`;
+    for (const button of card.querySelectorAll('button[data-session]')) {
+      button.addEventListener('click', () => {
+        signedOut.add(button.dataset.session);
+        render();
+      });
+    }
+  }
+
+  // ---- Mockup plumbing ---------------------------------------------------
+  const params = new URLSearchParams(location.search);
+  function applyTheme(theme) {
+    if (theme) document.documentElement.dataset.theme = theme;
+    else delete document.documentElement.dataset.theme;
+    document.getElementById('mock-theme').value = theme || '';
+  }
+  if (params.has('embed')) document.body.classList.add('embed');
+  applyTheme(params.get('theme') || '');
+  document.getElementById('mock-theme').addEventListener('change', (e) => applyTheme(e.target.value));
+  document.getElementById('mock-reset').addEventListener('click', () => { signedOut = new Set(); render(); });
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'mockup') return;
+    if ('theme' in data) applyTheme(data.theme);
+  });
+  if (params.has('embed') && window.parent !== window) {
+    window.parent.postMessage({ type: 'mockup-state', scope: '', ends: '' }, '*');
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>
