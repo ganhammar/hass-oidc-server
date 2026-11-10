@@ -17,6 +17,19 @@ DOMAIN = "oidc_provider"
 MAX_CLIENT_NAME_LENGTH = 100
 
 
+# Joins emoji such as 👨‍💻 into one character. It is a formatting character but
+# can neither reorder text nor break a line.
+_ZERO_WIDTH_JOINER = "\u200d"
+
+
+def _is_disallowed_name_character(char: str) -> bool:
+    """Return whether a character may not appear in a client name."""
+    if char == _ZERO_WIDTH_JOINER:
+        return False
+    category = unicodedata.category(char)
+    return category[0] == "C" or category in ("Zl", "Zp")
+
+
 def validate_client_name(client_name: Any) -> str:
     """Return the client name if it is a usable display string.
 
@@ -30,14 +43,11 @@ def validate_client_name(client_name: Any) -> str:
         ValueError: If the name is not a string, is blank, too long, or holds
             control, formatting or line separator characters
     """
-    if not isinstance(client_name, str) or not client_name.strip():
+    if not isinstance(client_name, str) or not client_name.replace(_ZERO_WIDTH_JOINER, "").strip():
         raise ValueError("client_name must be a non-empty string")
     if len(client_name) > MAX_CLIENT_NAME_LENGTH:
         raise ValueError(f"client_name must be at most {MAX_CLIENT_NAME_LENGTH} characters")
-    if any(
-        unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp")
-        for c in client_name
-    ):
+    if any(_is_disallowed_name_character(c) for c in client_name):
         raise ValueError("client_name must not contain control or formatting characters")
     return client_name.strip()
 

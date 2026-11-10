@@ -411,3 +411,9 @@ def test_client_name_allows_ordinary_unicode():
     from custom_components.oidc_provider.client_manager import validate_client_name
 
     assert validate_client_name("Café Assistant 日本") == "Café Assistant 日本"
+    # Emoji joined with a zero-width joiner stay usable, but a joiner alone is no name
+    with pytest.raises(ValueError):
+        validate_client_name("\u200d\u200d")
+    assert (
+        validate_client_name("\U0001f468\u200d\U0001f4bb Dev") == "\U0001f468\u200d\U0001f4bb Dev"
+    )
