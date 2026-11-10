@@ -890,6 +890,19 @@ class TestMigrateEntry:
             is True
         )
 
+    async def test_minor_version_2_without_a_saved_choice_migrates(self, mock_hass):
+        """An entry saved by a release before 1.7.0 after a downgrade lacks the choice."""
+        mock_hass.config_entries = Mock()
+        entry = self._entry(1, 2, {CONF_REQUIRE_PKCE: True})
+
+        assert await async_migrate_entry(mock_hass, entry) is True
+
+        mock_hass.config_entries.async_update_entry.assert_called_once_with(
+            entry,
+            options={CONF_REQUIRE_PKCE: True, CONF_ALLOW_CLIENT_METADATA_DOCUMENTS: False},
+            minor_version=3,
+        )
+
     async def test_current_entry_is_left_alone(self, mock_hass):
         """An entry already at minor version 3 keeps its recorded choices."""
         mock_hass.config_entries = Mock()

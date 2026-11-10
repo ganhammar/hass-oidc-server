@@ -2098,7 +2098,7 @@ async def test_oidc_token_view_refresh_token():
     refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
     assert data["refresh_token"] != "valid_refresh_token"
     assert list(refresh_tokens) == [data["refresh_token"]]
-    assert refresh_tokens[data["refresh_token"]]["previous"] == "valid_refresh_token"
+    assert list(refresh_tokens[data["refresh_token"]]["retired"]) == ["valid_refresh_token"]
     mock_token_store.async_save.assert_called_once()
 
 
@@ -2207,11 +2207,51 @@ async def test_replaced_refresh_token_within_grace_gets_the_current_token():
 
 
 @pytest.mark.asyncio
+async def test_late_duplicate_of_an_older_token_gets_the_current_one():
+    """A is replaced by B and B by C; a delayed request with A within the minute gets C."""
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    _, first = await _post_refresh_grant(hass, "fam1.a")
+    _, second = await _post_refresh_grant(hass, first["refresh_token"])
+
+    status, late = await _post_refresh_grant(hass, "fam1.a")
+
+    assert status == 200
+    assert late["refresh_token"] == second["refresh_token"]
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == [second["refresh_token"]]
+
+
+@pytest.mark.asyncio
+async def test_token_responses_are_not_cached():
+    """Token responses carry Cache-Control: no-store, errors included (RFC 6749 §5.1)."""
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+    for token in ("fam1.a", "unknown"):
+        request = MagicMock()
+        request.app = {"hass": hass}
+        request.remote = "127.0.0.1"
+        request.headers = {}
+        request.url = Mock()
+        request.url.origin.return_value = "http://localhost"
+        request.post = AsyncMock(
+            return_value={
+                "grant_type": "refresh_token",
+                "client_id": "test_client",
+                "client_secret": "test_secret",
+                "refresh_token": token,
+            }
+        )
+        response = await OIDCTokenView().post(request)
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Pragma"] == "no-cache"
+
+
+@pytest.mark.asyncio
 async def test_replaced_refresh_token_after_grace_revokes_the_family():
     """A replaced token presented after the grace period revokes the whole session."""
     hass, token_store = _rotation_hass(
         {
-            "fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time() - 61),
+            "fam1.b": _stored_token(retired={"fam1.a": time.time() - 61}),
             "fam2.x": _stored_token(family="fam2"),
         }
     )
@@ -2224,9 +2264,9 @@ async def test_replaced_refresh_token_after_grace_revokes_the_family():
 
 
 @pytest.mark.asyncio
-async def test_older_token_of_a_family_revokes_it():
-    """A token two rotations old is not remembered, so its family prefix revokes the session."""
-    hass, _ = _rotation_hass({"fam1.c": _stored_token(previous="fam1.b", rotated_at=time.time())})
+async def test_token_retired_before_the_grace_period_revokes_the_family():
+    """A token retired too long ago is not remembered, so its family prefix revokes the session."""
+    hass, _ = _rotation_hass({"fam1.c": _stored_token(retired={"fam1.b": time.time()})})
 
     status, _ = await _post_refresh_grant(hass, "fam1.a")
 
@@ -2237,7 +2277,7 @@ async def test_older_token_of_a_family_revokes_it():
 @pytest.mark.asyncio
 async def test_replaced_refresh_token_from_another_client_revokes_the_family():
     """Another client presenting a replaced token, even within the grace period, revokes it."""
-    hass, _ = _rotation_hass({"fam1.b": _stored_token(previous="fam1.a", rotated_at=time.time())})
+    hass, _ = _rotation_hass({"fam1.b": _stored_token(retired={"fam1.a": time.time()})})
 
     status, _ = await _post_refresh_grant(hass, "fam1.a", "other_client", "other_secret")
 

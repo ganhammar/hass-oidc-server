@@ -393,3 +393,21 @@ def test_redirect_uris_must_be_ascii_without_fragment(uri):
 
     with pytest.raises(ValueError):
         validate_redirect_uris([uri])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Claude\nInjected", "Evil\u202eedoc", "Zero\u200bWidth", "Tab\there", "Line\u2028sep"],
+)
+def test_client_name_rejects_control_and_formatting_characters(name):
+    """Names anyone can choose must not reorder or break the text around them."""
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    with pytest.raises(ValueError):
+        validate_client_name(name)
+
+
+def test_client_name_allows_ordinary_unicode():
+    from custom_components.oidc_provider.client_manager import validate_client_name
+
+    assert validate_client_name("Café Assistant 日本") == "Café Assistant 日本"
