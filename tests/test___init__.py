@@ -91,14 +91,14 @@ class TestAsyncSetupEntry:
         mock_store,
         mock_token_store,
     ):
-        """Stale dynamic clients are pruned once refresh tokens are loaded."""
+        """Dynamic clients that never got a token are pruned at setup."""
         now = time.time()
         old = now - 8 * 86400
         mock_store.async_load = AsyncMock(
             return_value={
                 "clients": {
                     "stale": {"registration": "dynamic", "created_at": old},
-                    "in_use": {"registration": "dynamic", "created_at": old},
+                    "in_use": {"registration": "dynamic", "created_at": old, "used_at": old},
                     "manual": {"created_at": old},
                 }
             }

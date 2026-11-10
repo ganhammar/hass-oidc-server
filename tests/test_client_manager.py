@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from custom_components.oidc_provider.client_manager import (
-    count_dynamic_clients,
+    count_unused_dynamic_clients,
     create_client,
     prune_dynamic_clients,
 )
@@ -422,37 +422,35 @@ NOW = 10_000_000.0
 OLD = NOW - DYNAMIC_CLIENT_RETENTION - 1
 
 
-def _client(created_at=None, dynamic=True):
+def _client(created_at=None, dynamic=True, used=False):
     client = {"client_name": "c"}
     if created_at is not None:
         client["created_at"] = created_at
     if dynamic:
         client["registration"] = "dynamic"
+    if used:
+        client["used_at"] = created_at
     return client
 
 
-async def test_prune_removes_old_dynamic_clients_without_live_tokens(mock_hass):
-    """Old dynamic clients with no live refresh token are removed and persisted."""
+async def test_prune_removes_old_dynamic_clients_that_never_got_a_token(mock_hass):
+    """Only old self-registered clients that never had a token issued are removed."""
     mock_hass.data[DOMAIN]["clients"] = {
-        "stale": _client(OLD),
-        "expired_token": _client(OLD),
-        "live_token": _client(OLD),
+        "abandoned": _client(OLD),
+        # Its sessions ended, but a user approved it and it may come back
+        "used_without_live_token": _client(OLD, used=True),
         "recent": _client(NOW - 10),
         "manual_old": _client(OLD, dynamic=False),
         "legacy": {"client_name": "legacy"},
         "dynamic_no_timestamp": _client(),
     }
-    mock_hass.data[DOMAIN]["refresh_tokens"] = {
-        "a": {"client_id": "expired_token", "expires_at": NOW - 1},
-        "b": {"client_id": "live_token", "expires_at": NOW + 100},
-    }
 
     with patch("custom_components.oidc_provider.client_manager.time.time", return_value=NOW):
         removed = await prune_dynamic_clients(mock_hass)
 
-    assert removed == 2
+    assert removed == 1
     assert set(mock_hass.data[DOMAIN]["clients"]) == {
-        "live_token",
+        "used_without_live_token",
         "recent",
         "manual_old",
         "legacy",
@@ -481,14 +479,15 @@ async def test_prune_without_refresh_tokens_key(mock_hass):
         assert await prune_dynamic_clients(mock_hass) == 1
 
 
-def test_count_dynamic_clients(mock_hass):
-    """Only clients with the dynamic marker are counted."""
+def test_count_unused_dynamic_clients(mock_hass):
+    """Only self-registered clients that never had a token issued are counted."""
     mock_hass.data[DOMAIN]["clients"] = {
         "a": _client(1),
         "b": _client(1, dynamic=False),
         "c": {},
+        "d": _client(1, used=True),
     }
-    assert count_dynamic_clients(mock_hass) == 1
+    assert count_unused_dynamic_clients(mock_hass) == 1
 
 
 @pytest.mark.parametrize(

@@ -21,10 +21,11 @@ from homeassistant.helpers.storage import Store
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import (
-    count_dynamic_clients,
+    count_unused_dynamic_clients,
     create_client,
     prune_dynamic_clients,
     validate_client_name,
+    validate_redirect_uris,
 )
 from .const import (
     ACCESS_TOKEN_EXPIRY,
@@ -42,16 +43,18 @@ from .const import (
     GROUP_OWNER,
     HA_GROUP_TO_OIDC_GROUP,
     ID_TOKEN_EXPIRY,
-    MAX_DYNAMIC_CLIENTS,
     MAX_PENDING_AUTH_REQUESTS,
     MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS,
     MAX_TOKEN_ATTEMPTS,
+    MAX_UNUSED_DYNAMIC_CLIENTS,
     PANEL_URL_PATH,
     RATE_LIMIT_PENALTY,
     RATE_LIMIT_WINDOW,
     REFRESH_TOKEN_EXPIRY,
     REFRESH_TOKEN_REUSE_GRACE,
+    REGISTRATION_DYNAMIC,
     REGISTRATION_RATE_LIMIT_MAX,
+    REGISTRATION_RATE_LIMIT_PER_ADDRESS,
     REGISTRATION_RATE_LIMIT_WINDOW,
     RESPONSE_TYPE_CODE,
     SCOPE_EMAIL,
@@ -1270,6 +1273,17 @@ class OIDCTokenView(HomeAssistantView):
         # Persist refresh tokens to storage
         await _save_refresh_tokens(hass)
 
+        # A dynamically registered client that has had a token issued was
+        # approved by a user and is never pruned, even after its sessions end.
+        stored_client = hass.data[DOMAIN].get("clients", {}).get(client_id)
+        if (
+            stored_client is not None
+            and stored_client.get("registration") == REGISTRATION_DYNAMIC
+            and "used_at" not in stored_client
+        ):
+            stored_client["used_at"] = time.time()
+            await hass.data[DOMAIN]["store"].async_save({"clients": hass.data[DOMAIN]["clients"]})
+
         response_body: dict[str, Any] = {
             "access_token": access_token,
             "token_type": "Bearer",
@@ -1720,6 +1734,57 @@ class OIDCJWKSView(HomeAssistantView):
         return web.json_response(jwks)
 
 
+def _registration_refusal(hass: HomeAssistant, remote: str | None) -> web.Response | None:
+    """Count a registration against the limits, or return the refusal to send.
+
+    Registrations are limited per hour overall and per remote address, so one
+    caller cannot use up the hourly allowance. Dynamically registered clients
+    that have not had a token yet are capped as well. Clients that have had one
+    were approved by a user and do not count.
+    """
+    now = time.time()
+    window_start = now - REGISTRATION_RATE_LIMIT_WINDOW
+    recent = hass.data[DOMAIN].setdefault("registration_times", [])
+    recent[:] = [t for t in recent if t > window_start]
+    by_address = hass.data[DOMAIN].setdefault("registration_times_by_address", {})
+    for address in list(by_address):
+        by_address[address] = [t for t in by_address[address] if t > window_start]
+        if not by_address[address]:
+            del by_address[address]
+    address_recent = by_address.setdefault(remote or "", [])
+
+    limited = None
+    if len(address_recent) >= REGISTRATION_RATE_LIMIT_PER_ADDRESS:
+        limited = address_recent
+    elif len(recent) >= REGISTRATION_RATE_LIMIT_MAX:
+        limited = recent
+    if limited is not None:
+        retry_after = max(1, int(limited[0] + REGISTRATION_RATE_LIMIT_WINDOW - now) + 1)
+        _LOGGER.debug("Refused dynamic client registration from %s: rate limited", remote)
+        return web.json_response(
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "Too many client registrations, try again later",
+            },
+            status=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if count_unused_dynamic_clients(hass) >= MAX_UNUSED_DYNAMIC_CLIENTS:
+        _LOGGER.debug("Refused dynamic client registration from %s: client limit reached", remote)
+        return web.json_response(
+            {
+                "error": "temporarily_unavailable",
+                "error_description": "Too many registered clients, try again later",
+            },
+            status=429,
+        )
+
+    recent.append(now)
+    address_recent.append(now)
+    return None
+
+
 class OIDCRegisterView(HomeAssistantView):
     """OAuth 2.0 Dynamic Client Registration endpoint (RFC 7591)."""
 
@@ -1745,56 +1810,6 @@ class OIDCRegisterView(HomeAssistantView):
                 status=403,
             )
 
-        # Sliding window over successful registrations, shared by all callers.
-        # A slot is taken before anything awaits, so concurrent requests cannot
-        # all pass the check, and it is given back when the registration fails.
-        now = time.time()
-        recent = hass.data[DOMAIN].setdefault("registration_times", [])
-        recent[:] = [t for t in recent if t > now - REGISTRATION_RATE_LIMIT_WINDOW]
-        if len(recent) >= REGISTRATION_RATE_LIMIT_MAX:
-            retry_after = max(1, int(recent[0] + REGISTRATION_RATE_LIMIT_WINDOW - now) + 1)
-            _LOGGER.debug(
-                "Refused dynamic client registration from %s: rate limited", request.remote
-            )
-            return web.json_response(
-                {
-                    "error": "temporarily_unavailable",
-                    "error_description": "Too many client registrations, try again later",
-                },
-                status=429,
-                headers={"Retry-After": str(retry_after)},
-            )
-        recent.append(now)
-
-        await prune_dynamic_clients(hass)
-        # Registrations still being processed count toward the client limit,
-        # so concurrent requests cannot together go past it.
-        in_progress = hass.data[DOMAIN].get("registrations_in_progress", 0)
-        if count_dynamic_clients(hass) + in_progress >= MAX_DYNAMIC_CLIENTS:
-            recent.remove(now)
-            _LOGGER.debug(
-                "Refused dynamic client registration from %s: client limit reached",
-                request.remote,
-            )
-            return web.json_response(
-                {
-                    "error": "temporarily_unavailable",
-                    "error_description": "Too many registered clients, try again later",
-                },
-                status=429,
-            )
-
-        hass.data[DOMAIN]["registrations_in_progress"] = in_progress + 1
-        try:
-            response = await self._register(request, hass)
-        finally:
-            hass.data[DOMAIN]["registrations_in_progress"] -= 1
-        if response.status != 201 and now in recent:
-            recent.remove(now)
-        return response
-
-    async def _register(self, request: web.Request, hass: HomeAssistant) -> web.Response:
-        """Validate the registration request and create the client."""
         try:
             data = await request.json()
         except Exception:
@@ -1855,29 +1870,35 @@ class OIDCRegisterView(HomeAssistantView):
                 status=400,
             )
 
-        # Create client using shared client_manager
         try:
-            client_info = await create_client(
-                hass,
-                client_name=client_name,
-                redirect_uris=redirect_uris,
-                grant_types=grant_types,
-                response_types=response_types,
-                token_endpoint_auth_method=token_endpoint_auth_method,
-                # Anyone can reach this endpoint, so the registrant is not
-                # vouched for by the operator and the user decides per login.
-                consent_required=True,
-                dynamic=True,
-            )
+            validate_redirect_uris(redirect_uris)
         except ValueError as e:
             return web.json_response(
-                {
-                    "error": "invalid_redirect_uri",
-                    "error_description": str(e),
-                },
+                {"error": "invalid_redirect_uri", "error_description": str(e)},
                 status=400,
             )
 
+        # The limits are checked only now, once the request is known to be
+        # valid, so a caller sending its body slowly holds no slot. From the
+        # checks to create_client storing the client nothing awaits, so
+        # concurrent requests cannot together pass them.
+        await prune_dynamic_clients(hass)
+        refusal = _registration_refusal(hass, request.remote)
+        if refusal is not None:
+            return refusal
+
+        client_info = await create_client(
+            hass,
+            client_name=client_name,
+            redirect_uris=redirect_uris,
+            grant_types=grant_types,
+            response_types=response_types,
+            token_endpoint_auth_method=token_endpoint_auth_method,
+            # Anyone can reach this endpoint, so the registrant is not
+            # vouched for by the operator and the user decides per login.
+            consent_required=True,
+            dynamic=True,
+        )
         return web.json_response(client_info, status=201)
 
 

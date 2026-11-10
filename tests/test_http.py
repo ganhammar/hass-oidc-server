@@ -3638,14 +3638,6 @@ async def test_client_with_a_secret_stays_confidential_whatever_its_method():
     assert status == 200
 
 
-def _register_hass():
-    store = Mock()
-    store.async_save = AsyncMock()
-    hass = Mock()
-    hass.data = {DOMAIN: {"clients": {}, "store": store, CONF_ALLOW_DYNAMIC_REGISTRATION: True}}
-    return hass
-
-
 async def _register(hass, body):
     request = Mock()
     request.app = {"hass": hass}
@@ -3935,7 +3927,25 @@ async def test_oidc_register_view_rate_limited():
     assert json.loads(response.body)["error"] == "temporarily_unavailable"
     assert 2900 <= int(response.headers["Retry-After"]) <= 3001
     assert hass.data[DOMAIN]["clients"] == {}
-    request.json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oidc_register_view_rate_limited_per_address():
+    """One address may register 5 clients an hour, leaving the rest for everyone else."""
+    from custom_components.oidc_provider.const import REGISTRATION_RATE_LIMIT_PER_ADDRESS
+
+    hass = _register_hass()
+    for _ in range(REGISTRATION_RATE_LIMIT_PER_ADDRESS):
+        assert (await OIDCRegisterView().post(_register_request(hass))).status == 201
+
+    refused = await OIDCRegisterView().post(_register_request(hass))
+    other = _register_request(hass)
+    other.remote = "198.51.100.20"
+    allowed = await OIDCRegisterView().post(other)
+
+    assert refused.status == 429
+    assert "Retry-After" in refused.headers
+    assert allowed.status == 201
 
 
 @pytest.mark.asyncio
@@ -3953,9 +3963,11 @@ async def test_oidc_register_view_rate_limit_window_slides():
 
 @pytest.mark.asyncio
 async def test_oidc_register_view_client_cap():
-    """Registration is refused once 200 dynamic clients exist, without Retry-After."""
+    """Registration is refused once 200 unused dynamic clients exist, without Retry-After."""
     now = time.time()
     clients = {f"c{i}": {"registration": "dynamic", "created_at": now} for i in range(200)}
+    # Clients a user has approved do not count toward the cap
+    clients["approved"] = {"registration": "dynamic", "created_at": now, "used_at": now}
     hass = _register_hass(clients=clients)
     request = _register_request(hass)
 
@@ -3964,7 +3976,7 @@ async def test_oidc_register_view_client_cap():
     assert response.status == 429
     assert json.loads(response.body)["error"] == "temporarily_unavailable"
     assert "Retry-After" not in response.headers
-    assert len(hass.data[DOMAIN]["clients"]) == 200
+    assert len(hass.data[DOMAIN]["clients"]) == 201
 
 
 @pytest.mark.asyncio
@@ -3999,7 +4011,7 @@ async def test_oidc_register_view_refusals_log_at_debug(caplog):
 
 
 async def _concurrent_registrations(hass, count):
-    """Send registrations whose bodies arrive only once all have passed the checks."""
+    """Send registrations, from distinct addresses, whose bodies all arrive at once."""
     import asyncio
 
     release = asyncio.Event()
@@ -4009,10 +4021,10 @@ async def _concurrent_registrations(hass, count):
         return {"client_name": "Flood", "redirect_uris": ["https://app.example.com/cb"]}
 
     tasks = []
-    for _ in range(count):
+    for i in range(count):
         request = Mock()
         request.app = {"hass": hass}
-        request.remote = "198.51.100.1"
+        request.remote = f"198.51.100.{i}"
         request.json = slow_json
         tasks.append(asyncio.create_task(OIDCRegisterView().post(request)))
     for _ in range(5):
@@ -4023,7 +4035,7 @@ async def _concurrent_registrations(hass, count):
 
 @pytest.mark.asyncio
 async def test_concurrent_registrations_cannot_pass_the_rate_limit():
-    """Slots are taken before the body is read, so a burst cannot all get through."""
+    """Checks and the stored client come with no await between, so a burst cannot pass."""
     from custom_components.oidc_provider.const import REGISTRATION_RATE_LIMIT_MAX
 
     hass = _register_hass()
@@ -4038,13 +4050,35 @@ async def test_concurrent_registrations_cannot_pass_the_rate_limit():
 @pytest.mark.asyncio
 async def test_concurrent_registrations_cannot_pass_the_client_limit(monkeypatch):
     """Registrations in progress count toward the client limit."""
-    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_DYNAMIC_CLIENTS", 3)
+    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_UNUSED_DYNAMIC_CLIENTS", 3)
     hass = _register_hass()
 
     statuses = await _concurrent_registrations(hass, 8)
 
     assert statuses.count(201) == 3
     assert len(hass.data[DOMAIN]["clients"]) == 3
-    # Refused registrations give their rate limit slot back
+    # Refused registrations take no rate limit slot
     assert len(hass.data[DOMAIN]["registration_times"]) == 3
-    assert hass.data[DOMAIN]["registrations_in_progress"] == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_registration_body_holds_no_slot():
+    """A request still sending its body has not taken a slot from anyone."""
+    import asyncio
+
+    hass = _register_hass()
+    never = asyncio.Event()
+
+    async def stalled_json():
+        await never.wait()
+
+    stalled = _register_request(hass)
+    stalled.json = stalled_json
+    task = asyncio.create_task(OIDCRegisterView().post(stalled))
+    await asyncio.sleep(0)
+
+    response = await OIDCRegisterView().post(_register_request(hass))
+
+    assert response.status == 201
+    assert len(hass.data[DOMAIN]["registration_times"]) == 1
+    task.cancel()

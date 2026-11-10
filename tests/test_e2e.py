@@ -208,31 +208,30 @@ async def test_dcr_rejects_missing_redirect_uris(
 async def test_dcr_prunes_stale_clients_and_limits_registrations(
     setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
 ) -> None:
-    """Stale dynamic clients are pruned on registration and the hourly limit applies."""
+    """Abandoned dynamic clients are pruned, used ones kept, and the hourly limit applies."""
     client = await hass_client()
     clients = hass.data[DOMAIN]["clients"]
 
-    stale = await _register_client(client)
-    kept = await _register_client(client)
-    old = time.time() - 8 * 86400
-    clients[stale["client_id"]]["created_at"] = old
-    clients[kept["client_id"]]["created_at"] = old
+    abandoned = await _register_client(client)
+    used, _ = await _signed_in(client)
+    old = time.time() - 2 * 86400
+    clients[abandoned["client_id"]]["created_at"] = old
+    clients[used["client_id"]]["created_at"] = old
     clients["operator"] = {"client_name": "Operator", "created_at": old}
-    hass.data[DOMAIN]["refresh_tokens"]["live"] = {
-        "client_id": kept["client_id"],
-        "expires_at": time.time() + 1000,
-    }
+    # Its session ended, but a user approved it, so it stays for its next sign-in
+    hass.data[DOMAIN]["refresh_tokens"].clear()
+    assert "used_at" in clients[used["client_id"]]
 
     fresh = await _register_client(client)
 
-    assert stale["client_id"] not in clients
-    assert kept["client_id"] in clients
+    assert abandoned["client_id"] not in clients
+    assert used["client_id"] in clients
     assert fresh["client_id"] in clients
     assert "operator" in clients
     assert clients[fresh["client_id"]]["registration"] == "dynamic"
 
-    # 3 registrations so far; 17 more fill the hourly window.
-    for _ in range(17):
+    # 3 registrations so far from this address; 2 more reach its hourly limit
+    for _ in range(2):
         await _register_client(client)
     count = len(clients)
     resp = await client.post(
