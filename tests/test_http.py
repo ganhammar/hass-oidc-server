@@ -4426,3 +4426,441 @@ async def test_slow_registration_body_holds_no_slot():
     assert response.status == 201
     assert len(hass.data[DOMAIN]["registration_times"]) == 1
     task.cancel()
+
+
+# Paths the main flows do not reach
+
+
+def test_resource_indicator_is_kept_only_when_well_formed():
+    from custom_components.oidc_provider.http import _normalize_resource
+
+    assert _normalize_resource("not a url") is None
+    assert _normalize_resource("https://mcp.example.com/api#frag") is None
+    assert _normalize_resource("https://mcp.example.com/api/mcp") == (
+        "https://mcp.example.com/api/mcp"
+    )
+
+
+def test_consent_screen_host_that_idna_cannot_encode_is_escaped():
+    """A host IDNA refuses, such as one with a label over 63 characters, is escaped."""
+    from custom_components.oidc_provider.http import _ascii_host
+
+    shown = _ascii_host("ä" * 70 + ".example")
+
+    assert shown.isascii()
+    assert "\\xe4" in shown
+
+
+def test_registered_redirect_uri_with_an_invalid_port_never_matches():
+    from custom_components.oidc_provider.http import _redirect_uri_allowed
+
+    assert not _redirect_uri_allowed(
+        "http://localhost:1234/callback", ["http://localhost:99999/callback"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("kid", "status"), [(None, 400), ("unpublished", 200)])
+async def test_revocation_recognizes_access_tokens_by_their_kid(kid, status):
+    """A token without a kid is checked with the current key; an unpublished kid is unknown."""
+    hass, _ = _rotation_hass({})
+    private_key = hass.data[DOMAIN]["jwt_private_key"]
+    hass.data[DOMAIN]["jwt_public_key"] = private_key.public_key()
+    hass.data[DOMAIN]["jwt_verification_keys"] = {"test-kid-1": private_key.public_key()}
+    headers = {"kid": kid} if kid else None
+    token = jwt.encode({"sub": "user123"}, private_key, algorithm="RS256", headers=headers)
+
+    response_status, _ = await _post_revoke(hass, token)
+
+    assert response_status == status
+
+
+@pytest.mark.asyncio
+async def test_client_sessions_and_revoking_them():
+    from custom_components.oidc_provider.http import client_sessions, revoke_client_sessions
+
+    hass, token_store = _rotation_hass(
+        {
+            "fam1.a": _stored_token(),
+            "fam2.b": _stored_token("fam2"),
+            "fam3.c": _stored_token("fam3", client_id="other_client"),
+        }
+    )
+
+    sessions = client_sessions(hass)
+    assert sessions["test_client"]["active_sessions"] == 2
+    assert sessions["other_client"]["active_sessions"] == 1
+
+    assert await revoke_client_sessions(hass, "test_client") == 2
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["fam3.c"]
+    token_store.async_save.assert_awaited_once()
+    assert await revoke_client_sessions(hass, "unknown") == 0
+
+
+def _authorize_request(hass, client_id, **query):
+    request = Mock()
+    request.app = {"hass": hass}
+    request.remote = "198.51.100.7"
+    request.query = {
+        "client_id": client_id,
+        "redirect_uri": "http://localhost:53682/callback",
+        "response_type": "code",
+        "scope": "openid",
+        "code_challenge": "challenge",
+        "code_challenge_method": "S256",
+        **query,
+    }
+    return request
+
+
+@pytest.mark.asyncio
+async def test_authorize_resolves_a_metadata_document_client():
+    """A URL client_id is resolved, and the client is kept with the pending request."""
+    from custom_components.oidc_provider.http import OIDCAuthorizationView
+
+    hass = Mock()
+    hass.data = {DOMAIN: {"clients": {}}}
+    document_client = {
+        "client_name": "Claude Code",
+        "redirect_uris": ["http://localhost/callback"],
+        "token_endpoint_auth_method": "none",
+        "consent_required": True,
+        "metadata_document": True,
+    }
+    with patch(
+        "custom_components.oidc_provider.http.async_resolve_client",
+        AsyncMock(return_value=document_client),
+    ):
+        response = await OIDCAuthorizationView().get(_authorize_request(hass, CIMD_CLIENT_ID))
+
+    assert response.status == 200
+    [pending] = hass.data[DOMAIN]["pending_auth_requests"].values()
+    assert pending["metadata_client"] is document_client
+    assert pending["remote"] == "198.51.100.7"
+
+
+@pytest.mark.asyncio
+async def test_authorize_refuses_a_metadata_document_that_cannot_be_used():
+    from custom_components.oidc_provider.cimd import ClientMetadataError
+    from custom_components.oidc_provider.http import OIDCAuthorizationView
+
+    hass = Mock()
+    hass.data = {DOMAIN: {"clients": {}}}
+    with patch(
+        "custom_components.oidc_provider.http.async_resolve_client",
+        AsyncMock(side_effect=ClientMetadataError("metadata document could not be fetched")),
+    ):
+        response = await OIDCAuthorizationView().get(_authorize_request(hass, CIMD_CLIENT_ID))
+
+    assert response.status == 400
+    assert "could not be fetched" in response.text
+
+
+@pytest.mark.asyncio
+async def test_authorize_requires_pkce_from_a_public_client():
+    from custom_components.oidc_provider.http import OIDCAuthorizationView
+
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "require_pkce": False,
+            "clients": {
+                "public": {
+                    "redirect_uris": ["http://localhost/callback"],
+                    "token_endpoint_auth_method": "none",
+                }
+            },
+        }
+    }
+    request = _authorize_request(hass, "public")
+    del request.query["code_challenge"]
+
+    response = await OIDCAuthorizationView().get(request)
+
+    assert response.status == 400
+    assert "PKCE is required for public clients" in response.text
+
+
+@pytest.mark.asyncio
+async def test_authorize_refuses_past_the_pending_cap():
+    from custom_components.oidc_provider.http import OIDCAuthorizationView
+
+    future = time.time() + 600
+    hass = Mock()
+    hass.data = {
+        DOMAIN: {
+            "clients": {"c": {"redirect_uris": ["http://localhost/callback"]}},
+            "pending_auth_requests": {
+                f"r{i}": {"remote": "198.51.100.7", "expires_at": future} for i in range(20)
+            },
+        }
+    }
+
+    response = await OIDCAuthorizationView().get(_authorize_request(hass, "c"))
+
+    assert response.status == 429
+    assert response.headers["Retry-After"] == "60"
+
+
+def _code_hass(code_data, clients=None):
+    """Return hass state with one authorization code for the token endpoint."""
+    hass, token_store = _rotation_hass({})
+    hass.data[DOMAIN]["authorization_codes"] = {
+        "the_code": {
+            "client_id": "test_client",
+            "redirect_uri": "https://example.com/callback",
+            "user_id": "user123",
+            "scope": "openid",
+            "expires_at": time.time() + 600,
+            **code_data,
+        }
+    }
+    hass.data[DOMAIN]["clients"].update(clients or {})
+    hass.data[DOMAIN]["store"] = Mock(async_save=AsyncMock())
+    return hass, token_store
+
+
+async def _post_code_grant(hass, client_id="test_client", secret="test_secret", **extra):
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {}
+    request.url = Mock()
+    request.url.origin.return_value = "http://localhost"
+    request.post = AsyncMock(
+        return_value={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": secret,
+            "code": "the_code",
+            "redirect_uri": "https://example.com/callback",
+            **extra,
+        }
+    )
+    response = await OIDCTokenView().post(request)
+    return response.status, json.loads(response.body.decode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_drops_expired_rate_limit_records():
+    hass, _ = _code_hass({})
+    hass.data[DOMAIN]["rate_limit_attempts"] = {
+        "old:1.2.3.4": {"attempts": 3, "window_start": time.time() - 3600}
+    }
+
+    await _post_code_grant(hass)
+
+    assert "old:1.2.3.4" not in hass.data[DOMAIN]["rate_limit_attempts"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client", "secret", "status"),
+    [
+        ({"client_secret": "plain"}, "plain", 200),
+        ({"client_secret": "plain"}, "wrong", 401),
+        ({}, "anything", 401),
+    ],
+    ids=["legacy-plain-secret", "legacy-wrong-secret", "no-secret-configured"],
+)
+async def test_token_endpoint_with_legacy_and_secretless_clients(client, secret, status):
+    """Clients stored with a plain secret still work; one with no secret at all fails closed."""
+    hass, _ = _code_hass({"client_id": "legacy"}, clients={"legacy": client})
+
+    response_status, _ = await _post_code_grant(hass, "legacy", secret)
+
+    assert response_status == status
+
+
+@pytest.mark.asyncio
+async def test_public_client_code_without_pkce_is_refused():
+    """A public client's code must carry a PKCE challenge, even if one slipped through."""
+    hass, _ = _code_hass(
+        {"client_id": CIMD_CLIENT_ID, "redirect_uri": "https://example.com/callback"}
+    )
+
+    status, body = await _post_code_grant(hass, CIMD_CLIENT_ID, "")
+
+    assert (status, body["error_description"]) == (400, "code_verifier required")
+
+
+@pytest.mark.asyncio
+async def test_code_verifier_that_cannot_be_hashed_is_refused():
+    hass, _ = _code_hass({"code_challenge": "challenge", "code_challenge_method": "S256"})
+
+    status, body = await _post_code_grant(hass, code_verifier="vérifier")
+
+    assert (status, body["error_description"]) == (400, "PKCE verification error")
+
+
+@pytest.mark.asyncio
+async def test_first_token_marks_a_dynamic_client_as_used():
+    """A self-registered client that gets a token is marked, so it is never pruned."""
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass, _ = _code_hass(
+        {"client_id": "dyn"},
+        clients={"dyn": {"registration": "dynamic", "client_secret_hash": hash_client_secret("s")}},
+    )
+
+    status, _ = await _post_code_grant(hass, "dyn", "s")
+
+    assert status == 200
+    assert "used_at" in hass.data[DOMAIN]["clients"]["dyn"]
+    hass.data[DOMAIN]["store"].async_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_code_presented_again_while_tokens_are_issued_hands_out_nothing():
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    hass, _ = _code_hass({})
+
+    async def replay_meanwhile(*args, **kwargs):
+        # Another request with the same code takes the redemption record
+        hass.data[DOMAIN]["redeemed_codes"].pop("the_code")
+        return "access-token"
+
+    with patch.object(OIDCTokenView, "_generate_access_token", side_effect=replay_meanwhile):
+        status, body = await _post_code_grant(hass)
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_of_a_session_revoked_meanwhile_hands_out_nothing():
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    hass, _ = _rotation_hass({"fam1.a": _stored_token()})
+
+    async def revoke_meanwhile(*args, **kwargs):
+        hass.data[DOMAIN]["refresh_tokens"].clear()
+        return "access-token"
+
+    with patch.object(OIDCTokenView, "_generate_access_token", side_effect=revoke_meanwhile):
+        status, body = await _post_refresh_grant(hass, "fam1.a")
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+
+
+def _userinfo_request(hass, token):
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.headers = {"Authorization": f"Bearer {token}"}
+    request.url = Mock()
+    request.url.scheme = "http"
+    request.url.origin.return_value = "http://localhost"
+    return request
+
+
+def _userinfo_hass(user=None):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    hass = Mock()
+    hass.data = {DOMAIN: {"jwt_public_key": private_key.public_key()}}
+    hass.auth = Mock()
+    hass.auth.async_get_user = AsyncMock(return_value=user)
+    return hass, private_key
+
+
+def _userinfo_token(private_key, **claims):
+    payload = {
+        "iss": "http://localhost/oidc",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "aud": "test_client",
+        "sub": "user123",
+        **claims,
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    return jwt.encode(payload, private_key, algorithm="RS256", headers={"typ": "at+jwt"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claims", "status", "error"),
+    [
+        ({"aud": None}, 401, "invalid_token"),
+        ({"sub": None}, 401, "invalid_token"),
+        ({}, 404, "user_not_found"),
+        ({"exp": int(time.time()) - 10}, 401, "token_expired"),
+        ({"iss": "https://elsewhere/oidc"}, 401, "invalid_token"),
+    ],
+    ids=["no-audience", "no-subject", "unknown-user", "expired", "wrong-issuer"],
+)
+async def test_userinfo_refusals(claims, status, error):
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    hass, private_key = _userinfo_hass(user=None)
+    token = _userinfo_token(private_key, **claims)
+
+    response = await OIDCUserInfoView().get(_userinfo_request(hass, token))
+
+    assert response.status == status
+    assert json.loads(response.body)["error"] == error
+
+
+@pytest.mark.asyncio
+async def test_userinfo_reports_unexpected_errors():
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    hass, private_key = _userinfo_hass()
+    hass.auth.async_get_user = AsyncMock(side_effect=RuntimeError("auth store down"))
+
+    response = await OIDCUserInfoView().get(_userinfo_request(hass, _userinfo_token(private_key)))
+
+    assert response.status == 500
+    assert json.loads(response.body)["error"] == "internal_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (ValueError("not json"), "invalid_request"),
+        ({"client_name": "C"}, "invalid_redirect_uri"),
+        (
+            {"redirect_uris": ["https://example.com/cb"], "grant_types": ["client_credentials"]},
+            "invalid_client_metadata",
+        ),
+        (
+            {"redirect_uris": ["https://example.com/cb"], "response_types": ["token"]},
+            "invalid_client_metadata",
+        ),
+    ],
+    ids=["invalid-json", "no-redirect-uris", "unsupported-grant", "unsupported-response"],
+)
+async def test_register_view_refuses_invalid_requests(body, error):
+    hass = _register_hass()
+    request = _register_request(hass)
+    if isinstance(body, Exception):
+        request.json = AsyncMock(side_effect=body)
+    else:
+        request.json = AsyncMock(return_value=body)
+
+    response = await OIDCRegisterView().post(request)
+
+    assert response.status == 400
+    assert json.loads(response.body)["error"] == error
+    assert hass.data[DOMAIN]["clients"] == {}
+
+
+@pytest.mark.asyncio
+async def test_sessions_view_lists_the_signed_in_users_sessions():
+    from custom_components.oidc_provider.http import OIDCSessionsView
+
+    hass, _ = _rotation_hass(
+        {"fam1.a": _stored_token(), "fam2.b": _stored_token("fam2", user_id="someone_else")}
+    )
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.__getitem__.return_value = Mock(id="user123")
+
+    response = await OIDCSessionsView().get(request)
+
+    [session] = json.loads(response.body)["sessions"]
+    assert session["client_id"] == "test_client"

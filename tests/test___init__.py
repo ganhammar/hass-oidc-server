@@ -1111,3 +1111,144 @@ def test_markdown_text_cannot_add_links_or_formatting():
     )
     # Neither a backtick nor a line break can end the code span
     assert _markdown_text("a`b\n# Heading") == "`a'b # Heading`"
+
+
+@pytest.fixture
+async def service_handlers(mock_hass, mock_config_entry, mock_store, mock_token_store):
+    """Set the entry up on a mock hass and return its service handlers by name."""
+    with (
+        patch("custom_components.oidc_provider.Store", side_effect=[mock_store, mock_token_store]),
+        patch("custom_components.oidc_provider.setup_http_endpoints"),
+        patch("custom_components.oidc_provider.async_register_built_in_panel"),
+    ):
+        await async_setup_entry(mock_hass, mock_config_entry)
+    return {
+        call_args[0][1]: call_args[0][2]
+        for call_args in mock_hass.services.async_register.call_args_list
+    }
+
+
+def _service_call(data, return_response=False):
+    call = Mock()
+    call.data = data
+    call.return_response = return_response
+    call.context.user_id = None
+    return call
+
+
+class TestServiceEdgeCases:
+    """Service paths the main flows do not reach."""
+
+    async def test_admin_check_refuses_unknown_and_non_admin_users(self, mock_hass):
+        from homeassistant.exceptions import Unauthorized, UnknownUser
+
+        from custom_components.oidc_provider import _admin_only
+
+        handler = AsyncMock(return_value=None)
+        checked = _admin_only(mock_hass, handler)
+        call = _service_call({})
+        call.context.user_id = "someone"
+
+        mock_hass.auth.async_get_user = AsyncMock(return_value=None)
+        with pytest.raises(UnknownUser):
+            await checked(call)
+        mock_hass.auth.async_get_user = AsyncMock(return_value=Mock(is_admin=False))
+        with pytest.raises(Unauthorized):
+            await checked(call)
+        handler.assert_not_awaited()
+
+    async def test_register_client_returns_credentials_for_a_response(
+        self, service_handlers, mock_hass
+    ):
+        response = await service_handlers["register_client"](
+            _service_call(
+                {"client_name": "Responder", "redirect_uris": "https://app.example.com/cb"},
+                return_response=True,
+            )
+        )
+
+        assert response["client_secret"]
+        assert response["redirect_uris"] == ["https://app.example.com/cb"]
+        mock_hass.services.async_call.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("data", "message"),
+        [
+            ({"client_name": "Bad", "redirect_uris": "http://app.example.com/cb"}, "HTTPS"),
+            ({"client_name": "Taken", "redirect_uris": "https://app.example.com/cb"}, "exists"),
+        ],
+    )
+    async def test_register_client_failures_raise_for_a_response(
+        self, service_handlers, mock_hass, data, message
+    ):
+        from homeassistant.exceptions import HomeAssistantError
+
+        mock_hass.data[DOMAIN]["clients"]["existing"] = {"client_name": "Taken"}
+
+        with pytest.raises(HomeAssistantError, match=message):
+            await service_handlers["register_client"](_service_call(data, return_response=True))
+
+    async def test_register_client_survives_a_failed_notification(
+        self, service_handlers, mock_hass
+    ):
+        mock_hass.services.async_call = AsyncMock(side_effect=RuntimeError("no notifications"))
+
+        result = await service_handlers["register_client"](
+            _service_call({"client_name": "Quiet", "redirect_uris": "https://app.example.com/cb"})
+        )
+
+        assert result is None
+        assert [c["client_name"] for c in mock_hass.data[DOMAIN]["clients"].values()] == ["Quiet"]
+
+    async def test_register_client_logs_unexpected_errors(self, service_handlers, caplog):
+        with patch(
+            "custom_components.oidc_provider.create_client", side_effect=RuntimeError("boom")
+        ):
+            result = await service_handlers["register_client"](
+                _service_call({"client_name": "X", "redirect_uris": "https://app.example.com/cb"})
+            )
+
+        assert result is None
+        assert "boom" in caplog.text
+
+    async def test_revoke_client_ends_sessions_of_a_client_that_is_not_stored(
+        self, service_handlers, mock_hass
+    ):
+        client_id = "https://claude.ai/oauth/claude-code-client-metadata"
+        mock_hass.data[DOMAIN]["refresh_tokens"] = {
+            "fam1.a": {"client_id": client_id, "family": "fam1", "expires_at": time.time() + 60},
+            "fam2.b": {"client_id": "other", "family": "fam2", "expires_at": time.time() + 60},
+        }
+
+        await service_handlers["revoke_client"](_service_call({"client_id": client_id}))
+
+        assert list(mock_hass.data[DOMAIN]["refresh_tokens"]) == ["fam2.b"]
+
+    async def test_list_clients_includes_metadata_document_clients(
+        self, service_handlers, mock_hass
+    ):
+        client_id = "https://claude.ai/oauth/claude-code-client-metadata"
+        mock_hass.data[DOMAIN]["refresh_tokens"] = {
+            "fam1.a": {
+                "client_id": client_id,
+                "client_name": "Claude Code",
+                "family": "fam1",
+                "expires_at": time.time() + 60,
+            }
+        }
+
+        response = await service_handlers["list_clients"](_service_call({}, return_response=True))
+
+        assert response == {
+            "clients": [
+                {
+                    "client_id": client_id,
+                    "client_name": "Claude Code",
+                    "client_host": "claude.ai",
+                    "active_sessions": 1,
+                }
+            ]
+        }
+        message = mock_hass.services.async_call.call_args[0][2]["message"]
+        assert "Signed in through a metadata document" in message
+        assert "`Claude Code`" in message

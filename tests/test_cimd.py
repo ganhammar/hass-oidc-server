@@ -441,3 +441,35 @@ class TestResolveClient:
 
         assert len(cache) == CIMD_CACHE_MAX_ENTRIES
         assert CLIENT_ID in cache
+
+
+class TestEdgeCases:
+    """Paths the main flows do not reach."""
+
+    def test_host_of_a_client_id_with_an_invalid_port(self):
+        assert client_id_host("https://example.com:99999/client") == "example.com"
+
+    @pytest.mark.parametrize("client_id", ["http://example.com/client", "https:///client"])
+    def test_client_id_must_be_https_with_a_host(self, client_id):
+        with pytest.raises(ClientMetadataError, match="https URL with a host"):
+            _check_client_id_url(client_id)
+
+    async def test_resolver_closes_its_resolver(self):
+        resolver = PublicAddressResolver()
+        with patch.object(resolver._resolver, "close", AsyncMock()) as close:
+            await resolver.close()
+
+        close.assert_awaited_once()
+
+    async def test_addresses_without_recent_fetches_are_forgotten(self):
+        """Per-address fetch records older than a minute are dropped."""
+        import time
+
+        hass = _hass()
+        hass.data[DOMAIN]["cimd_fetch_times_by_address"] = {"192.0.2.1": [time.time() - 61]}
+        with patch.object(
+            cimd, "_fetch_document", AsyncMock(return_value=(CLAUDE_CODE_DOCUMENT, 300))
+        ):
+            await async_resolve_client(hass, CLIENT_ID, "203.0.113.9")
+
+        assert list(hass.data[DOMAIN]["cimd_fetch_times_by_address"]) == ["203.0.113.9"]
