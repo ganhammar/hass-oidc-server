@@ -1343,7 +1343,8 @@ class OIDCTokenView(HomeAssistantView):
         # REFRESH_TOKEN_EXPIRY from sign-in however often it is refreshed.
         family = token_data.get("family") or secrets.token_urlsafe(16)
         new_refresh_token = _new_refresh_token(family)
-        # The tokens the session retired within the grace period, with when
+        # The tokens the session retired within the grace period, each with the
+        # time it was retired
         retired = {
             token: retired_at
             for token, retired_at in token_data.get("retired", {}).items()
