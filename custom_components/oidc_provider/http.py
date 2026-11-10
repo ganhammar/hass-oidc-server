@@ -39,6 +39,7 @@ from .const import (
     RATE_LIMIT_PENALTY,
     RATE_LIMIT_WINDOW,
     REFRESH_TOKEN_EXPIRY,
+    REFRESH_TOKEN_REUSE_GRACE,
     RESPONSE_TYPE_CODE,
     SCOPE_EMAIL,
     SCOPE_GROUPS,
@@ -91,9 +92,34 @@ async def _save_refresh_tokens(hass: HomeAssistant) -> None:
         await token_store.async_save({"refresh_tokens": hass.data[DOMAIN]["refresh_tokens"]})
 
 
+def _new_refresh_token(family: str) -> str:
+    """Return a refresh token in the given family.
+
+    Every refresh token issued for one authorization carries the same family
+    id as a prefix. A superseded token is no longer stored, so the prefix is
+    what ties it back to the session it belonged to when it is presented again.
+    """
+    return f"{family}.{secrets.token_urlsafe(32)}"
+
+
+def _refresh_token_family(token: str) -> str | None:
+    """Return the family id a refresh token carries, if any."""
+    family, separator, _ = token.partition(".")
+    return family if separator and family else None
+
+
+def _revoke_family(hass: HomeAssistant, family: str) -> bool:
+    """Drop every stored refresh token of a family. Returns whether any was."""
+    refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
+    doomed = [token for token, data in refresh_tokens.items() if data.get("family") == family]
+    for token in doomed:
+        del refresh_tokens[token]
+    return bool(doomed)
+
+
 async def _revoke_code_grant(hass: HomeAssistant, grant: dict[str, Any]) -> None:
-    """Revoke the refresh token issued when an authorization code was redeemed."""
-    if hass.data[DOMAIN]["refresh_tokens"].pop(grant["refresh_token"], None) is not None:
+    """Revoke the refresh tokens descended from a redeemed authorization code."""
+    if _revoke_family(hass, grant["family"]):
         await _save_refresh_tokens(hass)
 
 
@@ -634,7 +660,18 @@ class OIDCTokenView(HomeAssistantView):
     requires_auth = False
 
     async def post(self, request: web.Request) -> web.Response:
-        """Handle token request."""
+        """Handle token request.
+
+        Responses carry tokens or say why none were issued, so no cache may keep
+        them (RFC 6749 §5.1).
+        """
+        response = await self._token_response(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+    async def _token_response(self, request: web.Request) -> web.Response:
+        """Answer a token request."""
         hass = request.app["hass"]
         data = await request.post()
 
@@ -865,10 +902,11 @@ class OIDCTokenView(HomeAssistantView):
 
         # Kept until the code would have expired, so a later presentation of the
         # same code can revoke what this redemption issues.
-        refresh_token = secrets.token_urlsafe(32)
+        family = secrets.token_urlsafe(16)
+        refresh_token = _new_refresh_token(family)
         grant = {
             "client_id": client_id,
-            "refresh_token": refresh_token,
+            "family": family,
             "expires_at": auth_data["expires_at"],
         }
         redeemed_codes[code] = grant
@@ -887,6 +925,8 @@ class OIDCTokenView(HomeAssistantView):
             "nonce": nonce,
             "auth_time": auth_time,
             "resource": resource,
+            "family": family,
+            "issued_at": time.time(),
             "expires_at": time.time() + REFRESH_TOKEN_EXPIRY,
         }
 
@@ -928,37 +968,112 @@ class OIDCTokenView(HomeAssistantView):
     async def _handle_refresh_token(
         self, _request: web.Request, hass: HomeAssistant, data: Any, client_id: str
     ) -> web.Response:
-        """Handle refresh token grant for the authenticated client."""
-        refresh_token = data.get("refresh_token")
+        """Handle refresh token grant for the authenticated client.
 
+        Every successful refresh replaces the presented refresh token with a new
+        one in the same family (RFC 9700 §4.14.2). Every token the session
+        retired in the last REFRESH_TOKEN_REUSE_GRACE seconds is still answered
+        with the current one, so a delayed duplicate from a client refreshing in
+        several places does not end the session. Presented after that, or by
+        another client, a retired token means the session's tokens have leaked,
+        and the whole family is revoked.
+        """
+        refresh_token = data.get("refresh_token") or ""
         refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
-        if refresh_token not in refresh_tokens:
-            return web.json_response({"error": "invalid_grant"}, status=400)
+        now = time.time()
 
-        token_data = refresh_tokens[refresh_token]
+        token_data = refresh_tokens.get(refresh_token)
+        if token_data is None:
+            return await self._handle_superseded_refresh_token(
+                _request, hass, refresh_token, client_id
+            )
 
-        # Validate refresh token
-        if token_data["expires_at"] < time.time():
+        if token_data["expires_at"] < now:
             del refresh_tokens[refresh_token]
             await _save_refresh_tokens(hass)
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         # The refresh token is bound to the client it was issued to
         # (RFC 6749 §6); the body client_id is caller-controlled and not used.
-        # Presentation by another client indicates the token has leaked, so it
-        # is revoked (RFC 9700 §4.14).
+        # Presentation by another client indicates the token has leaked, so its
+        # family is revoked (RFC 9700 §4.14).
         if token_data["client_id"] != client_id:
             del refresh_tokens[refresh_token]
+            if token_data.get("family"):
+                _revoke_family(hass, token_data["family"])
             await _save_refresh_tokens(hass)
             _LOGGER.warning(
-                "Refresh token issued to client %s used by client %s; token revoked",
+                "Refresh token issued to client %s used by client %s; session revoked",
                 token_data["client_id"],
                 client_id,
             )
             return web.json_response({"error": "invalid_grant"}, status=400)
 
-        # Generate new access token, preserving the original resource binding
-        # (RFC 8707) so refreshed tokens stay valid at the same resource.
+        # Tokens stored before rotation existed have no family; they start one.
+        # The replacement keeps the original expiry, so a session lasts
+        # REFRESH_TOKEN_EXPIRY from sign-in however often it is refreshed.
+        family = token_data.get("family") or secrets.token_urlsafe(16)
+        new_refresh_token = _new_refresh_token(family)
+        # The tokens the session retired within the grace period, each with the
+        # time it was retired
+        retired = {
+            token: retired_at
+            for token, retired_at in token_data.get("retired", {}).items()
+            if now - retired_at <= REFRESH_TOKEN_REUSE_GRACE
+        }
+        retired[refresh_token] = now
+        new_token_data = {**token_data, "family": family, "issued_at": now, "retired": retired}
+        del refresh_tokens[refresh_token]
+        refresh_tokens[new_refresh_token] = new_token_data
+        await _save_refresh_tokens(hass)
+
+        return await self._refresh_response(_request, hass, new_refresh_token, new_token_data)
+
+    async def _handle_superseded_refresh_token(
+        self, _request: web.Request, hass: HomeAssistant, refresh_token: str, client_id: str
+    ) -> web.Response:
+        """Answer a refresh token that is not stored: replaced, revoked or unknown."""
+        refresh_tokens = hass.data[DOMAIN]["refresh_tokens"]
+        successor = next(
+            (
+                (token, data)
+                for token, data in refresh_tokens.items()
+                if refresh_token and refresh_token in data.get("retired", {})
+            ),
+            None,
+        )
+
+        if successor is not None:
+            successor_token, successor_data = successor
+            retired_at = successor_data["retired"][refresh_token]
+            if (
+                successor_data["client_id"] == client_id
+                and time.time() - retired_at <= REFRESH_TOKEN_REUSE_GRACE
+                and successor_data["expires_at"] >= time.time()
+            ):
+                return await self._refresh_response(_request, hass, successor_token, successor_data)
+            family = successor_data["family"]
+        else:
+            family = _refresh_token_family(refresh_token)
+
+        if family and _revoke_family(hass, family):
+            await _save_refresh_tokens(hass)
+            _LOGGER.warning(
+                "A replaced refresh token was presented by client %s; session revoked",
+                client_id,
+            )
+        return web.json_response({"error": "invalid_grant"}, status=400)
+
+    async def _refresh_response(
+        self,
+        _request: web.Request,
+        hass: HomeAssistant,
+        refresh_token: str,
+        token_data: dict[str, Any],
+    ) -> web.Response:
+        """Issue fresh access and ID tokens for a stored refresh token."""
+        # The access token keeps the original resource binding (RFC 8707), so
+        # refreshed tokens stay valid at the same resource.
         access_token = await self._generate_access_token(
             _request,
             hass,
@@ -968,17 +1083,17 @@ class OIDCTokenView(HomeAssistantView):
             audience=token_data.get("resource"),
         )
 
-        # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
-        # Original nonce and auth_time are carried forward; iat/exp/at_hash are
-        # fresh. Old refresh tokens persisted before this change have neither
-        # field, handled by .get() returning None.
         response_body: dict[str, Any] = {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": ACCESS_TOKEN_EXPIRY,
+            "refresh_token": refresh_token,
             "scope": token_data["scope"],
         }
 
+        # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
+        # Original nonce and auth_time are carried forward; iat/exp/at_hash are
+        # fresh. Refresh tokens stored without either field get None from .get().
         scope_value = token_data["scope"] or ""
         if SCOPE_OPENID in scope_value.split():
             response_body["id_token"] = await self._generate_id_token(
@@ -991,6 +1106,11 @@ class OIDCTokenView(HomeAssistantView):
                 auth_time=token_data.get("auth_time"),
                 access_token=access_token,
             )
+
+        # The session may have been revoked while these tokens were being
+        # issued, by reuse detection, a sign-out or the revocation endpoint.
+        if hass.data[DOMAIN]["refresh_tokens"].get(refresh_token) is not token_data:
+            return web.json_response({"error": "invalid_grant"}, status=400)
 
         return web.json_response(response_body)
 

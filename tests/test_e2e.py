@@ -308,8 +308,10 @@ async def _issue_code(client: ClientSessionGenerator, registration: dict) -> tup
     return code, verifier
 
 
-async def _refresh(client: ClientSessionGenerator, registration: dict, refresh_token: str) -> int:
-    """Use a refresh token at /oidc/token. Returns the response status."""
+async def _refresh(
+    client: ClientSessionGenerator, registration: dict, refresh_token: str
+) -> tuple[int, dict]:
+    """Use a refresh token at /oidc/token. Returns (status, json body)."""
     resp = await client.post(
         "/oidc/token",
         data={
@@ -320,7 +322,7 @@ async def _refresh(client: ClientSessionGenerator, registration: dict, refresh_t
         },
         headers=FORWARDED,
     )
-    return resp.status
+    return resp.status, await resp.json()
 
 
 async def test_replayed_code_is_refused_and_revokes_its_refresh_token(
@@ -343,13 +345,83 @@ async def test_replayed_code_is_refused_and_revokes_its_refresh_token(
 
     first_status, first_body = await _exchange_code(client, **exchange)
     assert first_status == 200
-    assert await _refresh(client, registration, first_body["refresh_token"]) == 200
+    refresh_status, refreshed = await _refresh(client, registration, first_body["refresh_token"])
+    assert refresh_status == 200
 
     second_status, second_body = await _exchange_code(client, **exchange)
 
     assert second_status == 400
     assert second_body["error"] == "invalid_grant"
-    assert await _refresh(client, registration, first_body["refresh_token"]) == 400
+    # The token the code issued and the one that replaced it are both revoked
+    assert (await _refresh(client, registration, first_body["refresh_token"]))[0] == 400
+    assert (await _refresh(client, registration, refreshed["refresh_token"]))[0] == 400
+
+
+async def test_refresh_racing_a_revocation_issues_nothing(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session revoked while a refresh is being answered gets invalid_grant, not tokens."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    _, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+
+    store = hass.data[DOMAIN]["token_store"]
+    save = store.async_save
+
+    async def save_then_revoke(data: dict) -> None:
+        await save(data)
+        hass.data[DOMAIN]["refresh_tokens"].clear()
+
+    monkeypatch.setattr(store, "async_save", save_then_revoke)
+    status, refreshed = await _refresh(client, registration, body["refresh_token"])
+
+    assert (status, refreshed["error"]) == (400, "invalid_grant")
+
+
+async def test_refresh_rotates_and_reuse_revokes_the_session(
+    setup_provider: None, hass_client: ClientSessionGenerator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each refresh replaces the refresh token; a replaced one used later ends the session."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    code, verifier = await _issue_code(client, registration)
+    _, body = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    first = body["refresh_token"]
+
+    status, body = await _refresh(client, registration, first)
+    assert status == 200
+    second = body["refresh_token"]
+    assert second != first
+
+    # Within the grace period the replaced token is answered with its replacement
+    status, body = await _refresh(client, registration, first)
+    assert (status, body["refresh_token"]) == (200, second)
+
+    status, body = await _refresh(client, registration, second)
+    assert status == 200
+    third = body["refresh_token"]
+
+    # Past the grace period, the replaced token revokes every token of the session
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    status, body = await _refresh(client, registration, second)
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert (await _refresh(client, registration, third))[0] == 400
 
 
 async def test_code_presented_during_its_redemption_issues_nothing(

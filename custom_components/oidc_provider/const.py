@@ -13,6 +13,11 @@ ID_TOKEN_EXPIRY = 3600  # 1 hour
 REFRESH_TOKEN_EXPIRY = 2592000  # 30 days
 AUTHORIZATION_CODE_EXPIRY = 600  # 10 minutes
 
+# A refresh token is replaced on every use. The one it replaced is still
+# answered for this long, so a client that sent two refreshes at once or lost
+# a response keeps its session; after that, presenting it revokes the session.
+REFRESH_TOKEN_REUSE_GRACE = 60  # seconds
+
 # Token type discriminator (custom claim used to distinguish access vs id tokens)
 TOKEN_USE_ACCESS = "access"
 TOKEN_USE_ID = "id"
