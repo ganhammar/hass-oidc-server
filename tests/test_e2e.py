@@ -27,6 +27,7 @@ import base64
 import hashlib
 import re
 import secrets
+import time
 
 import pytest
 from homeassistant import config_entries
@@ -202,6 +203,46 @@ async def test_dcr_rejects_missing_redirect_uris(
     )
     assert resp.status == 400
     assert (await resp.json())["error"] == "invalid_redirect_uri"
+
+
+async def test_dcr_prunes_stale_clients_and_limits_registrations(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Abandoned dynamic clients are pruned, used ones kept, and the hourly limit applies."""
+    client = await hass_client()
+    clients = hass.data[DOMAIN]["clients"]
+
+    abandoned = await _register_client(client)
+    used, _ = await _signed_in(client)
+    old = time.time() - 2 * 86400
+    clients[abandoned["client_id"]]["created_at"] = old
+    clients[used["client_id"]]["created_at"] = old
+    clients["operator"] = {"client_name": "Operator", "created_at": old}
+    # Its session ended, but a user approved it, so it stays for its next sign-in
+    hass.data[DOMAIN]["refresh_tokens"].clear()
+    assert "used_at" in clients[used["client_id"]]
+
+    fresh = await _register_client(client)
+
+    assert abandoned["client_id"] not in clients
+    assert used["client_id"] in clients
+    assert fresh["client_id"] in clients
+    assert "operator" in clients
+    assert clients[fresh["client_id"]]["registration"] == "dynamic"
+
+    # 3 registrations so far from this address; 2 more reach its hourly limit
+    for _ in range(2):
+        await _register_client(client)
+    count = len(clients)
+    resp = await client.post(
+        "/oidc/register",
+        json={"client_name": "One Too Many", "redirect_uris": [REDIRECT_URI]},
+        headers=FORWARDED,
+    )
+    assert resp.status == 429
+    assert (await resp.json())["error"] == "temporarily_unavailable"
+    assert int(resp.headers["Retry-After"]) > 0
+    assert len(clients) == count
 
 
 async def test_authorization_code_flow_issues_audience_bound_token(

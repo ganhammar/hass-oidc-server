@@ -95,5 +95,17 @@ CIMD_CACHE_MAX_ENTRIES = 100
 MAX_PENDING_AUTH_REQUESTS = 1000
 MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS = 20
 
+
+# Dynamically registered clients that never had a token issued are pruned
+# after the retention period; a client that had one was approved by a user and
+# is kept. Registration is limited overall and per address, since the endpoint
+# needs no login, and the unused clients it creates are capped.
+REGISTRATION_DYNAMIC = "dynamic"
+DYNAMIC_CLIENT_RETENTION = 86400  # 1 day in seconds
+REGISTRATION_RATE_LIMIT_MAX = 20  # Successful registrations per window
+REGISTRATION_RATE_LIMIT_PER_ADDRESS = 5  # The same, for one remote address
+REGISTRATION_RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+MAX_UNUSED_DYNAMIC_CLIENTS = 200
+
 # Frontend panel serving the login flow (hidden from the sidebar)
 PANEL_URL_PATH = "oidc_login"

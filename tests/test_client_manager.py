@@ -1,11 +1,15 @@
 """Tests for client manager."""
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from custom_components.oidc_provider.client_manager import create_client
-from custom_components.oidc_provider.const import DOMAIN
+from custom_components.oidc_provider.client_manager import (
+    count_unused_dynamic_clients,
+    create_client,
+    prune_dynamic_clients,
+)
+from custom_components.oidc_provider.const import DOMAIN, DYNAMIC_CLIENT_RETENTION
 
 
 @pytest.fixture
@@ -393,6 +397,97 @@ def test_redirect_uris_must_be_ascii_without_fragment(uri):
 
     with pytest.raises(ValueError):
         validate_redirect_uris([uri])
+
+
+async def test_create_client_records_created_at_without_dynamic_marker(mock_hass):
+    """Operator-created clients get a timestamp but no dynamic marker."""
+    with patch("custom_components.oidc_provider.client_manager.time.time", return_value=1000.0):
+        result = await create_client(mock_hass, client_name="Manual")
+
+    stored = mock_hass.data[DOMAIN]["clients"][result["client_id"]]
+    assert stored["created_at"] == 1000.0
+    assert "registration" not in stored
+
+
+async def test_create_client_dynamic_marker(mock_hass):
+    """Dynamically registered clients carry the dynamic marker."""
+    result = await create_client(mock_hass, client_name="Dyn", dynamic=True)
+
+    stored = mock_hass.data[DOMAIN]["clients"][result["client_id"]]
+    assert stored["registration"] == "dynamic"
+    assert "created_at" in stored
+
+
+NOW = 10_000_000.0
+OLD = NOW - DYNAMIC_CLIENT_RETENTION - 1
+
+
+def _client(created_at=None, dynamic=True, used=False):
+    client = {"client_name": "c"}
+    if created_at is not None:
+        client["created_at"] = created_at
+    if dynamic:
+        client["registration"] = "dynamic"
+    if used:
+        client["used_at"] = created_at
+    return client
+
+
+async def test_prune_removes_old_dynamic_clients_that_never_got_a_token(mock_hass):
+    """Only old self-registered clients that never had a token issued are removed."""
+    mock_hass.data[DOMAIN]["clients"] = {
+        "abandoned": _client(OLD),
+        # Its sessions ended, but a user approved it and it may come back
+        "used_without_live_token": _client(OLD, used=True),
+        "recent": _client(NOW - 10),
+        "manual_old": _client(OLD, dynamic=False),
+        "legacy": {"client_name": "legacy"},
+        "dynamic_no_timestamp": _client(),
+    }
+
+    with patch("custom_components.oidc_provider.client_manager.time.time", return_value=NOW):
+        removed = await prune_dynamic_clients(mock_hass)
+
+    assert removed == 1
+    assert set(mock_hass.data[DOMAIN]["clients"]) == {
+        "used_without_live_token",
+        "recent",
+        "manual_old",
+        "legacy",
+        "dynamic_no_timestamp",
+    }
+    mock_hass.data[DOMAIN]["store"].async_save.assert_awaited_once_with(
+        {"clients": mock_hass.data[DOMAIN]["clients"]}
+    )
+
+
+async def test_prune_does_not_save_when_nothing_removed(mock_hass):
+    """No store write happens when no client is stale."""
+    mock_hass.data[DOMAIN]["clients"] = {"recent": _client(NOW)}
+
+    with patch("custom_components.oidc_provider.client_manager.time.time", return_value=NOW):
+        assert await prune_dynamic_clients(mock_hass) == 0
+
+    mock_hass.data[DOMAIN]["store"].async_save.assert_not_awaited()
+
+
+async def test_prune_without_refresh_tokens_key(mock_hass):
+    """Pruning tolerates a missing refresh_tokens entry."""
+    mock_hass.data[DOMAIN]["clients"] = {"stale": _client(OLD)}
+
+    with patch("custom_components.oidc_provider.client_manager.time.time", return_value=NOW):
+        assert await prune_dynamic_clients(mock_hass) == 1
+
+
+def test_count_unused_dynamic_clients(mock_hass):
+    """Only self-registered clients that never had a token issued are counted."""
+    mock_hass.data[DOMAIN]["clients"] = {
+        "a": _client(1),
+        "b": _client(1, dynamic=False),
+        "c": {},
+        "d": _client(1, used=True),
+    }
+    assert count_unused_dynamic_clients(mock_hass) == 1
 
 
 @pytest.mark.parametrize(
