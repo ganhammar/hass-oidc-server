@@ -38,8 +38,6 @@ from .http import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()<>#+!|~-])")
-
 
 def _admin_only(hass: HomeAssistant, handler):
     """Wrap a service handler so only administrators can call it.
@@ -64,13 +62,16 @@ def _admin_only(hass: HomeAssistant, handler):
 
 
 def _markdown_text(value: str) -> str:
-    """Escape a value for Markdown in a notification.
+    """Return a value as a Markdown code span for a notification.
 
     Client names and redirect URIs come from whoever registered the client,
-    which with dynamic registration or metadata documents can be anyone, so
-    they must not add links or formatting to an administrator's notification.
+    which with dynamic registration or metadata documents can be anyone. In a
+    code span Markdown adds no links, headings or formatting, bare URLs
+    included. Backticks and line breaks, which could end the span, become
+    plain characters.
     """
-    return _MARKDOWN_SPECIAL.sub(r"\\\1", value)
+    text = re.sub(r"[\r\n]+", " ", value).replace("`", "'")
+    return f"`{text}`"
 
 
 STORAGE_VERSION = 1
@@ -121,7 +122,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info(
         "Migrated config entry to minor version 3; dynamic client registration %s, "
         "client metadata documents %s",
-        "enabled" if options[CONF_ALLOW_DYNAMIC_REGISTRATION] else "disabled",
+        # An entry saved by a release before 1.7.0 after a downgrade can lack
+        # the dynamic registration choice; it then has the default.
+        (
+            "enabled"
+            if options.get(CONF_ALLOW_DYNAMIC_REGISTRATION, DEFAULT_ALLOW_DYNAMIC_REGISTRATION)
+            else "disabled"
+        ),
         "enabled" if options[CONF_ALLOW_CLIENT_METADATA_DOCUMENTS] else "disabled",
     )
 

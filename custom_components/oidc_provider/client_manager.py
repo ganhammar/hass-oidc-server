@@ -3,6 +3,7 @@
 import logging
 import secrets
 import time
+import unicodedata
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,16 +22,25 @@ MAX_CLIENT_NAME_LENGTH = 100
 def validate_client_name(client_name: Any) -> str:
     """Return the client name if it is a usable display string.
 
-    The name is shown on the consent screen, so it must be a non-empty string
-    of bounded length.
+    The name is shown on the consent screen and in notifications, and anyone
+    can choose it through dynamic registration or a metadata document. So it
+    must be a non-empty string of bounded length on one line, without control
+    or formatting characters: a right-to-left override could reorder the text
+    around it, and a line break could add headings to a notification.
 
     Raises:
-        ValueError: If the name is not a string, is blank, or is too long
+        ValueError: If the name is not a string, is blank, too long, or holds
+            control, formatting or line separator characters
     """
     if not isinstance(client_name, str) or not client_name.strip():
         raise ValueError("client_name must be a non-empty string")
     if len(client_name) > MAX_CLIENT_NAME_LENGTH:
         raise ValueError(f"client_name must be at most {MAX_CLIENT_NAME_LENGTH} characters")
+    if any(
+        unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp")
+        for c in client_name
+    ):
+        raise ValueError("client_name must not contain control or formatting characters")
     return client_name.strip()
 
 
@@ -78,32 +88,33 @@ def validate_redirect_uris(redirect_uris: list[Any]) -> None:
             raise ValueError(f"Redirect URI has an invalid port: {uri}") from e
 
 
-def count_dynamic_clients(hass: HomeAssistant) -> int:
-    """Return how many stored clients were registered dynamically."""
+def _is_unused_dynamic_client(client: dict[str, Any]) -> bool:
+    """Return whether a client registered itself and has never had a token issued."""
+    return client.get("registration") == REGISTRATION_DYNAMIC and "used_at" not in client
+
+
+def count_unused_dynamic_clients(hass: HomeAssistant) -> int:
+    """Return how many stored clients registered themselves and never got a token."""
     clients = hass.data[DOMAIN].get("clients", {})
-    return sum(1 for c in clients.values() if c.get("registration") == REGISTRATION_DYNAMIC)
+    return sum(1 for client in clients.values() if _is_unused_dynamic_client(client))
 
 
 async def prune_dynamic_clients(hass: HomeAssistant) -> int:
-    """Remove stale dynamically registered clients and return how many were removed.
+    """Remove abandoned dynamically registered clients and return how many were removed.
 
-    A client is stale when it is marked as dynamically registered, was created
-    more than DYNAMIC_CLIENT_RETENTION seconds ago, and no refresh token issued
-    to it is still valid. Clients without the dynamic marker are never removed.
+    A client is abandoned when it registered itself more than
+    DYNAMIC_CLIENT_RETENTION seconds ago and has never had a token issued. A
+    client that has had one was approved by a user and is kept, since many
+    clients reuse their client_id after their sessions end. Clients without
+    the dynamic marker are never removed.
     """
     now = time.time()
     clients = hass.data[DOMAIN].get("clients", {})
-    active = {
-        token["client_id"]
-        for token in hass.data[DOMAIN].get("refresh_tokens", {}).values()
-        if token.get("expires_at", 0) > now
-    }
     stale = [
         client_id
         for client_id, client in clients.items()
-        if client.get("registration") == REGISTRATION_DYNAMIC
+        if _is_unused_dynamic_client(client)
         and client.get("created_at", now) < now - DYNAMIC_CLIENT_RETENTION
-        and client_id not in active
     ]
     if not stale:
         return 0

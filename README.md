@@ -46,7 +46,7 @@ Change these later under **Settings** → **Devices & Services** → **OIDC Prov
 - **Allow client metadata documents** (default: on for new installs): accepts clients whose client ID is an HTTPS URL serving their metadata, as described in [Client ID Metadata Documents](#client-id-metadata-documents). This is how Claude connects. Turning it off ends those clients' sessions at their next token refresh.
 - **Allow dynamic client registration** (default: off for new installs): lets clients register themselves at `/oidc/register` (RFC 7591). Only needed for clients that support neither client metadata documents nor a client you register for them. Every sign-in through a dynamically registered client stops on the [consent screen](#consent-screen).
 
-Clients that use dynamic registration, such as Claude when client metadata documents are off, register a new client on every fresh connection, so these clients are cleaned up automatically. A dynamically registered client is removed once it is more than 7 days old and has no valid refresh token. The cleanup runs when the integration starts and before each new registration. Clients you registered with `register_client`, and clients registered by earlier releases, are never removed automatically.
+Clients that use dynamic registration, such as Claude when client metadata documents are off, register a new client on every fresh connection, so abandoned registrations are cleaned up automatically. A dynamically registered client that has not had a token issued within a day of registering is removed. Once a user has approved one, it is kept even after its sessions end, since many clients reuse their client ID for the next sign-in. The cleanup runs when the integration starts and before each new registration. Clients you registered with `register_client`, and clients registered by earlier releases, are never removed automatically.
 
 While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
 
@@ -100,7 +100,7 @@ These clients are public: they have no secret and prove their sign-ins with PKCE
 The fetch is limited to keep the endpoint from being used against your network:
 
 - Only `https` URLs in normalized form with a host name and a path, without a query or fragment, are accepted. IP addresses in any notation are refused, and international host names must be given in punycode, so a look-alike cannot pass for another domain on the consent screen
-- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made
+- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made. IPv6 addresses that embed an IPv4 address, such as NAT64, count as that IPv4 address
 - Redirects are not followed, documents larger than 5 KB are refused, and the request times out after 5 seconds. A failed fetch is answered with the same message whatever the cause, so it reveals nothing about your network
 - Documents are cached for their `Cache-Control` lifetime, between 1 minute and 1 day, and not at all when marked `no-store` or `no-cache`. At most 30 uncached fetches run per minute, and at most 5 for any one address
 - A document must not contain a client secret, must use `none` as its token endpoint authentication method, and must list its redirect URIs
@@ -176,7 +176,7 @@ Once installed, your Home Assistant instance exposes the following OIDC endpoint
 - **Token**: `https://your-ha-instance/oidc/token`
 - **UserInfo**: `https://your-ha-instance/oidc/userinfo`
 - **JWKS**: `https://your-ha-instance/oidc/jwks` (the current signing key, and the previous one after a rotation that kept it)
-- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it
+- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it. Access tokens cannot be revoked and are answered with `unsupported_token_type`; they expire within the hour
 - **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
 
 Both redirects back to the client, with `code` on approval or `error=access_denied` on denial, carry an `iss` parameter with the issuer (RFC 9207), and the discovery documents advertise `authorization_response_iss_parameter_supported`.
@@ -201,7 +201,7 @@ To use a client you registered yourself instead, register one as described above
 
 - **HTTPS Required**: Your Home Assistant instance must be accessible via HTTPS with a valid certificate for OIDC to work with external services
 - **Client Secrets**: Store client secrets securely and never commit them to version control
-- **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. The replaced token keeps working for one minute, so a retried request does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700)
+- **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. A replaced token keeps working for one minute after it was replaced, so a retried request, or one sent from another worker of the same client, does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700). Token responses are never cached (`Cache-Control: no-store`)
 - **Access Tokens**: Valid for 1 hour by default
 - **Client Actions**: Registering, updating, revoking and listing clients, and rotating the signing key, require a Home Assistant administrator. Automations and scripts, which run without a user, can still call them
 - **Signing Key**: Kept until you [rotate it](#rotating-the-signing-key). Rotate with `keep_previous_key: false` if it may have leaked
@@ -210,7 +210,7 @@ To use a client you registered yourself instead, register one as described above
 - **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
 - **Client Metadata Documents**: Anyone who can reach your instance can start a sign-in that makes Home Assistant fetch a URL. The fetch only reaches public addresses over HTTPS and is size, time and rate limited, as [described above](#client-id-metadata-documents). Sign-ins through these clients always go through the consent screen
 - **Public Clients**: Clients without a secret, from metadata documents or registered with `token_endpoint_auth_method: none`, must use PKCE whatever the PKCE option says. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) match on any port, as RFC 8252 requires for native apps
-- **Registration limits**: `/oidc/register` accepts at most 20 registrations per hour in total and at most 200 dynamically registered clients at a time. Beyond that it answers `429` with `temporarily_unavailable` (and a `Retry-After` header for the hourly limit) and creates nothing. Stale clients are pruned first, so the client limit only applies to clients that are still in use or recent.
+- **Registration limits**: `/oidc/register` accepts at most 20 registrations per hour in total, at most 5 of them from one address, and at most 200 dynamically registered clients that have not had a token issued yet. Beyond that it answers `429` with `temporarily_unavailable` (and a `Retry-After` header for the hourly limits) and creates nothing. Clients a user has approved do not count toward the 200.
 - **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes

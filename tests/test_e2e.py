@@ -246,31 +246,30 @@ async def test_dcr_rejects_missing_redirect_uris(
 async def test_dcr_prunes_stale_clients_and_limits_registrations(
     setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
 ) -> None:
-    """Stale dynamic clients are pruned on registration and the hourly limit applies."""
+    """Abandoned dynamic clients are pruned, used ones kept, and the hourly limit applies."""
     client = await hass_client()
     clients = hass.data[DOMAIN]["clients"]
 
-    stale = await _register_client(client)
-    kept = await _register_client(client)
-    old = time.time() - 8 * 86400
-    clients[stale["client_id"]]["created_at"] = old
-    clients[kept["client_id"]]["created_at"] = old
+    abandoned = await _register_client(client)
+    used, _ = await _signed_in(client)
+    old = time.time() - 2 * 86400
+    clients[abandoned["client_id"]]["created_at"] = old
+    clients[used["client_id"]]["created_at"] = old
     clients["operator"] = {"client_name": "Operator", "created_at": old}
-    hass.data[DOMAIN]["refresh_tokens"]["live"] = {
-        "client_id": kept["client_id"],
-        "expires_at": time.time() + 1000,
-    }
+    # Its session ended, but a user approved it, so it stays for its next sign-in
+    hass.data[DOMAIN]["refresh_tokens"].clear()
+    assert "used_at" in clients[used["client_id"]]
 
     fresh = await _register_client(client)
 
-    assert stale["client_id"] not in clients
-    assert kept["client_id"] in clients
+    assert abandoned["client_id"] not in clients
+    assert used["client_id"] in clients
     assert fresh["client_id"] in clients
     assert "operator" in clients
     assert clients[fresh["client_id"]]["registration"] == "dynamic"
 
-    # 3 registrations so far; 17 more fill the hourly window.
-    for _ in range(17):
+    # 3 registrations so far from this address; 2 more reach its hourly limit
+    for _ in range(2):
         await _register_client(client)
     count = len(clients)
     resp = await client.post(
@@ -1196,18 +1195,22 @@ async def test_dynamically_registered_public_client(
     assert status == 200, body
 
 
+@pytest.mark.parametrize(
+    "cap", ["MAX_PENDING_AUTH_REQUESTS", "MAX_PENDING_AUTH_REQUESTS_PER_ADDRESS"]
+)
 async def test_pending_authorizations_are_capped(
     setup_provider: None,
     hass: HomeAssistant,
     hass_client: ClientSessionGenerator,
     monkeypatch: pytest.MonkeyPatch,
+    cap: str,
 ) -> None:
-    """Anyone can start an authorization, so the oldest pending ones give way past the cap."""
-    monkeypatch.setattr("custom_components.oidc_provider.http.MAX_PENDING_AUTH_REQUESTS", 2)
+    """Past a cap new authorizations are refused, and the ones under way are kept."""
+    monkeypatch.setattr(f"custom_components.oidc_provider.http.{cap}", 2)
     client = await hass_client()
     registration = await _register_client(client)
 
-    request_ids = []
+    statuses = []
     for _ in range(3):
         _, challenge = _pkce_pair()
         resp = await client.get(
@@ -1222,9 +1225,10 @@ async def test_pending_authorizations_are_capped(
             },
             headers=FORWARDED,
         )
-        request_ids.append(re.search(r"oidc_request_id', '([^']+)'", await resp.text()).group(1))
+        statuses.append(resp.status)
 
-    assert list(hass.data[DOMAIN]["pending_auth_requests"]) == request_ids[1:]
+    assert statuses == [200, 200, 429]
+    assert len(hass.data[DOMAIN]["pending_auth_requests"]) == 2
 
 
 async def _signed_in(client: ClientSessionGenerator) -> tuple[dict, dict]:
@@ -1372,3 +1376,29 @@ async def test_client_actions_run_for_an_admin_and_without_a_user(
             DOMAIN, "list_clients", {}, blocking=True, return_response=True, context=context
         )
         assert response == {"clients": []}
+
+
+@pytest.mark.parametrize(
+    "client_id", ["https://[evil.com]/x", "https://[::1/x", "https://ex\\ample.com/x"]
+)
+async def test_malformed_url_client_id_is_refused_cleanly(
+    setup_provider: None, hass_client: ClientSessionGenerator, client_id: str
+) -> None:
+    """A client_id that is not a valid URL gets a 400, not a server error."""
+    client = await hass_client()
+    _, challenge = _pkce_pair()
+
+    resp = await client.get(
+        "/oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": LOOPBACK_REDIRECT_URI,
+            "scope": "openid",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400
