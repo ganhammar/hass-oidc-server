@@ -7,5 +7,5 @@
   "documentation": "https://github.com/ganhammar/hass-oidc-server",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/ganhammar/hass-oidc-server/issues",
-  "version": "1.8.0"
+  "version": "1.9.0"
 }
