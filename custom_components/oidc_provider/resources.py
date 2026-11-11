@@ -290,7 +290,11 @@ async def async_session_access(
     existing_sessions_options). When the description names no access for
     such sessions, current is None and remembered holds the user's last
     choice for the client, so the choice opens as the consent screen would.
-    None when the resource cannot answer.
+
+    granted holds the session's own options, the entries the description
+    still has, as what the session has now, and is None without a choice at
+    this resource. The screen decides from it and the ceiling whether the
+    user may still allow it. None when the resource cannot answer.
     """
     answers = await _async_ask(
         hass,
@@ -303,9 +307,9 @@ async def async_session_access(
     if answers is None:
         return None
     description, availability, ceiling = answers
-    current = remembered = None
+    current = remembered = granted = None
     if access and access.get("resource") == described.domain:
-        current = known_options(description, access.get("options")) or None
+        current = granted = known_options(description, access.get("options")) or None
     else:
         current = existing_sessions_options(description, ceiling)
         if current is None:
@@ -316,6 +320,7 @@ async def async_session_access(
         **_choice_model(described, description, availability, ceiling),
         "remembered": remembered,
         "current": current,
+        "granted": granted,
     }
 
 

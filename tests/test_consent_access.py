@@ -1045,6 +1045,9 @@ async def test_changing_access_opens_on_the_sessions_own_choice(stand_in):
     assert access["current"] == CUSTOM
     # The session's own choice, not the user's last choice for the client
     assert access["remembered"] is None
+    # It is what the session has
+    assert access["granted"] == CUSTOM
+    assert "adjusted" not in access
     # Availability and the ceiling as they are now
     assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
     assert access["ceiling"] == {**ceiling, "locked_presets": []}
@@ -1065,6 +1068,8 @@ async def test_a_session_without_a_choice_opens_on_the_access_it_would_get(stand
     assert status == 200, data
     assert data["access"]["current"] == {**CONTROL, "cameras": "none"}
     assert data["access"]["remembered"] is None
+    # It has no choice, so nothing is marked as what it has
+    assert data["access"]["granted"] is None
 
 
 async def test_without_access_for_sessions_from_before_the_choice_opens_as_on_consent(stand_in):
@@ -1075,10 +1080,48 @@ async def test_without_access_for_sessions_from_before_the_choice_opens_as_on_co
 
     _, data = await _change(hass, "before")
     assert (data["access"]["current"], data["access"]["remembered"]) == (None, None)
+    assert data["access"]["granted"] is None
 
     await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", CUSTOM)
     _, data = await _change(hass, "before")
     assert (data["access"]["current"], data["access"]["remembered"]) == (None, CUSTOM)
+
+
+async def test_a_choice_the_ceiling_no_longer_allows_is_sent_as_it_is(stand_in):
+    """What the session has is not held at the ceiling; the panel compares the two."""
+    hass = await _change_hass(stand_in)
+    _session(hass, "fam")["access"] = {**_session(hass, "fam")["access"], "options": CONTROL}
+    stand_in.CEILINGS[USER] = {
+        "groups": {"lights": {"max": "read", "reason": "Lights are read only."}},
+        "locked_presets": ["read"],
+        "reason": "The stand-in is in read-only mode.",
+    }
+
+    status, data = await _change(hass, "fam")
+
+    assert status == 200, data
+    assert data["access"]["current"] == data["access"]["granted"] == CONTROL
+    assert data["access"]["ceiling"]["locked_presets"] == ["read"]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        # The description gained Cameras after the session chose
+        {gid: oid for gid, oid in LOOK_ONLY.items() if gid != "cameras"},
+        # The description no longer has the option the session chose for Cameras
+        {**LOOK_ONLY, "cameras": "everything"},
+    ],
+)
+async def test_a_choice_without_an_option_for_every_group_is_sent_without_it(stand_in, stored):
+    """The panel fills in the group as the list of applications does."""
+    hass = await _change_hass(stand_in)
+    _session(hass, "fam")["access"] = {**_session(hass, "fam")["access"], "options": stored}
+
+    _, data = await _change(hass, "fam")
+
+    without_cameras = {gid: oid for gid, oid in LOOK_ONLY.items() if gid != "cameras"}
+    assert data["access"]["current"] == data["access"]["granted"] == without_cameras
 
 
 async def test_a_choice_at_another_resource_counts_as_none(stand_in):
@@ -1090,6 +1133,8 @@ async def test_a_choice_at_another_resource_counts_as_none(stand_in):
     _, data = await _change(hass, "fam")
 
     assert data["access"]["current"] == CONTROL
+    # Nothing is marked as what it has
+    assert data["access"]["granted"] is None
 
 
 async def test_saving_replaces_the_access_and_exactly_its_scopes(stand_in, caplog):

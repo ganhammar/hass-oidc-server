@@ -2405,6 +2405,7 @@ async def test_user_changes_the_access_a_session_was_granted(
     assert status == 200, offered
     assert offered["client_name"] == "Test MCP Client"
     assert offered["access"]["current"] == STAND_IN_LOOK_ONLY
+    assert offered["access"]["granted"] == STAND_IN_LOOK_ONLY
     assert offered["access"]["presets"][0]["title"] == "Look only"
 
     choice = {**STAND_IN_LOOK_ONLY, "cameras": "none", "files": "full"}
@@ -2528,6 +2529,7 @@ async def test_a_session_from_before_opens_on_its_default_and_saving_sets_its_ac
     status, offered = await _session_access(client, session["session_id"])
     assert status == 200, offered
     assert offered["access"]["current"] == STAND_IN_CONTROL
+    assert offered["access"]["granted"] is None
 
     assert (await _session_access(client, session["session_id"], STAND_IN_LOOK_ONLY))[0] == 200
     status, refreshed = await _refresh(client, registration, tokens["refresh_token"])

@@ -2558,8 +2558,8 @@ class OIDCSessionAccessView(HomeAssistantView):
         """Describe the choice of the session's access, in the language the panel asks for.
 
         It is what the consent screen shows of the resource, with the user's
-        ceiling and availability as they are now, and the options the choice
-        opens on (see async_session_access).
+        ceiling and availability as they are now, the options the choice
+        opens on and what the session has now (see async_session_access).
         """
         hass = request.app["hass"]
         user = request["hass_user"]

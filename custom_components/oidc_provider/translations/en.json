@@ -101,7 +101,14 @@
       "cancel": "Cancel",
       "changed": "The access you can allow changed after this page opened. Check your choice and save again.",
       "saved": "Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour.",
-      "gone": "{app} is no longer signed in, so its access cannot be changed."
+      "gone": "{app} is no longer signed in, so its access cannot be changed.",
+      "current": "What it has now",
+      "current_detail": "What {app} has now: {level}",
+      "adjusted": "You can no longer allow the access {app} has now. {reason}",
+      "saving": "Saving changes {changes}; Cancel leaves it as it is.",
+      "saving_many": "Saving changes it to the choice below; Cancel leaves it as it is.",
+      "difference": "{area} to {option}",
+      "cancel_keeps": "Cancel keeps the access {app} has now."
     }
   }
 }
