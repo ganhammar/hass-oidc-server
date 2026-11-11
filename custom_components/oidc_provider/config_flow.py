@@ -13,6 +13,7 @@ from .const import (
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
     PANEL_CLIENTS_PATH,
+    PANEL_SESSIONS_PATH,
 )
 
 
@@ -81,7 +82,10 @@ class OIDCProviderOptionsFlow(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            description_placeholders={"clients_url": PANEL_CLIENTS_PATH},
+            description_placeholders={
+                "clients_url": PANEL_CLIENTS_PATH,
+                "sessions_url": PANEL_SESSIONS_PATH,
+            },
             data_schema=vol.Schema(
                 {
                     vol.Optional(

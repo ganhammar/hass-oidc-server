@@ -22,7 +22,7 @@
     "step": {
       "init": {
         "title": "OIDC Provider Options",
-        "description": "To register, edit or revoke clients, open [Manage clients]({clients_url}).",
+        "description": "To register, edit or revoke clients, open [Manage clients]({clients_url}). To change what the applications signed in with your account can do, or sign them out, open [Connected applications]({sessions_url}).",
         "data": {
           "require_pkce": "Require PKCE",
           "allow_client_metadata_documents": "Allow client metadata documents",
