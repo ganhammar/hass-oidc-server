@@ -31,6 +31,8 @@ _SCOPE_PATTERN = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]+")
 _SCOPE_MAX_LENGTH = 128
 # Whitespace and control characters, which no resource indicator holds
 _UNPRINTABLE = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
+# A URL's scheme and authority, then the rest of it
+_ORIGIN_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://[^/?#]*)(.*)", re.IGNORECASE | re.DOTALL)
 
 CLAUSE_BELOW_HIGHEST = "below_highest"
 CLAUSE_AT_LOWEST = "at_lowest"
@@ -462,18 +464,31 @@ def matching_preset(description: dict[str, Any], options: dict[str, str]) -> str
     )
 
 
+def comparable_resource(url: str) -> str:
+    """Return a resource with its scheme and authority in lower case and the rest as written.
+
+    Scheme and host are case-insensitive (RFC 3986 §6.2.2.1); the path is not.
+    A path without a scheme comes back as it is.
+    """
+    match = _ORIGIN_PATTERN.fullmatch(url)
+    return f"{match.group(1).lower()}{match.group(2)}" if match else url
+
+
 def resource_matches(resources: list[str], indicator: str | None, base_url: str) -> bool:
     """Return whether a resource indicator (RFC 8707) names a described resource.
 
     A path is matched on the address the authorization request reached Home
     Assistant at, which is where a resource server on this Home Assistant
-    answers too; a URL is matched as written.
+    answers too, and a URL as it is written. Scheme and host match in any
+    case and the path exactly, so an indicator that differs in its path names
+    no described resource.
     """
     if not indicator:
         return False
     base = base_url.rstrip("/")
+    wanted = comparable_resource(indicator)
     return any(
-        indicator == (f"{base}{resource}" if resource.startswith("/") else resource)
+        wanted == comparable_resource(f"{base}{resource}" if resource.startswith("/") else resource)
         for resource in resources
     )
 

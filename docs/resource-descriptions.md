@@ -56,7 +56,7 @@ Availability and the ceiling are functions rather than part of the description b
 
 | Key | What it is |
 |---|---|
-| `resource` | The resource indicators (RFC 8707) your tokens are bound to, as one string or a list. A path starting with `/` matches on whichever address the authorization request reached Home Assistant at, which is where you answer too: `/api/mcp` matches `https://ha.example.com/api/mcp` for a sign-in at `https://ha.example.com`. An absolute `http` or `https` URL matches as written. List every path you answer on. A client must send the same value as `resource` when it authorizes; the provider binds the token's `aud` to it as before. |
+| `resource` | The resource indicators (RFC 8707) your tokens are bound to, as one string or a list. A path starting with `/` matches on whichever address the authorization request reached Home Assistant at, which is where you answer too: `/api/mcp` matches `https://ha.example.com/api/mcp` for a sign-in at `https://ha.example.com`. An absolute `http` or `https` URL matches as written. The scheme and host match in any case (RFC 3986) and the path exactly, so `/api/MCP` and `/api/mcp/` are not `/api/mcp`. List every path you answer on. A client's `resource` that matches none of them fails safe: the consent screen offers no choice, and the token carries none of your scopes. A client must send the same value as `resource` when it authorizes; the provider binds the token's `aud` to it as before. |
 | `name` | Your resource's name, shown in warnings and used in the default prompt. |
 | `prompt` | The line above the levels. Defaults to "Choose what {app} can do." |
 | `detail_intro` | A paragraph under the heading of the detailed view. Use it to say what your settings mean. |
@@ -173,7 +173,7 @@ A description is checked when it is collected, and every answer is checked when 
 - Scopes are OAuth scope tokens (printable ASCII without spaces, `"` or `\`) and may not be one of the provider's own (`openid`, `profile`, `email`, `groups`). Every scope an option or preset grants is declared under `scopes`.
 - A group has at least two options; a preset chooses a known option for every group; no two presets choose the same; `default_preset` names a preset.
 - Conditions name groups and options that exist.
-- Resource paths start with a single `/`, name more than `/` and have no query or fragment; URLs are `http` or `https`, without credentials or a fragment. Neither may hold whitespace, control characters, or `.` or `..` segments (also percent-encoded). No two integrations may describe the same resource.
+- Resource paths start with a single `/`, name more than `/` and have no query or fragment; URLs are `http` or `https`, without credentials or a fragment. Neither may hold whitespace, control characters, or `.` or `..` segments (also percent-encoded). No two integrations may describe the same resource, compared as above.
 - Availability names known groups, each with a reason. A ceiling names known groups, each with a known `max` and a reason, and known presets in `locked_presets`, leaving at least one unlocked, plus a top-level reason.
 - Keys the provider does not know are ignored, so a description written for a later release still works.
 

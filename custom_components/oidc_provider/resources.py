@@ -35,6 +35,7 @@ from .cimd import is_client_id_url
 from .const import DOMAIN, STORAGE_KEY_ACCESS_CHOICES, STORAGE_VERSION
 from .resource_description import (
     InvalidDescription,
+    comparable_resource,
     consent_model,
     known_options,
     resource_matches,
@@ -109,8 +110,13 @@ async def _async_collect(hass: HomeAssistant, domain: str, platform: Any) -> Non
         return
 
     registry: dict[str, DescribedResource] = hass.data[DATA_RESOURCES]
+    claimed = {comparable_resource(resource) for resource in description["resource"]}
     for other in registry.values():
-        shared = sorted(set(other.description["resource"]) & set(description["resource"]))
+        shared = sorted(
+            resource
+            for resource in other.description["resource"]
+            if comparable_resource(resource) in claimed
+        )
         if shared and other.domain != domain:
             _LOGGER.warning(
                 "Ignoring the resource description of integration %s: integration %s "

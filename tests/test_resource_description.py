@@ -420,6 +420,12 @@ def test_matching_preset(description):
         ("https://ha.example.com/api/stand_in/", "https://ha.example.com", False),
         ("https://notes.example.com/api", "https://ha.example.com", True),
         (None, "https://ha.example.com", False),
+        # Scheme and host in any case, the path exactly (RFC 3986 §6.2.2.1)
+        ("HTTPS://HA.Example.COM/api/stand_in", "https://ha.example.com", True),
+        ("https://ha.example.com/api/stand_in", "https://HA.example.com", True),
+        ("https://Notes.Example.com/api", "https://ha.example.com", True),
+        ("https://ha.example.com/API/stand_in", "https://ha.example.com", False),
+        ("https://notes.example.com/API", "https://ha.example.com", False),
     ],
 )
 def test_resource_matches(indicator, base, matches):

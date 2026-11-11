@@ -140,6 +140,27 @@ async def test_plain_function_and_a_second_claim_on_a_resource(stand_in, caplog)
     assert len(described_resources(hass)) == 1
 
 
+async def test_a_claim_differing_only_in_the_case_of_the_host_is_the_same_claim(stand_in, caplog):
+    """Scheme and host are case-insensitive, so both would match the same indicators."""
+    hass = _mock_hass()
+    notes = copy.deepcopy(stand_in.DESCRIPTION)
+    notes["resource"] = "https://notes.example.com/api"
+    other = copy.deepcopy(notes)
+    other["resource"] = "HTTPS://Notes.Example.com/api"
+
+    await _async_collect(
+        hass, "notes", SimpleNamespace(async_describe_resource=lambda hass, language: notes)
+    )
+    with caplog.at_level(logging.WARNING):
+        await _async_collect(
+            hass, "other", SimpleNamespace(async_describe_resource=lambda hass, language: other)
+        )
+
+    assert [described.domain for described in described_resources(hass)] == ["notes"]
+    assert "integration notes already describes https://notes.example.com/api" in caplog.text
+    assert find_resource(hass, "https://NOTES.example.com/api", BASE).domain == "notes"
+
+
 async def test_find_resource_and_scopes(stand_in):
     hass = _mock_hass()
     assert find_resource(hass, f"{BASE}/api/stand_in", BASE) is None
