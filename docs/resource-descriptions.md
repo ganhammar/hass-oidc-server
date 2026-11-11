@@ -31,16 +31,16 @@ Descriptions are collected once per Home Assistant run, the first time both inte
 
 - Your resource keeps matching sign-ins, so they keep asking your module (see below), and a module that fails then gives the plain screen.
 - Your scopes stay in the provider's discovery documents.
-- Sessions for your resource that began before your description keep ending at their next refresh.
+- Sessions for your resource that began before your description keep being settled at their next refresh, as [Sessions from before your description](#sessions-from-before-your-description) describes.
 - A change to your `resource` takes effect only after a restart, and so does a change to the scopes listed in the provider's discovery documents. The rest of the description is asked for again at every consent screen and approval.
 
 ## The module
 
 | Function | Required | Called | Returns |
 |---|---|---|---|
-| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; at every consent screen and on Connected applications, with the user's language; and when the user approves, with Home Assistant's language | The description, with its text in `language` |
-| `async_get_availability(hass, language)` | No | At every consent screen, with the user's language, and when the user approves, with Home Assistant's language | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
-| `async_get_ceiling(hass, user, language)` | No | At every consent screen, with the user's language, and when the user approves, with Home Assistant's language | The most this user may grant, or `None` |
+| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; at every consent screen and on Connected applications, with the user's language; and when the user approves or a [session from before your description](#sessions-from-before-your-description) is refreshed, with Home Assistant's language | The description, with its text in `language` |
+| `async_get_availability(hass, language)` | No | At every consent screen, with the user's language, and when the user approves or a session from before your description is refreshed, with Home Assistant's language | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
+| `async_get_ceiling(hass, user, language)` | No | At every consent screen, with the user's language, and when the user approves or a session from before your description is refreshed, with Home Assistant's language | The most this user may grant, or `None` |
 
 When the user approves, all three are asked again and their answers must still be valid. The choice is checked against that description and ceiling; availability does not change what may be approved.
 
@@ -59,6 +59,7 @@ Availability and the ceiling are functions rather than part of the description b
     "scopes": {...},          # every scope you understand
     "presets": [...],         # the levels, lowest first
     "default_preset": "read", # optional: preselected the first time
+    "existing_sessions_preset": "admin",  # optional: what sessions from before get
     "sections": [...],        # the areas, in groups with a heading
 }
 ```
@@ -72,6 +73,7 @@ Availability and the ceiling are functions rather than part of the description b
 | `scopes` | Every scope a choice can grant: `{scope: {"title": ..., "description": ...}}`, a title and one sentence each. They are advertised in the provider's discovery documents. |
 | `presets` | The levels, in order from least to most. See below. |
 | `default_preset` | The level preselected the first time a user meets a client. Defaults to the first preset. Afterwards the user's last choice for that client is preselected. |
+| `existing_sessions_preset` | The level a session that began before your integration described itself gets at its next refresh, so it keeps working without the user. Name the preset closest to what such a token could do at your resource before. Optional; without it such a session ends at that refresh. See [Sessions from before your description](#sessions-from-before-your-description). |
 | `sections` | The groups of areas, in order, each with a heading. See below. |
 
 ### Sections, groups and options
@@ -182,7 +184,7 @@ A description is checked when it is collected, and every answer is checked when 
 - `resource`, `name`, `scopes`, `presets` and `sections` are required; text is a non-empty string.
 - Ids are lower case letters and digits joined by single `-` or `_`, up to 64 characters. Group ids are unique across sections; option ids are unique in their group; preset and section ids are unique.
 - Scopes are OAuth scope tokens (printable ASCII without spaces, `"` or `\`) and may not be one of the provider's own (`openid`, `profile`, `email`, `groups`). Every scope an option or preset grants is declared under `scopes`.
-- A group has at least two options; a preset chooses a known option for every group; no two presets choose the same; `default_preset` names a preset.
+- A group has at least two options; a preset chooses a known option for every group; no two presets choose the same; `default_preset` and `existing_sessions_preset` name presets.
 - Conditions name groups and options that exist.
 - Resource paths start with a single `/`, name more than `/` and have no query or fragment; URLs are `http` or `https`, without credentials or a fragment. Neither may hold whitespace, control characters, or `.` or `..` segments (also percent-encoded). No two integrations may describe the same resource, compared as above.
 - Availability names known groups, each with a reason. A ceiling names known groups, each with a known `max` and a reason, and known presets in `locked_presets`, leaving at least one unlocked, plus a top-level reason.
@@ -206,9 +208,12 @@ An access token for your resource has your resource in `aud` (as today) and the 
 - The scopes come from the user's choice, whatever the client asked for. The client learns them from the token response's `scope` (RFC 6749 §3.3).
 - A choice that is exactly a preset with its own `scopes` carries those; any other choice carries the scopes of each chosen option. Expect both forms.
 - Refreshed tokens carry the same scopes and the same audience.
-- A token for your resource with none of your scopes grants nothing there. That is a token for which the user chose options that grant no scopes, such as the lowest everywhere, and an access token issued before your integration described itself. The provider gives you no way to tell the two apart, and you need none: a resource that enforces its scopes refuses such a token at once.
+- A token for your resource with none of your scopes grants nothing there. That is a token for which the user chose options that grant no scopes, such as the lowest everywhere, and an access token of a session from before your description, until that session's next refresh gives it access. The provider gives you no way to tell the two apart, and you need none: a resource that enforces its scopes refuses such a token at once.
 - Refuse a request whose token lacks the scopes it needs with `403` and a challenge that names them with `openid`, such as `WWW-Authenticate: Bearer error="insufficient_scope", scope="openid mcp:control"` (RFC 6750 §3.1). An MCP client then goes back through authorization, where the user chooses.
-- A session that began before your integration described itself carries no choice, so the provider also ends it at its next refresh with `invalid_grant`, and the client signs in again.
+- A token with none of your scopes may be refused either way, and each answer leads somewhere else:
+  - `401` with `WWW-Authenticate: Bearer error="invalid_token"` makes the client refresh. That refresh gives a session from before your description the access you name for it, so the client carries on without asking the user. If the refreshed token still carries none of your scopes, your next `401` makes the client start authorization again, where the user chooses.
+  - `403` with `error="insufficient_scope"`, and `openid` in the challenge's `scope`, sends the client straight to authorization, where the user chooses. The client does not refresh first, so a session from before your description does not get the access you name for it.
+- A session that began before your integration described itself carries no choice. At its next refresh it gets the access you name in `existing_sessions_preset`, or ends with `invalid_grant` and the client signs in again; see [Sessions from before your description](#sessions-from-before-your-description).
 - The provider refuses to bind a token to your resource when the client names it only at the token endpoint, with `invalid_target`, since the user was not asked. That check matches the indicator on the address the token request arrived at, so it is best effort. A token it misses carries none of your scopes, so it grants nothing.
 
 Read the claims with the provider's validator, as you do now, and require your own audience:
@@ -226,6 +231,16 @@ scopes = set((claims or {}).get("scope", "").split())
 ```
 
 Then decide what the request may do from those scopes, limited by what your integration has switched on and by the user's ceiling. The provider enforces none of it.
+
+## Sessions from before your description
+
+A session that began before your integration described itself carries no choice of your access, and its tokens carry none of your scopes. So does a session approved on the plain screen while your module could not answer. The provider settles such a session's access at its next refresh:
+
+- When the description it collected names `existing_sessions_preset`, it asks your module for the description and the user's ceiling, as when a user approves, and takes the preset that description names. Each group's option is held at the ceiling's `max` for that group where it is above it. If the result is a choice the user may make, the session keeps it as its access, as if the user had chosen it: the refreshed token and every later one carry its scopes, and Connected applications shows it. The scopes follow the rule for any choice, so the preset's own `scopes` when nothing was held at the ceiling, and otherwise those of each option, or those of another preset the result is exactly. It is not remembered as the user's choice, so the user's next consent screen for that client still opens on the user's own last choice or on `default_preset`.
+- The session ends at that refresh with `invalid_grant`, and the client signs in again where the user chooses, when the description names no `existing_sessions_preset`, when the result is exactly the choice of a preset the ceiling locks (see [The ceiling](#the-ceiling)), or when the user no longer exists.
+- When your module fails, does not answer within 10 seconds, or gives an answer that does not validate, the session is refreshed without your scopes and the provider logs a warning. The next refresh asks again.
+
+The access token such a session already holds, valid for up to an hour, carries none of your scopes until the client refreshes. How you refuse it decides whether the client refreshes first; see [What arrives in the token](#what-arrives-in-the-token).
 
 ## Scopes in your metadata and challenges
 
@@ -409,6 +424,8 @@ DESCRIPTION: dict[str, Any] = {
         },
     ],
     "default_preset": "read",
+    # Tokens could do everything here before this description existed
+    "existing_sessions_preset": "admin",
     "sections": [
         {"id": "devices", "title": "Devices", "groups": [ENTITIES, CAMERAS]},
         {"id": "setup", "title": "Setup", "groups": [DASHBOARDS, TEMPLATES]},

@@ -5,9 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from custom_components.oidc_provider.resource_description import (
+    existing_sessions_options,
     granted_scopes,
     validate_availability,
     validate_ceiling,
+    validate_choice,
     validate_description,
 )
 
@@ -45,3 +47,10 @@ async def test_the_complete_example_is_a_valid_description():
         "mcp:dashboards:read",
         "mcp:templates:read",
     ]
+    # A session from before gets Administer, which a user limited to no files gets held at
+    # the choice of Edit the setup
+    assert existing_sessions_options(description, None) == description["presets"][3]["options"]
+    options = validate_choice(
+        description, ceiling, {"options": existing_sessions_options(description, ceiling)}
+    )
+    assert granted_scopes(description, options) == ["mcp:configure"]
