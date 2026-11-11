@@ -62,7 +62,7 @@ If you switch from a fork of this integration that stores the same setting, a va
 
 Administrators manage clients on a page inside Home Assistant. Open **Settings** → **Devices & Services** → **OIDC Provider** → **Configure** and follow the **Manage clients** link, or go to `https://your-ha-instance/oidc_login?tab=clients`.
 
-The **Clients** tab lists every client with its client ID, redirect URIs, whether it shows the [consent screen](#consent-screen), its number of active sessions and how it identifies itself: registered by an administrator, registered by itself through dynamic registration, or identified by a [metadata document](#client-id-metadata-documents). From there you can:
+The **Clients** tab lists every registered client with its client ID, redirect URIs, whether it shows the [consent screen](#consent-screen), its number of active sessions and whether it registered itself through dynamic registration. A client identified by a [metadata document](#client-id-metadata-documents) is not stored, so it is listed while it holds a session. A client that registered itself before version 1.8.0 is listed as registered, like the ones you created, because those releases did not record the difference. From there you can:
 
 - **Register a client**: enter a name and its redirect URIs, one per line. The client ID and client secret are shown once, each with a copy button. The secret is stored only as a hash and cannot be shown again
 - **Edit** a client's redirect URIs and whether it requires consent

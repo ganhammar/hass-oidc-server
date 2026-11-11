@@ -1289,6 +1289,9 @@ async def test_user_lists_and_ends_their_sessions(
 
     resp = await client.delete(f"/api/oidc_provider/sessions/{session['session_id']}")
     assert resp.status == 200
+    # It is gone, which the path without the /api prefix reports too
+    resp = await client.delete(f"/oidc/sessions/{session['session_id']}")
+    assert resp.status == 404
 
     assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
     resp = await client.get("/api/oidc_provider/sessions")
@@ -1355,7 +1358,7 @@ async def test_admin_manages_clients_from_the_page(
     hass_client: ClientSessionGenerator,
     metadata_document: list[str],
 ) -> None:
-    """The Clients tab registers, edits and revokes over /oidc/clients, as the actions do."""
+    """The Clients tab registers, edits and revokes over its API view, as the actions do."""
     client = await hass_client()
 
     resp = await client.post(

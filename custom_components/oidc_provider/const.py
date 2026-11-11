@@ -111,6 +111,8 @@ REGISTRATION_RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
 MAX_UNUSED_DYNAMIC_CLIENTS = 200
 
 # How a client came to be known, as the client management page names it. A
+# registered client is stored without the dynamic marker: an administrator
+# registered it, or it registered itself on a release that kept no marker. A
 # metadata document client is not stored and is known through its sessions.
 CLIENT_KIND_REGISTERED = "registered"
 CLIENT_KIND_DYNAMIC = "dynamic"

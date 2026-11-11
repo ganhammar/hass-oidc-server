@@ -57,6 +57,7 @@ def _json(response):
 def _stored_client(**overrides) -> dict:
     return {
         "client_name": "Grafana",
+        "client_secret_hash": "hash-of-the-secret",
         "redirect_uris": ["https://grafana.example.com/login"],
         "consent_required": False,
         "created_at": 1700000000.0,
@@ -160,6 +161,15 @@ async def test_register_returns_the_secret_once():
     assert managed_clients(hass)[0]["registration"] == "registered"
 
 
+async def test_register_tolerates_a_stored_client_without_a_name():
+    hass = _hass({"old": {"redirect_uris": []}})
+    request = _request(hass, {"client_name": "App", "redirect_uris": ["https://a.example.com/cb"]})
+
+    response = await OIDCClientsView().post(request)
+
+    assert response.status == 201
+
+
 async def test_register_skips_consent_unless_asked():
     hass = _hass()
     request = _request(hass, {"client_name": "App", "redirect_uris": ["https://a.example.com/cb"]})
@@ -229,6 +239,7 @@ async def test_update_changes_redirect_uris_and_consent():
     updated = _json(response)
     assert updated["redirect_uris"] == ["https://new.example.com/cb"]
     assert updated["consent_required"] is True
+    assert "secret" not in response.body.decode()
     # Editing a client leaves its sessions alone
     assert updated["active_sessions"] == 1
     stored = hass.data[DOMAIN]["clients"]["abc"]

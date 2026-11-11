@@ -26,9 +26,15 @@ const SESSIONS_ERROR_HINT =
 
 const CLIENTS_ERROR_HINT = 'The clients could not be loaded. Reload the page to try again.';
 
+const REVOKE_ERROR_HINT =
+  'The client could not be revoked. Reload the page to see whether it is still listed.';
+
+// A stored client without the dynamic marker was registered by an
+// administrator, or by itself on a release that did not record that, so the
+// label does not say who registered it.
 const CLIENT_KINDS = {
-  registered: 'Registered by an administrator',
-  dynamic: 'Registered itself (dynamic registration)',
+  registered: 'Registered',
+  dynamic: 'Registered by itself (dynamic registration)',
   metadata_document: 'Identified by a metadata document',
 };
 
@@ -83,6 +89,9 @@ const STYLES = `
     position: relative;
     padding: 16px;
   }
+  .card-content h1:focus {
+    outline: none;
+  }
   .card-content h1 {
     font-size: var(--ha-font-size-3xl, 28px);
     font-weight: var(--ha-font-weight-normal, 400);
@@ -127,7 +136,7 @@ const STYLES = `
     font-size: var(--ha-font-size-m, 14px);
     cursor: pointer;
   }
-  .oidc-tabs button[aria-selected="true"] {
+  .oidc-tabs button[aria-current="page"] {
     color: var(--primary-color, #03a9f4);
     border-bottom-color: var(--primary-color, #03a9f4);
   }
@@ -241,7 +250,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._requestId = requestId;
     this._renderCard(`
-      <h1>One moment</h1>
+      <h1 tabindex="-1">One moment</h1>
       <p>Loading the authorization request.</p>
     `);
 
@@ -284,12 +293,14 @@ class OidcLoginPanel extends HTMLElement {
     this._tab = tab;
     try {
       if (tab === 'clients') {
-        await this._renderClients();
+        await this._renderClients(notice, 'info');
       } else {
         await this._renderSessions(notice);
       }
     } catch (error) {
-      this._renderError(error, tab === 'clients' ? CLIENTS_ERROR_HINT : SESSIONS_ERROR_HINT);
+      if (this._tab === tab) {
+        this._renderError(error, tab === 'clients' ? CLIENTS_ERROR_HINT : SESSIONS_ERROR_HINT);
+      }
     }
   }
 
@@ -309,8 +320,8 @@ class OidcLoginPanel extends HTMLElement {
       return '';
     }
     const tab = (id, label) =>
-      `<button type="button" role="tab" data-tab="${id}" aria-selected="${this._tab === id}">${label}</button>`;
-    return `<div class="oidc-tabs" role="tablist">${tab('sessions', 'Connected applications')}${tab('clients', 'Clients')}</div>`;
+      `<button type="button" data-tab="${id}"${this._tab === id ? ' aria-current="page"' : ''}>${label}</button>`;
+    return `<nav class="oidc-tabs" aria-label="Sections">${tab('sessions', 'Connected applications')}${tab('clients', 'Clients')}</nav>`;
   }
 
   _renderConsent(details) {
@@ -333,7 +344,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-        <h1>Approve access?</h1>
+        <h1 tabindex="-1">Approve access?</h1>
         <p>If you continue, you will be sent to <b><bdi>${escapeHtml(details.redirect_host)}</bdi></b>. The application will be able to see:</p>
         <ul>${scopes.join('')}</ul>
         ${loopbackNote}
@@ -387,7 +398,7 @@ class OidcLoginPanel extends HTMLElement {
     sessionStorage.removeItem('oidc_request_id');
 
     this._renderCard(`
-      <h1>${approve ? 'Access approved' : 'Access denied'}</h1>
+      <h1 tabindex="-1">${approve ? 'Access approved' : 'Access denied'}</h1>
       <p>Sending you back to the application.</p>
     `);
     window.location.href = data.redirect_url;
@@ -395,6 +406,10 @@ class OidcLoginPanel extends HTMLElement {
 
   async _renderSessions(notice = '') {
     const { sessions } = await this._fetchJson(SESSIONS_URL);
+    // The user may have switched tabs while the list was on its way
+    if (this._home && this._tab !== 'sessions') {
+      return;
+    }
     const formatTime = (seconds) => (seconds ? new Date(seconds * 1000).toLocaleString() : 'never');
     const items = sessions.map((session) => {
       const host = session.client_host ? ` from <bdi>${escapeHtml(session.client_host)}</bdi>` : '';
@@ -411,7 +426,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-      <h1>Connected applications</h1>
+      <h1 tabindex="-1">Connected applications</h1>
       ${
         items.length
           ? `<p>These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.</p>${items.join('')}`
@@ -438,8 +453,11 @@ class OidcLoginPanel extends HTMLElement {
     }
   }
 
-  async _renderClients(notice = '') {
+  async _renderClients(notice = '', noticeType = 'success') {
     const { clients } = await this._fetchJson(CLIENTS_URL);
+    if (this._tab !== 'clients') {
+      return;
+    }
     this._clients = clients;
     const items = clients.map((client, index) => {
       const stored = client.registration !== 'metadata_document';
@@ -473,14 +491,14 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-        <h1>Clients</h1>
+        <h1 tabindex="-1">Clients</h1>
         <p>The applications that can sign users in through this Home Assistant. A client you register gets a client ID and a secret to configure in the application.</p>
         <div class="action">
           <ha-button id="oidc-register">Register a client</ha-button>
         </div>
         ${items.length ? items.join('') : '<p>No clients are registered.</p>'}
       `,
-      notice ? `<ha-alert alert-type="success">${escapeHtml(notice)}</ha-alert>` : '',
+      notice ? `<ha-alert alert-type="${noticeType}">${escapeHtml(notice)}</ha-alert>` : '',
       true
     );
 
@@ -513,7 +531,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-        <h1>${client ? 'Edit client' : 'Register a client'}</h1>
+        <h1 tabindex="-1">${client ? 'Edit client' : 'Register a client'}</h1>
         ${name}
         <label class="oidc-field">
           <span>Redirect URIs</span>
@@ -546,7 +564,7 @@ class OidcLoginPanel extends HTMLElement {
       consent_required: this.querySelector('#oidc-consent').checked,
     };
     const body = {
-      redirect_uris: values.redirect_uris.split(/[\n,]/).map((uri) => uri.trim()).filter(Boolean),
+      redirect_uris: values.redirect_uris.split('\n').map((uri) => uri.trim()).filter(Boolean),
       consent_required: values.consent_required,
     };
     if (!this._startRequest()) {
@@ -589,7 +607,7 @@ class OidcLoginPanel extends HTMLElement {
     `;
     this._renderCard(
       `
-        <h1>Client registered</h1>
+        <h1 tabindex="-1">Client registered</h1>
         <p>Configure <b><bdi>${escapeHtml(registered.client_name)}</bdi></b> with these credentials.</p>
         ${field('oidc-client-id', 'Client ID', registered.client_id)}
         ${field('oidc-client-secret', 'Client secret', registered.client_secret)}
@@ -597,7 +615,7 @@ class OidcLoginPanel extends HTMLElement {
           <ha-button id="oidc-done">Done</ha-button>
         </div>
       `,
-      '<ha-alert alert-type="warning">Copy the client secret now. It is not stored and cannot be shown again.</ha-alert>',
+      '<ha-alert alert-type="warning">Copy the client secret now. Only a hash of it is stored, so it cannot be shown again.</ha-alert>',
       true
     );
 
@@ -630,7 +648,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-        <h1>${stored ? 'Revoke client?' : 'End sessions?'}</h1>
+        <h1 tabindex="-1">${stored ? 'Revoke client?' : 'End sessions?'}</h1>
         <p><b><bdi>${escapeHtml(client.client_name)}</bdi></b>: ${escapeHtml(consequence)}</p>
         <div class="action">
           <ha-button id="oidc-confirm" variant="danger">${stored ? 'Revoke' : 'End sessions'}</ha-button>
@@ -659,7 +677,7 @@ class OidcLoginPanel extends HTMLElement {
       // Already gone, for instance revoked from another tab: the list shows it.
       if (error.status !== 404) {
         this._busy = false;
-        this._renderError(error, CLIENTS_ERROR_HINT);
+        this._renderError(error, REVOKE_ERROR_HINT);
         return;
       }
     }
@@ -684,7 +702,7 @@ class OidcLoginPanel extends HTMLElement {
       return false;
     }
     this._busy = true;
-    for (const button of this.querySelectorAll('ha-button')) {
+    for (const button of this.querySelectorAll('ha-button, .oidc-tabs button')) {
       button.disabled = true;
     }
     return true;
@@ -749,7 +767,7 @@ class OidcLoginPanel extends HTMLElement {
   ) {
     this._renderCard(
       `
-        <h1>Something went wrong</h1>
+        <h1 tabindex="-1">Something went wrong</h1>
         <p>${escapeHtml(hint)}</p>
       `,
       `<ha-alert alert-type="error">${escapeHtml(error.message)}</ha-alert>`
@@ -773,6 +791,12 @@ class OidcLoginPanel extends HTMLElement {
     for (const button of this.querySelectorAll('.oidc-tabs button')) {
       button.addEventListener('click', () => this._selectTab(button.dataset.tab));
     }
+    // Replacing the content drops keyboard focus, so a change of view moves
+    // it to the new heading, which screen readers then announce.
+    if (this._rendered) {
+      this.querySelector('.card-content h1')?.focus();
+    }
+    this._rendered = true;
   }
 }
 

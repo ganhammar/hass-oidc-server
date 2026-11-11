@@ -230,7 +230,7 @@ async def create_client(
 def client_name_in_use(hass: HomeAssistant, client_name: str) -> bool:
     """Return whether a stored client already has this name."""
     clients = hass.data[DOMAIN].get("clients", {})
-    return any(client["client_name"] == client_name for client in clients.values())
+    return any(client.get("client_name") == client_name for client in clients.values())
 
 
 async def update_client(
