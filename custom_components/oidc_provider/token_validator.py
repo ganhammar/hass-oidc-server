@@ -2,6 +2,7 @@
 
 import ipaddress
 import logging
+import re
 from typing import Any
 
 import jwt
@@ -40,6 +41,26 @@ def _describe_token(token: str) -> str:
     return " ".join(parts)
 
 
+# A host as a request may name it: a name or an address, with or without a port.
+# Anything else in a host header, such as a path, is not a host.
+_HOST_PATTERN = re.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?"
+)
+
+
+def _named_host(request: web.Request) -> str | None:
+    """Return the host the request names, from X-Forwarded-Host or else Host.
+
+    A header that holds anything but a host is passed over, so a client cannot
+    put a path or another URL into the issuer and the addresses built from it.
+    """
+    for header in ("X-Forwarded-Host", "Host"):
+        host = request.headers.get(header)
+        if isinstance(host, str) and _HOST_PATTERN.fullmatch(host):
+            return host
+    return None
+
+
 def _is_ip_host(host: str) -> bool:
     """Return True when host (optionally host:port) is a bare IP address."""
     bare = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
@@ -70,8 +91,10 @@ def get_issuer_from_request(request: web.Request) -> str:
     # and X-Forwarded-Proto without setting X-Forwarded-Host, so fall back to the
     # Host header. The protocol comes from X-Forwarded-Proto when the proxy
     # terminates TLS, otherwise from the request scheme.
-    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host")
-    proto = request.headers.get("X-Forwarded-Proto") or request.url.scheme
+    host = _named_host(request)
+    proto = request.headers.get("X-Forwarded-Proto")
+    if proto not in ("http", "https"):
+        proto = request.url.scheme
 
     if host and not _is_ip_host(host):
         return f"{proto}://{host}"

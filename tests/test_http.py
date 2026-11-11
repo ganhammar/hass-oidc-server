@@ -89,6 +89,47 @@ def test_get_base_url_with_only_forwarded_host():
     request.url.origin.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "forwarded_host",
+    [
+        "example.com/x",
+        "example.com/x/api",
+        "evil.example.com#",
+        "user@example.com",
+        "example.com, proxy.example.com",
+        "exa mple.com",
+        "example.com:port",
+    ],
+)
+def test_a_forwarded_host_that_is_not_a_host_is_passed_over(forwarded_host):
+    """A client cannot put a path or another URL into the issuer through a host header."""
+    request = Mock()
+    request.headers = {
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": forwarded_host,
+        "Host": "ha.example.com",
+    }
+
+    assert get_issuer_from_request(request) == "https://ha.example.com"
+
+
+@pytest.mark.parametrize("host", ["ha.example.com:8443", "[fd00::1]:8123", "homeassistant"])
+def test_a_host_with_a_port_or_without_dots_is_a_host(host):
+    request = Mock()
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
+    request.app = {"hass": Mock(config=Mock(external_url=None))}
+
+    assert get_issuer_from_request(request) == f"https://{host}"
+
+
+def test_a_forwarded_proto_that_is_not_http_is_passed_over():
+    request = Mock()
+    request.headers = {"X-Forwarded-Proto": "javascript", "X-Forwarded-Host": "example.com"}
+    request.url.scheme = "http"
+
+    assert get_issuer_from_request(request) == "http://example.com"
+
+
 def test_get_base_url_with_host_header_and_forwarded_proto():
     """A proxy that forwards the Host header and X-Forwarded-Proto (e.g. a
     Cloudflare Tunnel) but omits X-Forwarded-Host still yields the client host."""
