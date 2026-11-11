@@ -39,6 +39,7 @@ from .const import DOMAIN, STORAGE_KEY_ACCESS_CHOICES, STORAGE_VERSION
 from .resource_description import (
     InvalidDescription,
     consent_model,
+    existing_sessions_options,
     known_options,
     resource_matches,
     resources_overlap,
@@ -221,6 +222,33 @@ async def _async_ask(
     return description, availability, ceiling
 
 
+def _choice_model(
+    described: DescribedResource,
+    description: dict[str, Any],
+    availability: dict[str, str],
+    ceiling: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return what a choice of access shows of a resource, without the choice it opens on."""
+    return {
+        "resource": described.domain,
+        **consent_model(description),
+        "unavailable": availability,
+        "ceiling": ceiling,
+    }
+
+
+async def _async_remembered_options(
+    hass: HomeAssistant,
+    description: dict[str, Any],
+    user_id: str,
+    client_id: str,
+    resource: str,
+) -> dict[str, str] | None:
+    """Return the entries of a user's last choice for a client that the description still has."""
+    remembered = await async_remembered_choice(hass, user_id, client_id, resource)
+    return known_options(description, remembered) or None
+
+
 async def async_consent_access(
     hass: HomeAssistant,
     described: DescribedResource,
@@ -238,13 +266,56 @@ async def async_consent_access(
     if answers is None:
         return None
     description, availability, ceiling = answers
-    remembered = await async_remembered_choice(hass, user.id, client_id, described.domain)
     return {
-        "resource": described.domain,
-        **consent_model(description),
-        "unavailable": availability,
-        "ceiling": ceiling,
-        "remembered": known_options(description, remembered) or None,
+        **_choice_model(described, description, availability, ceiling),
+        "remembered": await _async_remembered_options(
+            hass, description, user.id, client_id, described.domain
+        ),
+    }
+
+
+async def async_session_access(
+    hass: HomeAssistant,
+    described: DescribedResource,
+    user: User,
+    client_id: str,
+    access: dict[str, Any] | None,
+    language: str,
+) -> dict[str, Any] | None:
+    """Return what changing a session's access shows of its resource, in the user's language.
+
+    That is what the consent screen shows, with the options the choice opens
+    on in current: the session's own, or for a session without a choice at
+    this resource, the access such a session gets at its next refresh (see
+    existing_sessions_options). When the description names no access for
+    such sessions, current is None and remembered holds the user's last
+    choice for the client, so the choice opens as the consent screen would.
+    None when the resource cannot answer.
+    """
+    answers = await _async_ask(
+        hass,
+        described,
+        user,
+        language,
+        f"Not offering to change the access of a session of client {client_id} at "
+        f"integration {described.label}",
+    )
+    if answers is None:
+        return None
+    description, availability, ceiling = answers
+    current = remembered = None
+    if access and access.get("resource") == described.domain:
+        current = known_options(description, access.get("options")) or None
+    else:
+        current = existing_sessions_options(description, ceiling)
+        if current is None:
+            remembered = await _async_remembered_options(
+                hass, description, user.id, client_id, described.domain
+            )
+    return {
+        **_choice_model(described, description, availability, ceiling),
+        "remembered": remembered,
+        "current": current,
     }
 
 

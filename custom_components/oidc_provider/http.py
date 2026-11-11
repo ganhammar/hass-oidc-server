@@ -89,6 +89,7 @@ from .resources import (
     async_consent_access,
     async_display_model,
     async_remember_choice,
+    async_session_access,
     find_resource,
     resource_scopes,
 )
@@ -445,34 +446,84 @@ def _client_display(hass: HomeAssistant, client_id: str, data: dict[str, Any]) -
     }
 
 
+def _session_entry(
+    hass: HomeAssistant, key: str, tokens: list[tuple[str, dict[str, Any]]]
+) -> dict[str, Any]:
+    """Return one session as the user's list of sessions shows it."""
+    _, data = tokens[0]
+    last_used = max((d.get("issued_at") or 0 for _, d in tokens), default=0)
+    access = data.get("access")
+    described = find_resource(hass, data.get("resource"))
+    return {
+        "session_id": _session_id(key),
+        **_client_display(hass, data["client_id"], data),
+        "scopes": (data.get("scope") or "").split(),
+        # The access the user chose at the session's resource, as the
+        # option chosen in each group of the resource's description
+        "access": (
+            {"resource": access["resource"], "options": access["options"]} if access else None
+        ),
+        # The integration whose description the session's resource matches,
+        # where the user can change the session's access
+        "access_offered_by": described.domain if described else None,
+        "signed_in_at": data.get("auth_time"),
+        "last_used_at": last_used or None,
+        "expires_at": int(data["expires_at"]),
+    }
+
+
 def user_sessions(hass: HomeAssistant, user_id: str) -> list[dict[str, Any]]:
     """Return a user's live sessions, most recently used first."""
-    sessions = []
-    for key, tokens in _live_sessions(hass).items():
-        _, data = tokens[0]
-        if data.get("user_id") != user_id:
-            continue
-        last_used = max((d.get("issued_at") or 0 for _, d in tokens), default=0)
-        access = data.get("access")
-        sessions.append(
-            {
-                "session_id": _session_id(key),
-                **_client_display(hass, data["client_id"], data),
-                "scopes": (data.get("scope") or "").split(),
-                # The access the user chose at the session's resource, as the
-                # option chosen in each group of the resource's description
-                "access": (
-                    {"resource": access["resource"], "options": access["options"]}
-                    if access
-                    else None
-                ),
-                "signed_in_at": data.get("auth_time"),
-                "last_used_at": last_used or None,
-                "expires_at": int(data["expires_at"]),
-            }
-        )
+    sessions = [
+        _session_entry(hass, key, tokens)
+        for key, tokens in _live_sessions(hass).items()
+        if tokens[0][1].get("user_id") == user_id
+    ]
     sessions.sort(key=lambda session: session["last_used_at"] or 0, reverse=True)
     return sessions
+
+
+def _user_session(
+    hass: HomeAssistant, user_id: str, session_id: str
+) -> tuple[str, list[tuple[str, dict[str, Any]]]] | None:
+    """Return the key and refresh tokens of one of a user's live sessions.
+
+    Sessions of other users are not found.
+    """
+    return next(
+        (
+            (key, tokens)
+            for key, tokens in _live_sessions(hass).items()
+            if _session_id(key) == session_id and tokens[0][1].get("user_id") == user_id
+        ),
+        None,
+    )
+
+
+def _openid_connect_scopes(scope: str) -> str:
+    """Return the OpenID Connect scopes of a grant's scope, in the order granted."""
+    return " ".join(granted for granted in scope.split() if granted in SUPPORTED_SCOPES)
+
+
+def _change_session_access(hass: HomeAssistant, key: str, access: dict[str, Any]) -> bool:
+    """Give every stored refresh token of a session new access. Returns whether one was.
+
+    The access replaces the session's access, and its scopes replace the
+    resource's scopes in the session's scope; the OpenID Connect scopes stay.
+    Each token gets both at once, before anything awaits, so a refresh finds
+    the session with its old access or its new one, never between. The
+    tokens are updated in place, so a refresh issuing tokens for one of them
+    sees the change (see OIDCTokenView._refresh_response), and rotation and
+    reuse detection carry on as before.
+    """
+    now = time.time()
+    changed = False
+    for token, data in hass.data[DOMAIN]["refresh_tokens"].items():
+        if _session_key(token, data) == key and data["expires_at"] >= now:
+            data["access"] = access
+            data["scope"] = _with_access_scopes(_openid_connect_scopes(data["scope"]), access)
+            changed = True
+    return changed
 
 
 def client_sessions(hass: HomeAssistant) -> dict[str, dict[str, Any]]:
@@ -728,6 +779,7 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
     hass.http.register_view(OIDCRevocationView())
     hass.http.register_view(OIDCSessionsView())
     hass.http.register_view(OIDCSessionView())
+    hass.http.register_view(OIDCSessionAccessView())
     hass.http.register_view(OIDCStringsView())
     hass.http.register_view(OIDCClientsView())
 
@@ -1764,6 +1816,11 @@ class OIDCTokenView(HomeAssistantView):
         granted without a choice of that access, first gets the access the
         resource gives such sessions, or is ended, or goes on without it while
         the resource cannot answer (see _settle_access_from_before).
+
+        The tokens carry the session's scope as it is when they are done: a
+        session whose scope changes while they are issued, because another
+        refresh gave it access or the user changed its access, gets them
+        issued again with the new scope.
         """
         if not token_data.get("access"):
             described = find_resource(hass, token_data.get("resource"))
@@ -1774,10 +1831,29 @@ class OIDCTokenView(HomeAssistantView):
                 if refusal is not None:
                     return refusal
 
-        # Read once, so the tokens and the response agree even if another
-        # refresh of the session gives it access while they are issued
-        scope = token_data["scope"]
+        while True:
+            # Read once per issue, so the tokens and the response agree
+            scope = token_data["scope"]
+            response_body = await self._refreshed_tokens(
+                _request, hass, refresh_token, token_data, scope
+            )
 
+            # The session may have been revoked while these tokens were being
+            # issued, by reuse detection, a sign-out or the revocation endpoint.
+            if hass.data[DOMAIN]["refresh_tokens"].get(refresh_token) is not token_data:
+                return web.json_response({"error": "invalid_grant"}, status=400)
+            if token_data["scope"] == scope:
+                return web.json_response(response_body)
+
+    async def _refreshed_tokens(
+        self,
+        _request: web.Request,
+        hass: HomeAssistant,
+        refresh_token: str,
+        token_data: dict[str, Any],
+        scope: str,
+    ) -> dict[str, Any]:
+        """Return the body of a refresh response: new tokens carrying the given scope."""
         # The access token keeps the original resource binding (RFC 8707), so
         # refreshed tokens stay valid at the same resource.
         access_token = await self._generate_access_token(
@@ -1811,13 +1887,7 @@ class OIDCTokenView(HomeAssistantView):
                 auth_time=token_data.get("auth_time"),
                 access_token=access_token,
             )
-
-        # The session may have been revoked while these tokens were being
-        # issued, by reuse detection, a sign-out or the revocation endpoint.
-        if hass.data[DOMAIN]["refresh_tokens"].get(refresh_token) is not token_data:
-            return web.json_response({"error": "invalid_grant"}, status=400)
-
-        return web.json_response(response_body)
+        return response_body
 
     @staticmethod
     async def _access_from_before(
@@ -2397,23 +2467,28 @@ class OIDCSessionsView(HomeAssistantView):
         """List the user's live sessions.
 
         With them comes the description of every resource a session chose
-        access at, in the language the panel asks for, so the panel can name
-        what was granted. A session whose resource cannot be described now is
-        listed without its access.
+        access at, or can choose it at, in the language the panel asks for,
+        so the panel can name what was granted. A session whose resource
+        cannot be described now is listed without its access, and without
+        the integration where its access can be changed.
         """
         hass = request.app["hass"]
         user = request["hass_user"]
         sessions = user_sessions(hass, user.id)
         language = _panel_language(hass, request.query.get("language"))
         resources: dict[str, dict[str, Any] | None] = {}
-        for session in sessions:
-            if session["access"] is None:
-                continue
-            domain = session["access"]["resource"]
+
+        async def model(domain: str) -> dict[str, Any] | None:
             if domain not in resources:
                 resources[domain] = await async_display_model(hass, domain, language)
-            if resources[domain] is None:
+            return resources[domain]
+
+        for session in sessions:
+            if session["access"] is not None and await model(session["access"]["resource"]) is None:
                 session["access"] = None
+            offered_by = session["access_offered_by"]
+            if offered_by is not None and await model(offered_by) is None:
+                session["access_offered_by"] = None
         return web.json_response(
             {
                 "sessions": sessions,
@@ -2434,14 +2509,151 @@ class OIDCSessionView(HomeAssistantView):
         """End one of the user's sessions. Sessions of other users are not found."""
         hass = request.app["hass"]
         user = request["hass_user"]
-        for key, tokens in _live_sessions(hass).items():
-            _, data = tokens[0]
-            if _session_id(key) == session_id and data.get("user_id") == user.id:
-                _revoke_session(hass, key)
-                await _save_refresh_tokens(hass)
-                _LOGGER.info("User %s ended a session of client %s", user.id, data["client_id"])
-                return web.json_response({"revoked": True})
-        return web.json_response({"error": "not_found"}, status=404)
+        session = _user_session(hass, user.id, session_id)
+        if session is None:
+            return web.json_response({"error": "not_found"}, status=404)
+        key, tokens = session
+        _revoke_session(hass, key)
+        await _save_refresh_tokens(hass)
+        _LOGGER.info("User %s ended a session of client %s", user.id, tokens[0][1]["client_id"])
+        return web.json_response({"revoked": True})
+
+
+def _session_access_error(error: str, message: str, status: int) -> web.Response:
+    """Return an answer about a session's access that the panel can show."""
+    return web.json_response({"error": error, "message": message}, status=status)
+
+
+class OIDCSessionAccessView(HomeAssistantView):
+    """The access one of the signed-in user's sessions has at its resource.
+
+    The user changes it on Connected applications with the same choice as on
+    the consent screen. GET describes the choice, PUT makes it. Only the
+    session's own user finds it, and only while its resource describes the
+    access it offers.
+    """
+
+    url = "/api/oidc_provider/sessions/{session_id}/access"
+    name = "api:oidc:session:access"
+    requires_auth = True
+
+    @staticmethod
+    def _find(
+        hass: HomeAssistant, user_id: str, session_id: str
+    ) -> tuple[str, dict[str, Any], DescribedResource] | web.Response:
+        """Return the session's key, its stored data and its resource, or the error response."""
+        session = _user_session(hass, user_id, session_id)
+        if session is None:
+            return _session_access_error("not_found", "No such session", 404)
+        key, tokens = session
+        _, data = tokens[0]
+        described = find_resource(hass, data.get("resource"))
+        if described is None:
+            return _session_access_error(
+                "not_offered", "The session's resource offers no choice of access", 409
+            )
+        return key, data, described
+
+    async def get(self, request: web.Request, session_id: str) -> web.Response:
+        """Describe the choice of the session's access, in the language the panel asks for.
+
+        It is what the consent screen shows of the resource, with the user's
+        ceiling and availability as they are now, and the options the choice
+        opens on (see async_session_access).
+        """
+        hass = request.app["hass"]
+        user = request["hass_user"]
+        found = self._find(hass, user.id, session_id)
+        if isinstance(found, web.Response):
+            return found
+        _, data, described = found
+
+        access = await async_session_access(
+            hass,
+            described,
+            user,
+            data["client_id"],
+            data.get("access"),
+            _panel_language(hass, request.query.get("language")),
+        )
+        if access is None:
+            return _session_access_error(
+                "unavailable", "The access cannot be described right now. Try again later.", 503
+            )
+        display = _client_display(hass, data["client_id"], data)
+        return web.json_response(
+            {
+                "client_name": display["client_name"],
+                "client_host": display["client_host"],
+                "access": access,
+            }
+        )
+
+    async def put(self, request: web.Request, session_id: str) -> web.Response:
+        """Change the session's access to the choice in the body: {"options": {...}}.
+
+        The choice is checked as an approval on the consent screen checks it,
+        against the description and the user's ceiling asked for now. A
+        choice that fits replaces the session's access and the resource's
+        scopes in its scope, and becomes the user's choice for the client
+        next time. Tokens already issued keep their scopes until they
+        expire; the session's next refresh carries the new ones.
+        """
+        hass = request.app["hass"]
+        user = request["hass_user"]
+        try:
+            choice = await request.json()
+        except ValueError:
+            choice = None
+        if not isinstance(choice, dict):
+            return _session_access_error(
+                "invalid_request", "The request body must be a JSON object", 400
+            )
+
+        found = self._find(hass, user.id, session_id)
+        if isinstance(found, web.Response):
+            return found
+        key, data, described = found
+        client_id = data["client_id"]
+
+        rules = await async_access_rules(
+            hass,
+            described,
+            user,
+            f"Not changing the access of a session of client {client_id} at integration "
+            f"{described.label}",
+        )
+        if rules is None:
+            return _session_access_error(
+                "unavailable", "The access cannot be checked right now. Try again later.", 503
+            )
+        description, ceiling = rules
+        try:
+            options = validate_choice(description, ceiling, choice)
+        except InvalidChoice as err:
+            return _session_access_error("invalid_choice", f"Invalid access choice: {err}", 400)
+        access = _access(described, description, options)
+
+        # Changes are made one at a time, so the session and the user's
+        # remembered choice end up with the same one. The session may have
+        # been refreshed or ended while the resource was asked, so it is found
+        # again by its key, its token family, which refreshes keep. A token
+        # from before families gets one at its first refresh, so a change
+        # racing that refresh finds no session and changes nothing.
+        async with hass.data[DOMAIN].setdefault("access_change_lock", asyncio.Lock()):
+            if not _change_session_access(hass, key, access):
+                return _session_access_error("not_found", "No such session", 404)
+            await _save_refresh_tokens(hass)
+            await async_remember_choice(hass, user.id, client_id, access["resource"], options)
+
+        _LOGGER.info(
+            "User %s changed the access of a session of client %s at integration %s to: %s",
+            user.id,
+            client_id,
+            described.label,
+            " ".join(access["scopes"]) or "no scopes",
+        )
+        return web.json_response({"access": {"resource": access["resource"], "options": options}})
 
 
 class OIDCStringsView(HomeAssistantView):
