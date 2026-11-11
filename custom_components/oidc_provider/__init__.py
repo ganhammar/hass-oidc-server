@@ -35,6 +35,7 @@ from .http import (
     revoke_client_sessions,
     setup_http_endpoints,
 )
+from .resources import async_setup_resources
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,8 +88,14 @@ ROTATE_SIGNING_KEY_SCHEMA = vol.Schema(
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the OIDC Provider component."""
+    """Set up the OIDC Provider component.
+
+    Resource descriptions are collected here rather than with the config
+    entry, since an integration platform is processed once per Home
+    Assistant run and an entry can be reloaded.
+    """
     hass.data.setdefault(DOMAIN, {})
+    await async_setup_resources(hass)
     return True
 
 

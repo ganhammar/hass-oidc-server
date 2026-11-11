@@ -1486,3 +1486,73 @@ async def test_concurrent_rotations_do_not_bring_back_the_replaced_key(
     keys = list(hass.data[DOMAIN]["jwt_verification_keys"])
     assert len(keys) == 2
     assert original not in keys
+
+
+# --- Resource servers that describe the access they offer --------------------
+#
+# The stand-in integration under tests/stand_in ships an oidc_provider.py the
+# way another integration would. Home Assistant hands it to the provider
+# through its integration platforms, whichever of the two loads first.
+
+
+async def _setup_stand_in(hass: HomeAssistant) -> None:
+    assert await async_setup_component(hass, "oidc_stand_in", {})
+    await hass.async_block_till_done()
+
+
+def _described_domains(hass: HomeAssistant) -> list[str]:
+    from custom_components.oidc_provider.resources import described_resources
+
+    return [described.domain for described in described_resources(hass)]
+
+
+async def test_description_is_collected_from_a_resource_loaded_after_the_provider(
+    setup_provider: None, hass: HomeAssistant, stand_in
+) -> None:
+    assert _described_domains(hass) == []
+
+    await _setup_stand_in(hass)
+
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_description_is_collected_from_a_resource_loaded_before_the_provider(
+    enable_custom_integrations: None, hass: HomeAssistant, stand_in
+) -> None:
+    await _setup_stand_in(hass)
+
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
+
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_reloading_the_provider_keeps_the_descriptions(
+    setup_provider: None, hass: HomeAssistant, stand_in
+) -> None:
+    """Unloading the entry clears its data; the descriptions are kept for the next setup."""
+    await _setup_stand_in(hass)
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_malformed_description_is_ignored_with_a_warning(
+    setup_provider: None,
+    hass: HomeAssistant,
+    stand_in,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand_in.DESCRIPTION = {**stand_in.DESCRIPTION, "presets": []}
+
+    await _setup_stand_in(hass)
+
+    assert _described_domains(hass) == []
+    assert "Ignoring the resource description of integration oidc_stand_in" in caplog.text
