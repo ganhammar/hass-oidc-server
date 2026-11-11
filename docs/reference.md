@@ -10,7 +10,7 @@ The provider's issuer is your Home Assistant address followed by `/oidc`, such a
 
 1. The host in `X-Forwarded-Host`, or else in `Host`, when it is a host name, with the scheme from `X-Forwarded-Proto` or else the request's own. A header that holds anything but a host, such as a path, is ignored.
 2. When that host is an IP address, or no header names a host, the external URL set under Settings > System > Network, if there is one.
-3. Otherwise the IP address from the header, or Home Assistant's own address when no header names a host.
+3. Otherwise the IP address from the header. When a header was sent but holds no host, Home Assistant's internal URL, and when no host header was sent at all, the address the request arrived at.
 
 The issuer appears in the discovery documents, as `iss` in every token, and as the `iss` parameter on every redirect back to a client (RFC 9207), so a client that talks to several providers can tell them apart. An integration that takes the issuer it expects from `get_issuer_from_request`, as hass-mcp-server does, works it out the same way from the request it receives, so a token is accepted only at the address it was issued at.
 
@@ -52,7 +52,7 @@ The login page and the endpoints behind it need a Home Assistant sign-in, and ar
 - `code_challenge` with `code_challenge_method=S256`, required while [Require PKCE](configuration.md#require-pkce) is on and always for public clients. The method defaults to S256.
 - `resource` names the server the token is for (RFC 8707) and becomes the access token's `aud`. It must be an absolute URI without a fragment; anything else is ignored.
 
-A request that fails these checks is answered with a plain-text `400` page in the browser, not with a redirect to the client; [Troubleshooting](troubleshooting.md#the-browser-shows-a-short-error-instead-of-the-login-page) lists the messages. `prompt`, `max_age` and request objects are not supported.
+A request that fails these checks is answered with a plain-text `400` page in the browser, or `429` when too many sign-ins are in progress, not with a redirect to the client; [Troubleshooting](troubleshooting.md#the-browser-shows-a-short-error-instead-of-the-login-page) lists the messages. `prompt`, `max_age` and request objects are not supported.
 
 After the person approves, the redirect carries `code`, `state` and `iss`. After they deny, it carries `error=access_denied`, `state` and `iss`.
 
@@ -76,7 +76,7 @@ The response holds `access_token`, `token_type` (`Bearer`), `expires_in` (3600),
 
 ### Registration
 
-`/oidc/register` takes a JSON body with `redirect_uris` (required), and optionally `client_name` (default "Dynamically Registered Client"), `grant_types` (`authorization_code` and `refresh_token`), `response_types` (`code`) and `token_endpoint_auth_method` (`none`, `client_secret_post` or `client_secret_basic`). It answers `201` with the client's ID, its secret unless it asked for `none`, and its metadata. The redirect URIs follow the [same rules](clients.md#registering-a-client) as for a client you register. A request that breaks the rules is answered with `400` and `invalid_redirect_uri` or `invalid_client_metadata`. See [Allow dynamic client registration](configuration.md#allow-dynamic-client-registration) for when it is open and how it is limited.
+`/oidc/register` takes a JSON body with `redirect_uris` (required), and optionally `client_name` (default "Dynamically Registered Client"), `grant_types` (`authorization_code` and `refresh_token`), `response_types` (`code`) and `token_endpoint_auth_method` (`none`, `client_secret_post` or `client_secret_basic`). It answers `201` with the client's ID, its secret unless it asked for `none`, and its metadata. The redirect URIs follow the [same rules](clients.md#registering-a-client) as for a client you register. A request that breaks the rules is answered with `400` and `invalid_redirect_uri` or `invalid_client_metadata`, or `invalid_request` when its body is not JSON. See [Allow dynamic client registration](configuration.md#allow-dynamic-client-registration) for when it is open and how it is limited.
 
 ## Discovery documents
 
@@ -155,7 +155,7 @@ A *session* is one sign-in by one person through one client, and its refresh tok
 
 - Every refresh replaces the refresh token with a new one. The session still ends 30 days after sign-in, however often it is refreshed; the application then has to sign the person in again.
 - A replaced refresh token keeps working for 1 minute, so a retried request, or one from another worker of the same client, does not end the session. Presented after that, or by another client, it ends the whole session, since only a leaked token is used that way (RFC 9700).
-- An authorization code is good for one attempt. Presented again after it issued tokens, it ends the session it started.
+- An authorization code is good for one attempt. Presented again within its 10 minutes after it issued tokens, it ends the session it started.
 - A session also ends when the person signs it out on [Connected applications](consent.md#connected-applications), when an administrator [revokes its client](clients.md#revoking-a-client), and when the client revokes its refresh token at `/oidc/revoke`.
 
 When a session ends, its refresh token stops working at once. Access tokens it already handed out keep working until they expire, within the hour.

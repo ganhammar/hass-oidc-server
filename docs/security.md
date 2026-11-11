@@ -6,7 +6,7 @@ What the provider protects against, what it leaves to you, and what to do if a k
 
 ## What the provider protects against
 
-- **A code intercepted on its way back.** PKCE binds each code to the application that started the sign-in. It is required by default, and always for clients without a secret, and only the S256 method is accepted. A code is good for one redemption attempt within 10 minutes, only by the client it was issued to and with the same redirect URI. A code presented again after it issued tokens ends the session it started.
+- **A code intercepted on its way back.** PKCE binds each code to the application that started the sign-in. It is required by default, and always for clients without a secret, and only the S256 method is accepted. A code is good for one redemption attempt within 10 minutes, only by the client it was issued to and with the same redirect URI. A code presented again within those 10 minutes, after it issued tokens, ends the session it started.
 - **A stolen refresh token.** Every refresh replaces the refresh token. A replaced token presented more than a minute later, or one presented by another client, ends the whole session (RFC 9700). However often it is refreshed, a session ends 30 days after sign-in.
 - **A token used at the wrong server.** An access token is bound to the server the client named with `resource` (RFC 8707), and a server that checks its audience, such as hass-mcp-server, refuses tokens meant for another.
 - **A client mixing up providers.** Every redirect back to a client names the issuer (`iss`, RFC 9207), and the discovery documents say so.
