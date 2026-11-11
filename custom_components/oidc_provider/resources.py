@@ -189,13 +189,18 @@ def resource_scopes(hass: HomeAssistant) -> list[str]:
     return scopes
 
 
+def _ignoring_for_sign_in(described: DescribedResource) -> str:
+    return f"Ignoring the resource description of integration {described.label} for this sign-in"
+
+
 async def _async_ask(
-    hass: HomeAssistant, described: DescribedResource, user: User, language: str
+    hass: HomeAssistant, described: DescribedResource, user: User, language: str, unanswered: str
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any] | None] | None:
     """Ask a resource for its description, availability and this user's ceiling.
 
-    Returns None, after logging why, when any answer is missing, malformed or
-    fails, so the sign-in goes on as if the resource had not described itself.
+    Returns None when any answer is missing, malformed or fails, after logging
+    a warning that starts with unanswered, which says what goes on without
+    the answers, and ends with why.
     """
     platform = described.platform
 
@@ -212,27 +217,13 @@ async def _async_ask(
         )
         ceiling = validate_ceiling(description, await optional("async_get_ceiling", user, language))
     except InvalidDescription as err:
-        _LOGGER.warning(
-            "Ignoring the resource description of integration %s for this sign-in: %s",
-            described.label,
-            err,
-        )
+        _LOGGER.warning("%s: %s", unanswered, err)
         return None
     except TimeoutError:
-        _LOGGER.warning(
-            "Ignoring the resource description of integration %s for this sign-in: "
-            "it did not answer within %s seconds",
-            described.label,
-            CALL_TIMEOUT,
-        )
+        _LOGGER.warning("%s: it did not answer within %s seconds", unanswered, CALL_TIMEOUT)
         return None
     except Exception:
-        _LOGGER.warning(
-            "Ignoring the resource description of integration %s for this sign-in: "
-            "asking it failed",
-            described.label,
-            exc_info=True,
-        )
+        _LOGGER.warning("%s: asking it failed", unanswered, exc_info=True)
         return None
     return description, availability, ceiling
 
@@ -250,7 +241,7 @@ async def async_consent_access(
     now, the user's ceiling and the choice the user made for this client last
     time. None when the resource cannot answer.
     """
-    answers = await _async_ask(hass, described, user, language)
+    answers = await _async_ask(hass, described, user, language, _ignoring_for_sign_in(described))
     if answers is None:
         return None
     description, availability, ceiling = answers
@@ -298,10 +289,20 @@ async def async_display_model(
 
 
 async def async_access_rules(
-    hass: HomeAssistant, described: DescribedResource, user: User
+    hass: HomeAssistant, described: DescribedResource, user: User, unanswered: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
-    """Return the description and ceiling a choice is checked against, or None."""
-    answers = await _async_ask(hass, described, user, hass.config.language)
+    """Return the description and ceiling a choice is checked against, or None.
+
+    When the resource cannot answer, the warning logged starts with
+    unanswered, by default that the description is ignored for this sign-in.
+    """
+    answers = await _async_ask(
+        hass,
+        described,
+        user,
+        hass.config.language,
+        unanswered or _ignoring_for_sign_in(described),
+    )
     if answers is None:
         return None
     description, _, ceiling = answers

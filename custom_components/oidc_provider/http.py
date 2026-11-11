@@ -77,8 +77,14 @@ from .const import (
     TOKEN_USE_ACCESS,
     TOKEN_USE_ID,
 )
-from .resource_description import InvalidChoice, granted_scopes, validate_choice
+from .resource_description import (
+    InvalidChoice,
+    existing_sessions_options,
+    granted_scopes,
+    validate_choice,
+)
 from .resources import (
+    DescribedResource,
     async_access_rules,
     async_consent_access,
     async_display_model,
@@ -162,6 +168,21 @@ def _with_access_scopes(scope: str, access: dict[str, Any] | None) -> str:
     if access:
         scopes.extend(granted for granted in access["scopes"] if granted not in scopes)
     return " ".join(scopes)
+
+
+def _access(
+    described: DescribedResource, description: dict[str, Any], options: dict[str, str]
+) -> dict[str, Any]:
+    """Return access at a resource as a grant keeps it.
+
+    That is the resource's integration, the option in every group of its
+    description and the scopes those options grant.
+    """
+    return {
+        "resource": described.domain,
+        "options": options,
+        "scopes": granted_scopes(description, options),
+    }
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -846,11 +867,7 @@ class OIDCContinueView(HomeAssistantView):
             options = validate_choice(description, ceiling, choice)
         except InvalidChoice as err:
             return web.Response(text=f"Invalid access choice: {err}", status=400)
-        return {
-            "resource": described.domain,
-            "options": options,
-            "scopes": granted_scopes(description, options),
-        }
+        return _access(described, description, options)
 
     async def post(self, request: web.Request) -> web.Response:
         """Record the user's decision on the pending request."""
@@ -1748,29 +1765,24 @@ class OIDCTokenView(HomeAssistantView):
         """Issue fresh access and ID tokens for a stored refresh token.
 
         A session whose resource describes the access it offers, but which was
-        granted without a choice of that access, because it began before the
-        resource described itself, is ended instead. The client then signs in
-        again and the user chooses, so every token for such a resource carries
-        a choice, and one without the resource's scopes means no access there.
+        granted without a choice of that access, first gets the access the
+        resource gives such sessions, or is ended, or goes on without it while
+        the resource cannot answer (see _settle_access_from_before).
         """
-        if not token_data.get("access") and find_resource(
-            hass, token_data.get("resource"), get_issuer_from_request(_request)
-        ):
-            _revoke_family(hass, token_data["family"])
-            await _save_refresh_tokens(hass)
-            _LOGGER.info(
-                "Ended a session of client %s granted before its resource described the "
-                "access it offers; the client has to sign in again",
-                token_data["client_id"],
+        if not token_data.get("access"):
+            described = find_resource(
+                hass, token_data.get("resource"), get_issuer_from_request(_request)
             )
-            return web.json_response(
-                {
-                    "error": "invalid_grant",
-                    "error_description": "The resource now asks what this application may "
-                    "do there; sign in again",
-                },
-                status=400,
-            )
+            if described is not None:
+                refusal = await self._settle_access_from_before(
+                    hass, described, refresh_token, token_data
+                )
+                if refusal is not None:
+                    return refusal
+
+        # Read once, so the tokens and the response agree even if another
+        # refresh of the session gives it access while they are issued
+        scope = token_data["scope"]
 
         # The access token keeps the original resource binding (RFC 8707), so
         # refreshed tokens stay valid at the same resource.
@@ -1778,7 +1790,7 @@ class OIDCTokenView(HomeAssistantView):
             _request,
             hass,
             token_data["user_id"],
-            token_data["scope"],
+            scope,
             token_data["client_id"],
             audience=token_data.get("resource"),
         )
@@ -1788,19 +1800,18 @@ class OIDCTokenView(HomeAssistantView):
             "token_type": "Bearer",
             "expires_in": ACCESS_TOKEN_EXPIRY,
             "refresh_token": refresh_token,
-            "scope": token_data["scope"],
+            "scope": scope,
         }
 
         # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
         # Original nonce and auth_time are carried forward; iat/exp/at_hash are
         # fresh. Refresh tokens stored without either field get None from .get().
-        scope_value = token_data["scope"] or ""
-        if SCOPE_OPENID in scope_value.split():
+        if SCOPE_OPENID in (scope or "").split():
             response_body["id_token"] = await self._generate_id_token(
                 _request,
                 hass,
                 token_data["user_id"],
-                token_data["scope"],
+                scope,
                 token_data["client_id"],
                 nonce=token_data.get("nonce"),
                 auth_time=token_data.get("auth_time"),
@@ -1813,6 +1824,106 @@ class OIDCTokenView(HomeAssistantView):
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         return web.json_response(response_body)
+
+    @staticmethod
+    async def _access_from_before(
+        hass: HomeAssistant, described: DescribedResource, token_data: dict[str, Any]
+    ) -> dict[str, Any] | str | None:
+        """Return the access a session granted without a choice of it defaults to.
+
+        That is the preset the description names in existing_sessions_preset,
+        held at the user's ceiling, with the resource asked for its description
+        and the ceiling as when a user approves. Returns why the session ends
+        instead when the resource gives such sessions no access, when that
+        access is not a choice the user may make, or when the user no longer
+        exists. None when the resource cannot answer now.
+        """
+        no_default = f"integration {described.label} gives such sessions no access"
+        if "existing_sessions_preset" not in described.description:
+            return no_default
+        user = await hass.auth.async_get_user(token_data["user_id"])
+        if user is None:
+            return "its user no longer exists"
+        rules = await async_access_rules(
+            hass,
+            described,
+            user,
+            f"Refreshing a session of client {token_data['client_id']} without the scopes of "
+            f"integration {described.label} until it gives the session its access for "
+            "sessions from before",
+        )
+        if rules is None:
+            return None
+        description, ceiling = rules
+        options = existing_sessions_options(description, ceiling)
+        if options is None:
+            return no_default
+        try:
+            options = validate_choice(description, ceiling, {"options": options})
+        except InvalidChoice as err:
+            return f"its user may not have the access such sessions get: {err}"
+        return _access(described, description, options)
+
+    async def _settle_access_from_before(
+        self,
+        hass: HomeAssistant,
+        described: DescribedResource,
+        refresh_token: str,
+        token_data: dict[str, Any],
+    ) -> web.Response | None:
+        """Give a session granted without a choice of access the access it defaults to.
+
+        Such a session began before its resource described the access it
+        offers. The access it gets (see _access_from_before) is stored as the
+        session's access, as if the user had chosen it, so this refresh and
+        every later one carry its scopes. It is not remembered as the user's
+        choice for the next sign-in. When the resource cannot answer now, the
+        session is refreshed without the resource's scopes and the next
+        refresh asks again. When there is no such access for it, the session
+        is ended, and the client signs in again where the user chooses.
+
+        Returns the response that ends the request, or None to issue tokens.
+        """
+        outcome = await self._access_from_before(hass, described, token_data)
+
+        # The session may have changed while the resource was asked: ended, or
+        # given its access by another refresh of it.
+        if hass.data[DOMAIN]["refresh_tokens"].get(refresh_token) is not token_data:
+            return web.json_response({"error": "invalid_grant"}, status=400)
+        if token_data.get("access") or outcome is None:
+            return None
+
+        if isinstance(outcome, dict):
+            # Both are set before anything awaits, so a refresh racing this one
+            # finds the session with its access or without it, never between.
+            token_data["access"] = outcome
+            token_data["scope"] = _with_access_scopes(token_data["scope"], outcome)
+            await _save_refresh_tokens(hass)
+            _LOGGER.info(
+                "Gave a session of client %s, granted before integration %s described the "
+                "access it offers, the access it gives such sessions: %s",
+                token_data["client_id"],
+                described.label,
+                " ".join(outcome["scopes"]) or "no scopes",
+            )
+            return None
+
+        _revoke_family(hass, token_data["family"])
+        await _save_refresh_tokens(hass)
+        _LOGGER.info(
+            "Ended a session of client %s granted before its resource described the "
+            "access it offers, since %s; the client has to sign in again",
+            token_data["client_id"],
+            outcome,
+        )
+        return web.json_response(
+            {
+                "error": "invalid_grant",
+                "error_description": "The resource now asks what this application may "
+                "do there; sign in again",
+            },
+            status=400,
+        )
 
     async def _generate_access_token(
         self,

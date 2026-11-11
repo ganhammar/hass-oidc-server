@@ -199,6 +199,7 @@ DESCRIPTION_SCHEMA = vol.Schema(
         ),
         vol.Required("presets"): vol.All([_PRESET_SCHEMA], vol.Length(min=1)),
         vol.Optional("default_preset"): _identifier,
+        vol.Optional("existing_sessions_preset"): _identifier,
         vol.Required("sections"): vol.All([_SECTION_SCHEMA], vol.Length(min=1)),
     },
     extra=vol.REMOVE_EXTRA,
@@ -227,7 +228,8 @@ def validate_description(data: Any) -> dict[str, Any]:
 
     The structure is checked first, then that every reference between its
     parts resolves: presets name an option for every group, notes name groups
-    and options that exist, and every scope granted is declared.
+    and options that exist, default_preset and existing_sessions_preset name
+    presets, and every scope granted is declared.
     """
     if not isinstance(data, dict):
         raise InvalidDescription("a description must be a dict")
@@ -313,10 +315,9 @@ def validate_description(data: Any) -> dict[str, Any]:
         check_notes(preset["notes"], where)
 
     description.setdefault("default_preset", preset_ids[0])
-    if description["default_preset"] not in preset_ids:
-        raise InvalidDescription(
-            f"default_preset '{description['default_preset']}' is not one of the presets"
-        )
+    for key in ("default_preset", "existing_sessions_preset"):
+        if key in description and description[key] not in preset_ids:
+            raise InvalidDescription(f"{key} '{description[key]}' is not one of the presets")
     return description
 
 
@@ -430,6 +431,30 @@ def validate_choice(
     for preset in description["presets"]:
         if preset["id"] in locked and preset["options"] == options:
             raise InvalidChoice(f"the options are those of preset {preset['id']}, which is locked")
+    return options
+
+
+def existing_sessions_options(
+    description: dict[str, Any], ceiling: dict[str, Any] | None
+) -> dict[str, str] | None:
+    """Return the options a session granted without a choice of access defaults to.
+
+    Those are the options of the preset existing_sessions_preset names, each
+    held at the ceiling's max for its group where it is above it. None when the
+    description names no such preset. The result is a choice like any other,
+    to be checked with validate_choice.
+    """
+    preset_id = description.get("existing_sessions_preset")
+    if preset_id is None:
+        return None
+    preset = next(preset for preset in description["presets"] if preset["id"] == preset_id)
+    limits = (ceiling or {}).get("groups", {})
+    options = dict(preset["options"])
+    for gid, group in _group_map(description).items():
+        limit = limits.get(gid)
+        ids = _option_ids(group)
+        if limit is not None and ids.index(options[gid]) > ids.index(limit["max"]):
+            options[gid] = limit["max"]
     return options
 
 
