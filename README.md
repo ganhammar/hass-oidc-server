@@ -208,7 +208,7 @@ Access tokens are JWTs in the RFC 9068 profile. The header has `typ: at+jwt` and
 
 `scope` holds the OpenID Connect scopes granted and, for a token bound to an integration that describes its access, the scopes of the access the person chose, whatever the application asked for. The token response's `scope` says the same, so the application learns what it was granted. Refreshed tokens keep the same scopes and the same `aud`.
 
-A session that began before its integration described the access it offers was granted without a choice. It ends at its next refresh, so the application signs in again and the person chooses; until then, its current access token works for up to an hour. An application must name such an integration when it authorizes: naming it only when redeeming the code is answered with `invalid_target`.
+A token bound to such an integration with none of its scopes grants nothing there, whether the person chose nothing or the token was issued before the integration described its access; the integration cannot tell the two apart. An integration that enforces its scopes refuses such a token at once and asks the application to authorize again, where the person chooses. A session that began before the integration described its access also ends at its next refresh. An application must name such an integration when it authorizes. Naming it only when redeeming the code is refused with `invalid_target` where the provider recognizes the address, which is best effort; a token issued that way carries none of the integration's scopes.
 
 ### Using with Claude Connectors
 

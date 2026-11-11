@@ -1,6 +1,8 @@
 # Consent screen: choosing what an assistant may do
 
-Mockups for the design in [hass-mcp-server#135](https://github.com/ganhammar/hass-mcp-server/issues/135) and its follow-up on a detailed mode. Nothing here is built. The point is to react to the layout and, as much, to the words.
+Mockups for the design in [hass-mcp-server#135](https://github.com/ganhammar/hass-mcp-server/issues/135) and its follow-up on a detailed mode. The point is to react to the layout and, as much, to the words.
+
+The provider builds the consent screen and Connected applications from this design, with the text a resource supplies (see [Describing a resource](../../resource-descriptions.md)). Not built yet: the time limit ("Allow access for" and its hint), the end-of-access line, "What it can do" and "Sign-in only" on Connected applications, and changing access without signing out (question 14). Access lasts until the user signs the application out, for 30 days at most.
 
 Open `index.html` in a browser. It shows each page in a phone-sized or wide frame, in light or dark, and lets you switch the situation (first connection, reconnecting, household member with limits). The pages also open on their own; each has a dashed "Mockup" box at the bottom with the same switches and the token scope the choice would produce. Nothing is fetched from the network, so Home Assistant's Roboto font is not loaded and the system font stands in.
 

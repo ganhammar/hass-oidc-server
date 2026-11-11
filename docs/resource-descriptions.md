@@ -27,13 +27,22 @@ custom_components/your_integration/
 
 The provider collects it through Home Assistant's [integration platforms](https://developers.home-assistant.io/docs/creating_integration_file_structure/#integration-platforms) (`async_process_integration_platforms(hass, "oidc_provider", ...)`), the mechanism `diagnostics` and `system_health` use. It works whichever of the two integrations loads first, and it only looks at integrations that are loaded. Each integration describes one resource.
 
+Descriptions are collected once per Home Assistant run, the first time both integrations are loaded, and kept until Home Assistant restarts. Reloading your integration, or removing it, does not collect again or forget what was collected. Until the next restart:
+
+- Your resource keeps matching sign-ins, so they keep asking your module (see below), and a module that fails then gives the plain screen.
+- Your scopes stay in the provider's discovery documents.
+- Sessions for your resource that began before your description keep ending at their next refresh.
+- A change to your `resource` takes effect only after a restart, and so does a change to the scopes listed in the provider's discovery documents. The rest of the description is asked for again at every consent screen and approval.
+
 ## The module
 
 | Function | Required | Called | Returns |
 |---|---|---|---|
-| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; then at every consent screen and on Connected applications, with the user's language | The description, with its text in `language` |
-| `async_get_availability(hass, language)` | No | At every consent screen | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
-| `async_get_ceiling(hass, user, language)` | No | At every consent screen, and again when the user approves | The most this user may grant, or `None` |
+| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; at every consent screen and on Connected applications, with the user's language; and when the user approves, with Home Assistant's language | The description, with its text in `language` |
+| `async_get_availability(hass, language)` | No | At every consent screen, with the user's language, and when the user approves, with Home Assistant's language | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
+| `async_get_ceiling(hass, user, language)` | No | At every consent screen, with the user's language, and when the user approves, with Home Assistant's language | The most this user may grant, or `None` |
+
+When the user approves, all three are asked again and their answers must still be valid. The choice is checked against that description and ceiling; availability does not change what may be approved.
 
 They may be coroutines or plain functions. Each call has 10 seconds to answer; a coroutine that takes longer is cancelled and treated as a failure (see [Validation](#validation)). A plain function runs on Home Assistant's event loop and cannot be cancelled, so it must not block: do any I/O in a coroutine. `user` is Home Assistant's `User` signing in. `language` is a language code Home Assistant knows, such as `en`, `sv` or `pt-BR`.
 
@@ -179,7 +188,7 @@ A description is checked when it is collected, and every answer is checked when 
 - Availability names known groups, each with a reason. A ceiling names known groups, each with a known `max` and a reason, and known presets in `locked_presets`, leaving at least one unlocked, plus a top-level reason.
 - Keys the provider does not know are ignored, so a description written for a later release still works.
 
-A module without `async_describe_resource`, a description that breaks a rule, or one whose function raises or does not answer within 10 seconds, is logged as a warning naming your integration and ignored, so sign-ins carry on as if you had not described yourself. If anything fails at consent time, the warning says so and that sign-in gets the plain approve or deny screen without your scopes. To check a description in your own tests while the provider is installed, call `custom_components.oidc_provider.resource_description.validate_description(description)`; it raises `InvalidDescription` with the reason.
+A module without `async_describe_resource`, a description that breaks a rule, or one whose function raises or does not answer within 10 seconds, is logged as a warning naming your integration and ignored, so sign-ins carry on as if you had not described yourself. If anything fails or does not validate when the consent screen loads, the warning says so and that sign-in gets the plain approve or deny screen without your scopes. If it happens when the user approves, the approval is refused, and the screen is shown again from your answers at that time, which is the plain screen while you still cannot answer. To check a description in your own tests while the provider is installed, call `custom_components.oidc_provider.resource_description.validate_description(description)`; it raises `InvalidDescription` with the reason.
 
 ## What arrives in the token
 
@@ -197,9 +206,10 @@ An access token for your resource has your resource in `aud` (as today) and the 
 - The scopes come from the user's choice, whatever the client asked for. The client learns them from the token response's `scope` (RFC 6749 §3.3).
 - A choice that is exactly a preset with its own `scopes` carries those; any other choice carries the scopes of each chosen option. Expect both forms.
 - Refreshed tokens carry the same scopes and the same audience.
-- A token for your resource without any of your scopes means the user chose the lowest option everywhere. Treat it as no access.
-- A session that began before your integration described itself carries no choice. The provider ends it at its next refresh, so the client signs in again and the user chooses. The access token it already holds keeps working until it expires, within the hour.
-- A client cannot get a token for your resource by naming it only at the token endpoint; that is answered with `invalid_target`.
+- A token for your resource with none of your scopes grants nothing there. That is a token for which the user chose options that grant no scopes, such as the lowest everywhere, and an access token issued before your integration described itself. The provider gives you no way to tell the two apart, and you need none: a resource that enforces its scopes refuses such a token at once.
+- Refuse a request whose token lacks the scopes it needs with `403` and a challenge that names them with `openid`, such as `WWW-Authenticate: Bearer error="insufficient_scope", scope="openid mcp:control"` (RFC 6750 §3.1). An MCP client then goes back through authorization, where the user chooses.
+- A session that began before your integration described itself carries no choice, so the provider also ends it at its next refresh with `invalid_grant`, and the client signs in again.
+- The provider refuses to bind a token to your resource when the client names it only at the token endpoint, with `invalid_target`, since the user was not asked. That check matches the indicator on the address the token request arrived at, so it is best effort. A token it misses carries none of your scopes, so it grants nothing.
 
 Read the claims with the provider's validator, as you do now, and require your own audience:
 
@@ -209,13 +219,22 @@ from custom_components.oidc_provider.token_validator import (
     validate_access_token,
 )
 
-claims = validate_access_token(
-    hass, token, get_issuer_from_request(request), expected_audience=f"{base_url}/api/mcp"
-)
+# The address the request reached, such as https://ha.example.com
+base_url = get_issuer_from_request(request)
+claims = validate_access_token(hass, token, base_url, expected_audience=f"{base_url}/api/mcp")
 scopes = set((claims or {}).get("scope", "").split())
 ```
 
-Then decide what the request may do from those scopes, limited by what your integration has switched on and by the user's ceiling. The provider enforces none of it. List your scopes in your protected resource metadata (RFC 9728) `scopes_supported`; the provider adds them to its discovery documents too.
+Then decide what the request may do from those scopes, limited by what your integration has switched on and by the user's ceiling. The provider enforces none of it.
+
+## Scopes in your metadata and challenges
+
+The provider refuses an authorization request without the `openid` scope, with `400` before the consent screen. MCP clients take the scope they request from the `scope` of your `401` or `403` challenge, or else from `scopes_supported` in your protected resource metadata (RFC 9728). So:
+
+- List `openid` in `scopes_supported`, with your own scopes.
+- Put `openid` in the `scope` of every challenge you send, with the scopes the request needs: `WWW-Authenticate: Bearer resource_metadata="...", scope="openid mcp:read"`.
+
+A client that asks for your scopes gets only what the user chooses: the provider grants them from the consent screen, whatever the client asked for, and adds them to its own discovery documents.
 
 ## Clients registered without consent
 
