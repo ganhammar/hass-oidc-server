@@ -12,7 +12,7 @@
 // the consent screen lets the user choose that access: one of the resource's
 // levels, or one setting per area in a detailed view. The resource supplies
 // that text in the user's language. The panel's own text comes from the
-// integration's translations, through /oidc/strings, with the English bundled
+// integration's translations, through STRINGS_URL, with the English bundled
 // for when they cannot be loaded.
 
 // The panel's text in English, the same as in translations/en.json, which a
@@ -86,9 +86,11 @@ const ICONS = {
 
 // Home Assistant's service worker answers a GET from its cache and refreshes
 // the cache afterwards, except under /api and /auth. The lists are read again
-// after every change, so they are served under /api.
+// after every change and the text changes with a release, so they are served
+// under /api.
 const SESSIONS_URL = '/api/oidc_provider/sessions';
 const CLIENTS_URL = '/api/oidc_provider/clients';
+const STRINGS_URL = '/api/oidc_provider/strings';
 
 const CLIENTS_ERROR_HINT = 'The clients could not be loaded. Reload the page to try again.';
 
@@ -991,9 +993,12 @@ class OidcLoginPanel extends HTMLElement {
     }
   }
 
-  _continueUrl() {
+  // The service worker answers a repeated GET of one address from its cache,
+  // so asking again for a request already read needs an address of its own.
+  _continueUrl(again = false) {
     const requestId = encodeURIComponent(this._requestId);
-    return `/oidc/continue?request_id=${requestId}&language=${encodeURIComponent(this._language())}`;
+    const url = `/oidc/continue?request_id=${requestId}&language=${encodeURIComponent(this._language())}`;
+    return again ? `${url}&again=${Date.now()}` : url;
   }
 
   _selectTab(tab) {
@@ -1024,7 +1029,7 @@ class OidcLoginPanel extends HTMLElement {
   // bundled English stands in, so signing in does not depend on it.
   async _loadStrings() {
     try {
-      const { strings } = await this._fetchJson(`/oidc/strings?language=${encodeURIComponent(this._language())}`);
+      const { strings } = await this._fetchJson(`${STRINGS_URL}?language=${encodeURIComponent(this._language())}`);
       this._strings = { ...FALLBACK_STRINGS, ...strings };
     } catch (error) {
       console.warn('OIDC login panel: showing the bundled English text', error);
@@ -1488,7 +1493,7 @@ class OidcLoginPanel extends HTMLElement {
   async _consentAgain() {
     let details;
     try {
-      details = await this._fetchJson(this._continueUrl());
+      details = await this._fetchJson(this._continueUrl(true));
     } catch (error) {
       return false;
     }

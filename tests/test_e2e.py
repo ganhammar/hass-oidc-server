@@ -1877,7 +1877,7 @@ async def test_panel_strings_are_served_in_the_users_language(
 ) -> None:
     client = await hass_client()
 
-    resp = await client.get("/oidc/strings", params={"language": "de"})
+    resp = await client.get("/api/oidc_provider/strings", params={"language": "de"})
 
     assert resp.status == 200
     data = await resp.json()

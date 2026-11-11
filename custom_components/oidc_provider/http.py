@@ -2451,9 +2451,14 @@ class OIDCSessionView(HomeAssistantView):
 
 
 class OIDCStringsView(HomeAssistantView):
-    """The login panel's text, in the signed-in user's language."""
+    """The login panel's text, in the signed-in user's language.
 
-    url = "/oidc/strings"
+    It is served under /api because Home Assistant's service worker answers a
+    GET from its cache anywhere else, which would show the text of the
+    release before an update.
+    """
+
+    url = "/api/oidc_provider/strings"
     name = "api:oidc:strings"
     requires_auth = True
 

@@ -91,7 +91,7 @@ def test_the_panel_bundles_the_english_of_the_translations():
 
 def test_strings_view_needs_a_signed_in_user():
     assert OIDCStringsView.requires_auth is True
-    assert OIDCStringsView.url == "/oidc/strings"
+    assert OIDCStringsView.url == "/api/oidc_provider/strings"
 
 
 # --- The panel's script -------------------------------------------------------
@@ -346,10 +346,11 @@ def test_a_refused_approval_shows_the_screen_again_from_the_current_access(stand
 
     result = _run_panel(RELOAD, before=before, now=now, chosen={**CONTROL, "cameras": "none"})
 
-    assert result["requests"] == [
-        "POST /oidc/continue",
-        "GET /oidc/continue?request_id=req&language=en",
-    ]
+    # The request is read again at an address of its own, since the service
+    # worker would answer the address it was first read at from its cache
+    refused, again = result["requests"]
+    assert refused == "POST /oidc/continue"
+    assert re.fullmatch(r"GET /oidc/continue\?request_id=req&language=en&again=\d+", again)
     assert result["shown"] == [
         {"view": "detailed", "rows": {**LOOK_ONLY, "cameras": "none"}, "selected": "_custom"}
     ]
