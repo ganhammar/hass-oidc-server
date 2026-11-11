@@ -223,6 +223,29 @@ async def async_consent_access(
     }
 
 
+async def async_display_model(
+    hass: HomeAssistant, domain: str, language: str
+) -> dict[str, Any] | None:
+    """Return a collected resource's description in a language, to show what was granted.
+
+    None, after logging why, when the resource is no longer described or
+    cannot describe itself now.
+    """
+    described = hass.data.get(DATA_RESOURCES, {}).get(domain)
+    if described is None:
+        return None
+    try:
+        description = validate_description(
+            await async_call(described.platform.async_describe_resource, hass, language)
+        )
+    except Exception as err:
+        _LOGGER.warning(
+            "Not showing the access granted at the resource of integration %s: %s", domain, err
+        )
+        return None
+    return consent_model(description)
+
+
 async def async_access_rules(
     hass: HomeAssistant, described: DescribedResource, user: User
 ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:

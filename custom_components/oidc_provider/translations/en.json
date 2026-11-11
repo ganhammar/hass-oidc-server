@@ -86,6 +86,7 @@
       "heading": "Connected applications",
       "intro": "These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.",
       "empty": "No applications are signed in with your Home Assistant account.",
+      "access": "Access: {level}",
       "meta": "Signed in {signed_in}, last used {last_used}",
       "never": "never",
       "sign_out": "Sign out"

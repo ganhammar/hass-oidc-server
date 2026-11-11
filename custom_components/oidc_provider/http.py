@@ -76,6 +76,7 @@ from .resource_description import InvalidChoice, granted_scopes, validate_choice
 from .resources import (
     async_access_rules,
     async_consent_access,
+    async_display_model,
     async_remember_choice,
     find_resource,
     resource_scopes,
@@ -426,11 +427,19 @@ def user_sessions(hass: HomeAssistant, user_id: str) -> list[dict[str, Any]]:
         if data.get("user_id") != user_id:
             continue
         last_used = max((d.get("issued_at") or 0 for _, d in tokens), default=0)
+        access = data.get("access")
         sessions.append(
             {
                 "session_id": _session_id(key),
                 **_client_display(hass, data["client_id"], data),
                 "scopes": (data.get("scope") or "").split(),
+                # The access the user chose at the session's resource, as the
+                # option chosen in each group of the resource's description
+                "access": (
+                    {"resource": access["resource"], "options": access["options"]}
+                    if access
+                    else None
+                ),
                 "signed_in_at": data.get("auth_time"),
                 "last_used_at": last_used or None,
                 "expires_at": int(data["expires_at"]),
@@ -2204,10 +2213,32 @@ class OIDCSessionsView(HomeAssistantView):
     requires_auth = True
 
     async def get(self, request: web.Request) -> web.Response:
-        """List the user's live sessions."""
+        """List the user's live sessions.
+
+        With them comes the description of every resource a session chose
+        access at, in the language the panel asks for, so the panel can name
+        what was granted. A session whose resource cannot be described now is
+        listed without its access.
+        """
         hass = request.app["hass"]
         user = request["hass_user"]
-        return web.json_response({"sessions": user_sessions(hass, user.id)})
+        sessions = user_sessions(hass, user.id)
+        language = _panel_language(hass, request.query.get("language"))
+        resources: dict[str, dict[str, Any] | None] = {}
+        for session in sessions:
+            if session["access"] is None:
+                continue
+            domain = session["access"]["resource"]
+            if domain not in resources:
+                resources[domain] = await async_display_model(hass, domain, language)
+            if resources[domain] is None:
+                session["access"] = None
+        return web.json_response(
+            {
+                "sessions": sessions,
+                "resources": {domain: model for domain, model in resources.items() if model},
+            }
+        )
 
 
 class OIDCSessionView(HomeAssistantView):

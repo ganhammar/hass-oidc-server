@@ -117,6 +117,18 @@ const STYLES = `
   .oidc-session-meta {
     color: var(--secondary-text-color, #727272);
   }
+  .oidc-session .access {
+    margin-top: 6px;
+    color: var(--secondary-text-color, #727272);
+  }
+  .access-level {
+    color: var(--primary-text-color);
+    font-weight: var(--ha-font-weight-medium, 500);
+  }
+  .oidc-session .access ul {
+    margin: 2px 0 0;
+    padding-left: 18px;
+  }
 
   /* Choosing access */
   .oidc-page .icon {
@@ -872,13 +884,13 @@ class OidcLoginPanel extends HTMLElement {
 
   // ---- Choosing access ----------------------------------------------------
 
-  _appName() {
-    return `<bdi>${escapeHtml(this._details.client_name)}</bdi>`;
+  _appName(name = this._details.client_name) {
+    return `<bdi>${escapeHtml(name)}</bdi>`;
   }
 
   // Text from the resource as markup, with {app} as the application's name
-  _res(text) {
-    return escapeHtml(text).replaceAll('{app}', this._appName());
+  _res(text, name = this._details?.client_name) {
+    return escapeHtml(text).replaceAll('{app}', this._appName(name));
   }
 
   // The same, for places that only take text, such as a select's options
@@ -896,20 +908,22 @@ class OidcLoginPanel extends HTMLElement {
     return `<span class="badge">${this._t('access.last_choice')}</span>`;
   }
 
-  _difference(group, rows) {
+  _difference(group, rows, access = this._access, name = undefined) {
     return this._t('access.difference', {
-      area: markup(this._res(group.title)),
-      option: markup(this._res(this._access.option(group.id, rows[group.id]).label)),
+      area: markup(this._res(group.title, name)),
+      option: markup(this._res(access.option(group.id, rows[group.id]).label, name)),
     });
   }
 
-  _summaryHtml(rows) {
-    const { preset, differences } = this._access.closest(rows);
-    const level = markup(this._res(preset.title));
+  _summaryHtml(rows, access = this._access, name = undefined) {
+    const { preset, differences } = access.closest(rows);
+    const level = markup(this._res(preset.title, name));
     if (differences.length > 3) {
       return this._t('access.custom_summary_many', { level });
     }
-    const items = differences.map((group) => `<li>${this._difference(group, rows)}</li>`).join('');
+    const items = differences
+      .map((group) => `<li>${this._difference(group, rows, access, name)}</li>`)
+      .join('');
     return `${this._t('access.custom_summary', { level })}<ul>${items}</ul>`;
   }
 
@@ -1233,8 +1247,32 @@ class OidcLoginPanel extends HTMLElement {
 
   // ---- Connected applications ---------------------------------------------
 
+  // What a session was granted at its resource: the level's title, or Custom
+  // with how it differs from the closest level
+  _sessionAccess(session, resources) {
+    const model = session.access && resources[session.access.resource];
+    if (!model) {
+      return '';
+    }
+    const access = new AccessChoice({ ...model, remembered: session.access.options });
+    const name = session.client_name;
+    if (access.selected !== CUSTOM) {
+      const preset = access.presets.find((candidate) => candidate.id === access.selected);
+      const level = markup(`<span class="access-level">${this._res(preset.title, name)}</span>`);
+      return `<div class="access">${this._t('sessions.access', { level })}</div>`;
+    }
+    const level = markup(`<span class="access-level">${this._t('access.custom')}</span>`);
+    return `
+      <div class="access">
+        ${this._t('sessions.access', { level })}
+        <div>${this._summaryHtml(access.rows, access, name)}</div>
+      </div>`;
+  }
+
   async _renderSessions(notice = '') {
-    const { sessions } = await this._fetchJson('/oidc/sessions');
+    const { sessions, resources = {} } = await this._fetchJson(
+      `/oidc/sessions?language=${encodeURIComponent(this._language())}`
+    );
     const formatTime = (seconds) =>
       seconds ? escapeHtml(new Date(seconds * 1000).toLocaleString()) : this._t('sessions.never');
     const items = sessions.map((session) => {
@@ -1248,6 +1286,7 @@ class OidcLoginPanel extends HTMLElement {
       return `
         <div class="oidc-session">
           ${label}
+          ${this._sessionAccess(session, resources)}
           <div class="oidc-session-meta">${this._t('sessions.meta', {
             signed_in: markup(formatTime(session.signed_in_at)),
             last_used: markup(formatTime(session.last_used_at)),

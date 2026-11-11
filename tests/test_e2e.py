@@ -1866,3 +1866,20 @@ async def test_discovery_advertises_the_described_scopes(
         scopes = (await resp.json())["scopes_supported"]
         assert scopes[:4] == ["openid", "profile", "email", "groups"], path
         assert {"stand_in:read", "stand_in:admin", "stand_in:lights:full"} <= set(scopes), path
+
+
+async def test_connected_applications_show_the_access_granted(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    choice = {**STAND_IN_LOOK_ONLY, "cameras": "none"}
+    status, _ = await _sign_in_with_choice(client, registration, choice)
+    assert status == 200
+
+    resp = await client.get("/oidc/sessions", params={"language": "en"})
+
+    data = await resp.json()
+    [session] = data["sessions"]
+    assert session["access"] == {"resource": "oidc_stand_in", "options": choice}
+    assert data["resources"]["oidc_stand_in"]["presets"][0]["title"] == "Look only"

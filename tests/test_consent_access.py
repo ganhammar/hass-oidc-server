@@ -570,3 +570,73 @@ async def test_discovery_advertises_the_scopes_resources_describe(stand_in, view
     assert scopes[:4] == ["openid", "profile", "email", "groups"]
     assert "stand_in:read" in scopes
     assert "stand_in:files:full" in scopes
+
+
+# --- What Connected applications shows ----------------------------------------
+
+
+async def _sessions(hass, language="en"):
+    from custom_components.oidc_provider.http import OIDCSessionsView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.query = {"language": language}
+    request.__getitem__.return_value = Mock(id=USER)
+    response = await OIDCSessionsView().get(request)
+    return json.loads(response.body)
+
+
+def _session_token(family, **overrides):
+    return {
+        "client_id": CLIENT,
+        "user_id": USER,
+        "scope": "openid",
+        "family": family,
+        "issued_at": 10,
+        "expires_at": time.time() + 3600,
+        **overrides,
+    }
+
+
+async def test_connected_applications_show_the_access_chosen(stand_in):
+    hass = await _token_hass(stand_in)
+    hass.data[DOMAIN]["refresh_tokens"] = {
+        "a.1": _session_token("a", access=ACCESS),
+        "b.1": _session_token("b", access={**ACCESS, "resource": "gone"}),
+        "c.1": _session_token("c"),
+    }
+
+    data = await _sessions(hass, language="sv")
+
+    by_family = {
+        session["access"] and session["access"]["resource"]: session for session in data["sessions"]
+    }
+    assert by_family["oidc_stand_in"]["access"] == {"resource": "oidc_stand_in", "options": CUSTOM}
+    # A session whose resource is no longer described is listed without its access
+    assert set(by_family) == {"oidc_stand_in", None}
+    assert len(data["sessions"]) == 3
+    model = data["resources"]["oidc_stand_in"]
+    assert model["name"] == "Ersättaren"
+    assert [preset["id"] for preset in model["presets"]] == [
+        "read",
+        "control",
+        "configure",
+        "admin",
+    ]
+    assert "scopes" not in json.dumps(data["resources"])
+    assert ("describe", "sv") in stand_in.CALLS
+
+
+async def test_connected_applications_when_the_resource_cannot_describe_itself(stand_in, caplog):
+    hass = await _token_hass(stand_in)
+    hass.data[DOMAIN]["refresh_tokens"] = {"a.1": _session_token("a", access=ACCESS)}
+    stand_in.DESCRIPTION = None
+
+    with caplog.at_level(logging.WARNING):
+        data = await _sessions(hass)
+
+    assert data["sessions"][0]["access"] is None
+    assert data["resources"] == {}
+    assert "Not showing the access granted at the resource of integration oidc_stand_in" in (
+        caplog.text
+    )
