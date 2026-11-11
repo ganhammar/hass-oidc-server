@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 from homeassistant.core import HomeAssistant
 
+from custom_components.oidc_provider import resources
 from custom_components.oidc_provider.const import DOMAIN, STORAGE_KEY_ACCESS_CHOICES
 from custom_components.oidc_provider.http import OIDCContinueView, _panel_language
 from custom_components.oidc_provider.resources import (
@@ -207,6 +208,33 @@ async def test_a_resource_that_cannot_answer_gets_the_plain_screen(
         "Ignoring the resource description of integration oidc_stand_in for this sign-in"
         in caplog.text
     )
+
+
+async def test_a_resource_that_does_not_answer_in_time_is_treated_as_failing(
+    stand_in, caplog, monkeypatch
+):
+    """The screen falls back to the plain one, and a choice can no longer be checked."""
+    hass = await _hass(stand_in)
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def hang(hass, user, language):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", hang)
+
+    with caplog.at_level(logging.WARNING):
+        status, data = await _get(hass)
+
+    assert status == 200
+    assert "access" not in data
+    assert (
+        "Ignoring the resource description of integration oidc_stand_in for this sign-in: "
+        "it did not answer within 0.01 seconds"
+    ) in caplog.text
+
+    status, text = await _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
+    assert status == 400
+    assert "can no longer be checked" in text
 
 
 async def test_a_resource_without_the_optional_functions_offers_no_limits(stand_in):
@@ -660,3 +688,25 @@ async def test_connected_applications_when_the_resource_cannot_describe_itself(s
     assert "Not showing the access granted at the resource of integration oidc_stand_in" in (
         caplog.text
     )
+
+
+async def test_connected_applications_when_the_resource_does_not_answer_in_time(
+    stand_in, caplog, monkeypatch
+):
+    hass = await _token_hass(stand_in)
+    hass.data[DOMAIN]["refresh_tokens"] = {"a.1": _session_token("a", access=ACCESS)}
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def hang(hass, language):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stand_in, "async_describe_resource", hang)
+
+    with caplog.at_level(logging.WARNING):
+        data = await _sessions(hass)
+
+    assert data["sessions"][0]["access"] is None
+    assert (
+        "Not showing the access granted at the resource of integration oidc_stand_in: "
+        "it did not answer within 0.01 seconds"
+    ) in caplog.text

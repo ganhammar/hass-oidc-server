@@ -1,5 +1,6 @@
 """Tests for collecting resource descriptions from other integrations."""
 
+import asyncio
 import copy
 import logging
 from types import SimpleNamespace
@@ -9,9 +10,12 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
+from custom_components.oidc_provider import resources
 from custom_components.oidc_provider.resources import (
+    CALL_TIMEOUT,
     DATA_RESOURCES,
     _async_collect,
+    async_call,
     async_setup_resources,
     described_resources,
     find_resource,
@@ -115,6 +119,36 @@ async def test_failing_description_is_ignored(caplog):
         caplog.text
     )
     assert "no description today" in caplog.text
+
+
+async def test_calls_into_a_resource_module_are_timed_out(monkeypatch):
+    """A coroutine gets CALL_TIMEOUT seconds; a plain function is called as it is."""
+    assert CALL_TIMEOUT == 10
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    with pytest.raises(TimeoutError):
+        await async_call(hang)
+    assert await async_call(lambda value: value + 1, 1) == 2
+
+
+async def test_description_that_does_not_answer_in_time_is_ignored(caplog, monkeypatch):
+    hass = _mock_hass()
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def describe(hass, language):
+        await asyncio.Event().wait()
+
+    with caplog.at_level(logging.WARNING):
+        await _async_collect(hass, "garden", SimpleNamespace(async_describe_resource=describe))
+
+    assert described_resources(hass) == []
+    assert (
+        "Ignoring the resource description of integration garden: describing it took longer "
+        "than 0.01 seconds"
+    ) in caplog.text
 
 
 async def test_plain_function_and_a_second_claim_on_a_resource(stand_in, caplog):

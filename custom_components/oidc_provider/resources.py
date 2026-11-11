@@ -13,8 +13,11 @@ or after it. The module provides:
   Optional.
 
 A description is validated when it is collected. One that is malformed, or
-whose module fails, is logged with the integration's name and ignored, so
-sign-ins carry on as if the resource had not described itself.
+whose module fails or does not answer within CALL_TIMEOUT seconds, is logged
+with the integration's name and ignored, so sign-ins carry on as if the
+resource had not described itself. A plain function, rather than a
+coroutine, runs on the event loop and cannot be timed out, so it must not
+block.
 """
 
 from __future__ import annotations
@@ -69,11 +72,21 @@ class DescribedResource:
     description: dict[str, Any]
 
 
+# How long a resource module's function may take to answer, in seconds
+CALL_TIMEOUT = 10
+
+
 async def async_call(function: Any, *args: Any) -> Any:
-    """Call a resource module's function, awaiting it if it is a coroutine."""
-    result = function(*args)
-    if inspect.isawaitable(result):
-        result = await result
+    """Call a resource module's function, awaiting it if it is a coroutine.
+
+    A coroutine that has not answered within CALL_TIMEOUT seconds is cancelled
+    and TimeoutError raised. A plain function runs on the event loop and is
+    not interrupted, so it must not block.
+    """
+    async with asyncio.timeout(CALL_TIMEOUT):
+        result = function(*args)
+        if inspect.isawaitable(result):
+            result = await result
     return result
 
 
@@ -100,6 +113,14 @@ async def _async_collect(hass: HomeAssistant, domain: str, platform: Any) -> Non
         description = validate_description(await async_call(describe, hass, hass.config.language))
     except InvalidDescription as err:
         _LOGGER.warning("Ignoring the resource description of integration %s: %s", domain, err)
+        return
+    except TimeoutError:
+        _LOGGER.warning(
+            "Ignoring the resource description of integration %s: describing it took longer "
+            "than %s seconds",
+            domain,
+            CALL_TIMEOUT,
+        )
         return
     except Exception:
         _LOGGER.warning(
@@ -191,6 +212,14 @@ async def _async_ask(
             err,
         )
         return None
+    except TimeoutError:
+        _LOGGER.warning(
+            "Ignoring the resource description of integration %s for this sign-in: "
+            "it did not answer within %s seconds",
+            described.domain,
+            CALL_TIMEOUT,
+        )
+        return None
     except Exception:
         _LOGGER.warning(
             "Ignoring the resource description of integration %s for this sign-in: "
@@ -244,6 +273,14 @@ async def async_display_model(
         description = validate_description(
             await async_call(described.platform.async_describe_resource, hass, language)
         )
+    except TimeoutError:
+        _LOGGER.warning(
+            "Not showing the access granted at the resource of integration %s: "
+            "it did not answer within %s seconds",
+            domain,
+            CALL_TIMEOUT,
+        )
+        return None
     except Exception as err:
         _LOGGER.warning(
             "Not showing the access granted at the resource of integration %s: %s", domain, err

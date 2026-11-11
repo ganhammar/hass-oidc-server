@@ -35,7 +35,7 @@ The provider collects it through Home Assistant's [integration platforms](https:
 | `async_get_availability(hass, language)` | No | At every consent screen | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
 | `async_get_ceiling(hass, user, language)` | No | At every consent screen, and again when the user approves | The most this user may grant, or `None` |
 
-They may be coroutines or plain functions. `user` is Home Assistant's `User` signing in. `language` is a language code Home Assistant knows, such as `en`, `sv` or `pt-BR`.
+They may be coroutines or plain functions. Each call has 10 seconds to answer; a coroutine that takes longer is cancelled and treated as a failure (see [Validation](#validation)). A plain function runs on Home Assistant's event loop and cannot be cancelled, so it must not block: do any I/O in a coroutine. `user` is Home Assistant's `User` signing in. `language` is a language code Home Assistant knows, such as `en`, `sv` or `pt-BR`.
 
 Availability and the ceiling are functions rather than part of the description because they are the only things that change while Home Assistant runs: availability follows your integration's options, and the ceiling depends on who signs in. The description itself is plain data, so the same model could come from somewhere other than a Home Assistant module later. The two answers are plain data too, in the shapes below.
 
@@ -179,7 +179,7 @@ A description is checked when it is collected, and every answer is checked when 
 - Availability names known groups, each with a reason. A ceiling names known groups, each with a known `max` and a reason, and known presets in `locked_presets`, leaving at least one unlocked, plus a top-level reason.
 - Keys the provider does not know are ignored, so a description written for a later release still works.
 
-A module without `async_describe_resource`, a description that breaks a rule, or one whose function raises, is logged as a warning naming your integration and ignored, so sign-ins carry on as if you had not described yourself. If anything fails at consent time, the warning says so and that sign-in gets the plain approve or deny screen without your scopes. To check a description in your own tests while the provider is installed, call `custom_components.oidc_provider.resource_description.validate_description(description)`; it raises `InvalidDescription` with the reason.
+A module without `async_describe_resource`, a description that breaks a rule, or one whose function raises or does not answer within 10 seconds, is logged as a warning naming your integration and ignored, so sign-ins carry on as if you had not described yourself. If anything fails at consent time, the warning says so and that sign-in gets the plain approve or deny screen without your scopes. To check a description in your own tests while the provider is installed, call `custom_components.oidc_provider.resource_description.validate_description(description)`; it raises `InvalidDescription` with the reason.
 
 ## What arrives in the token
 
