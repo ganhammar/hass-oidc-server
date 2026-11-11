@@ -78,6 +78,7 @@ from .resources import (
     async_consent_access,
     async_remember_choice,
     find_resource,
+    resource_scopes,
 )
 from .security import verify_client_secret
 from .token_validator import decode_access_token, get_issuer_from_request
@@ -136,6 +137,25 @@ async def async_panel_strings(hass: HomeAssistant, language: str) -> dict[str, s
         for key, value in translations.items()
         if key.startswith(prefix)
     }
+
+
+def _scopes_supported(hass: HomeAssistant) -> list[str]:
+    """Return the scopes the discovery documents advertise.
+
+    Those are the OpenID Connect scopes and every scope a resource describes.
+    A resource's scopes are granted as the user chooses on the consent screen,
+    whether or not the client asked for them, and each resource server lists
+    its own in its protected resource metadata (RFC 9728).
+    """
+    return [*SUPPORTED_SCOPES, *resource_scopes(hass)]
+
+
+def _with_access_scopes(scope: str, access: dict[str, Any] | None) -> str:
+    """Return a grant's scope with the scopes of the access chosen at its resource."""
+    scopes = scope.split()
+    if access:
+        scopes.extend(granted for granted in access["scopes"] if granted not in scopes)
+    return " ".join(scopes)
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -866,7 +886,7 @@ class OIDCDiscoveryView(HomeAssistantView):
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "claims_supported": [
@@ -913,7 +933,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
@@ -949,7 +969,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
@@ -996,17 +1016,19 @@ class OIDCAuthorizationView(HomeAssistantView):
                 status=400,
             )
 
-        # Unrecognised scope values are ignored (OIDC Core §3.1.2.1). Only the
-        # granted scopes are stored, shown on the consent screen, and returned
-        # with the token.
-        granted_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
-        if len(granted_scopes) != len(requested_scopes):
+        # Only OpenID Connect scopes are granted from the request. Unrecognised
+        # scope values are ignored (OIDC Core §3.1.2.1), and the scopes of a
+        # resource that describes the access it offers are what the user
+        # chooses on the consent screen, whatever the client asked for. The
+        # token response's scope says what was granted (RFC 6749 §3.3).
+        oidc_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
+        if len(oidc_scopes) != len(requested_scopes):
             _LOGGER.debug(
-                "Ignoring unsupported scopes for client %s: %s",
+                "Not granting requested scopes for client %s: %s",
                 client_id,
                 " ".join(sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES),
             )
-        scope = " ".join(granted_scopes)
+        scope = " ".join(oidc_scopes)
 
         # NOTE: max_age (OIDC Core §3.1.2.1) is intentionally not honored here.
         # The auth_time claim emitted in the id_token is stamped at the
@@ -1429,17 +1451,32 @@ class OIDCTokenView(HomeAssistantView):
                     status=400,
                 )
 
-        # Generate tokens
+        # Generate tokens. The scope is what the user approved: the OpenID
+        # Connect scopes, and the scopes of the access chosen at the resource.
         user_id = auth_data["user_id"]
-        scope = auth_data["scope"]
+        access = auth_data.get("access")
+        scope = _with_access_scopes(auth_data["scope"], access)
 
         nonce = auth_data.get("nonce")
         auth_time = auth_data.get("auth_time")
 
         # The token audience is bound to the resource requested at the authorize
         # step (RFC 8707). A token request MAY also carry a resource indicator;
-        # honor it only when the authorize step didn't specify one.
-        resource = auth_data.get("resource") or _normalize_resource(data.get("resource"))
+        # honor it only when the authorize step didn't specify one, and not for
+        # a resource that asks the user what the client may do there, since the
+        # user was not asked.
+        resource = auth_data.get("resource")
+        if resource is None:
+            resource = _normalize_resource(data.get("resource"))
+            if find_resource(hass, resource, get_issuer_from_request(_request)):
+                return web.json_response(
+                    {
+                        "error": "invalid_target",
+                        "error_description": "This resource asks the user what the "
+                        "application may do there; name it in the authorization request",
+                    },
+                    status=400,
+                )
 
         # Kept until the code would have expired, so a later presentation of the
         # same code can revoke what this redemption issues.
@@ -1466,6 +1503,9 @@ class OIDCTokenView(HomeAssistantView):
             "nonce": nonce,
             "auth_time": auth_time,
             "resource": resource,
+            # The access the user chose at the resource, kept so the session
+            # can show it and its refreshed tokens carry its scopes
+            "access": access,
             "client_name": auth_data.get("client_name"),
             "family": family,
             "issued_at": time.time(),
@@ -1624,7 +1664,33 @@ class OIDCTokenView(HomeAssistantView):
         refresh_token: str,
         token_data: dict[str, Any],
     ) -> web.Response:
-        """Issue fresh access and ID tokens for a stored refresh token."""
+        """Issue fresh access and ID tokens for a stored refresh token.
+
+        A session whose resource describes the access it offers, but which was
+        granted without a choice of that access, because it began before the
+        resource described itself, is ended instead. The client then signs in
+        again and the user chooses, so every token for such a resource carries
+        a choice, and one without the resource's scopes means no access there.
+        """
+        if not token_data.get("access") and find_resource(
+            hass, token_data.get("resource"), get_issuer_from_request(_request)
+        ):
+            _revoke_family(hass, token_data["family"])
+            await _save_refresh_tokens(hass)
+            _LOGGER.info(
+                "Ended a session of client %s granted before its resource described the "
+                "access it offers; the client has to sign in again",
+                token_data["client_id"],
+            )
+            return web.json_response(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "The resource now asks what this application may "
+                    "do there; sign in again",
+                },
+                status=400,
+            )
+
         # The access token keeps the original resource binding (RFC 8707), so
         # refreshed tokens stay valid at the same resource.
         access_token = await self._generate_access_token(

@@ -379,3 +379,194 @@ async def test_nothing_remembered_yet(hass: HomeAssistant, hass_storage):
     hass.data[DOMAIN] = {}
 
     assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") is None
+
+
+# --- The chosen access in the tokens ------------------------------------------
+
+ACCESS = {
+    "resource": "oidc_stand_in",
+    "options": CUSTOM,
+    "scopes": ["stand_in:lights:read", "stand_in:files:read"],
+}
+
+
+async def _token_hass(stand_in):
+    """Return hass state that can issue tokens, with the stand-in described."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.oidc_provider.security import hash_client_secret
+
+    hass = await _hass(stand_in)
+    hass.data[DOMAIN].update(
+        {
+            "clients": {CLIENT: {"client_secret_hash": hash_client_secret("secret")}},
+            "refresh_tokens": {},
+            "rate_limit_attempts": {},
+            "jwt_private_key": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+            "jwt_kid": "kid",
+            "token_store": Mock(async_save=AsyncMock()),
+            "store": Mock(async_save=AsyncMock()),
+        }
+    )
+    hass.auth.async_get_user = AsyncMock(return_value=None)
+    return hass
+
+
+async def _token(hass, **form):
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.remote = "127.0.0.1"
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "ha.example.com"}
+    request.post = AsyncMock(return_value={"client_id": CLIENT, "client_secret": "secret", **form})
+    response = await OIDCTokenView().post(request)
+    return response.status, json.loads(response.body)
+
+
+def _code_for(hass, *, access, resource=RESOURCE):
+    hass.data[DOMAIN]["authorization_codes"]["the-code"] = {
+        "client_id": CLIENT,
+        "redirect_uri": "https://app.example.com/cb",
+        "scope": "openid profile",
+        "user_id": USER,
+        "nonce": None,
+        "auth_time": 1,
+        "code_challenge": None,
+        "resource": resource,
+        "access": access,
+        "client_name": "App",
+        "expires_at": time.time() + 600,
+    }
+
+
+def _claims(token):
+    import jwt
+
+    return jwt.decode(token, options={"verify_signature": False})
+
+
+async def test_the_chosen_access_is_in_the_token_and_survives_refresh(stand_in):
+    hass = await _token_hass(stand_in)
+    _code_for(hass, access=ACCESS)
+
+    status, body = await _token(
+        hass,
+        grant_type="authorization_code",
+        code="the-code",
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    assert status == 200, body
+    scope = "openid profile stand_in:lights:read stand_in:files:read"
+    assert body["scope"] == scope
+    claims = _claims(body["access_token"])
+    assert claims["scope"] == scope
+    # Still bound to the resource it was issued for
+    assert claims["aud"] == RESOURCE
+    stored = hass.data[DOMAIN]["refresh_tokens"][body["refresh_token"]]
+    assert stored["access"] == ACCESS
+
+    status, body = await _token(
+        hass, grant_type="refresh_token", refresh_token=body["refresh_token"]
+    )
+
+    assert status == 200, body
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+
+
+async def test_a_session_granted_before_its_resource_was_described_ends_at_refresh(
+    stand_in, caplog
+):
+    """Such a session carries no choice of access, so the client signs in
+    again and the user chooses."""
+    hass = await _token_hass(stand_in)
+    hass.data[DOMAIN]["refresh_tokens"] = {
+        "fam.old": {
+            "client_id": CLIENT,
+            "user_id": USER,
+            "scope": "openid profile",
+            "resource": RESOURCE,
+            "family": "fam",
+            "expires_at": time.time() + 3600,
+        },
+        "other.token": {
+            "client_id": CLIENT,
+            "user_id": USER,
+            "scope": "openid",
+            "resource": None,
+            "family": "other",
+            "expires_at": time.time() + 3600,
+        },
+    }
+
+    with caplog.at_level(logging.INFO):
+        status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+    assert "sign in again" in body["error_description"]
+    # The whole session is gone; others are untouched
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other.token"]
+    assert "granted before its resource described the access it offers" in caplog.text
+
+    # A session for a resource without a description refreshes as before
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="other.token")
+    assert status == 200
+    assert body["scope"] == "openid"
+
+
+async def test_a_described_resource_named_only_at_the_token_endpoint_is_refused(stand_in):
+    """The user was not asked what the client may do there."""
+    hass = await _token_hass(stand_in)
+    _code_for(hass, access=None, resource=None)
+
+    status, body = await _token(
+        hass,
+        grant_type="authorization_code",
+        code="the-code",
+        redirect_uri="https://app.example.com/cb",
+        resource=RESOURCE,
+    )
+
+    assert status == 400
+    assert body["error"] == "invalid_target"
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+    # Another resource named there still binds the token, as before
+    _code_for(hass, access=None, resource=None)
+    status, body = await _token(
+        hass,
+        grant_type="authorization_code",
+        code="the-code",
+        redirect_uri="https://app.example.com/cb",
+        resource="https://ha.example.com/api/other",
+    )
+    assert status == 200
+    assert _claims(body["access_token"])["aud"] == "https://ha.example.com/api/other"
+    assert body["scope"] == "openid profile"
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        "OIDCDiscoveryView",
+        "OAuth2AuthorizationServerMetadataView",
+        "OAuth2AuthorizationServerMetadataAlternateView",
+    ],
+)
+async def test_discovery_advertises_the_scopes_resources_describe(stand_in, view):
+    from custom_components.oidc_provider import http as provider_http
+
+    hass = await _hass(stand_in)
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "ha.example.com"}
+
+    response = await getattr(provider_http, view)().get(request)
+
+    scopes = json.loads(response.body)["scopes_supported"]
+    assert scopes[:4] == ["openid", "profile", "email", "groups"]
+    assert "stand_in:read" in scopes
+    assert "stand_in:files:full" in scopes

@@ -1715,3 +1715,154 @@ async def test_panel_strings_are_served_in_the_users_language(
     # Only English ships, so it stands in for every language
     assert data["strings"]["consent.heading"] == "Approve access?"
     assert data["strings"]["access.back"] == "Back to levels"
+
+
+async def _sign_in_with_choice(
+    client: ClientSessionGenerator, registration: dict, options: dict[str, str] | None
+) -> tuple[int, dict]:
+    """Authorize for the stand-in's resource, approve with a choice and redeem the code."""
+    verifier, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    status, body = await _choose(client, request_id, options)
+    assert status == 200, body
+    code = parse_qs(urlparse(body["redirect_url"]).query)["code"][0]
+    return await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+
+
+async def test_chosen_access_is_in_the_token_and_survives_refresh(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+
+    # Exactly a level: the level's own scope
+    status, tokens = await _sign_in_with_choice(client, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile stand_in:read"
+
+    # Anything else: the scope of each area's setting
+    status, tokens = await _sign_in_with_choice(
+        client, registration, {**STAND_IN_LOOK_ONLY, "cameras": "none", "files": "full"}
+    )
+    assert status == 200, tokens
+    scope = (
+        "openid profile stand_in:lights:read stand_in:automations:read "
+        "stand_in:templates:read stand_in:files:full"
+    )
+    assert tokens["scope"] == scope
+
+    # The token is still bound to its resource, and the resource reads the scope
+    claims = validate_access_token(
+        hass, tokens["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims is not None
+    assert claims["scope"] == scope
+    assert (
+        validate_access_token(hass, tokens["access_token"], ISSUER_BASE, expected_audience=RESOURCE)
+        is None
+    )
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 200, refreshed
+    assert refreshed["scope"] == scope
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == scope
+
+
+async def test_choosing_nothing_grants_no_resource_scope(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    nothing = dict.fromkeys(STAND_IN_LOOK_ONLY, "none")
+
+    status, tokens = await _sign_in_with_choice(client, registration, nothing)
+
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 200, refreshed
+
+
+async def test_session_from_before_the_resource_described_itself_ends_at_refresh(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
+) -> None:
+    """A session that began before its resource described the access it offers
+    carries no choice, so its next refresh sends the client back to sign in."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    status, tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+
+    await _setup_stand_in(hass)
+
+    status, body = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+async def test_described_resource_named_only_when_redeeming_the_code_is_refused(
+    setup_stand_in: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client, client_id=registration["client_id"], code_challenge=challenge, resource=None
+    )
+
+    resp = await client.post(
+        "/oidc/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+            "code_verifier": verifier,
+            "resource": STAND_IN_RESOURCE,
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "invalid_target"
+
+
+async def test_discovery_advertises_the_described_scopes(
+    setup_stand_in: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    for path in DISCOVERY_PATHS:
+        resp = await client.get(path, headers=FORWARDED)
+        scopes = (await resp.json())["scopes_supported"]
+        assert scopes[:4] == ["openid", "profile", "email", "groups"], path
+        assert {"stand_in:read", "stand_in:admin", "stand_in:lights:full"} <= set(scopes), path
