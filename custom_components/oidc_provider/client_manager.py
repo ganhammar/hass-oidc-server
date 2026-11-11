@@ -225,3 +225,37 @@ async def create_client(
     if client_secret is not None:
         client_info["client_secret"] = client_secret
     return client_info
+
+
+def client_name_in_use(hass: HomeAssistant, client_name: str) -> bool:
+    """Return whether a stored client already has this name."""
+    clients = hass.data[DOMAIN].get("clients", {})
+    return any(client.get("client_name") == client_name for client in clients.values())
+
+
+async def update_client(
+    hass: HomeAssistant,
+    client_id: str,
+    redirect_uris: list[str],
+    consent_required: bool | None = None,
+) -> dict[str, Any]:
+    """Replace a stored client's redirect URIs and, when given, its consent setting.
+
+    The redirect host is shown on the consent screen, so the URIs get the same
+    validation as at registration.
+
+    Returns:
+        The updated client record
+
+    Raises:
+        KeyError: If no client with this ID is stored
+        ValueError: If a redirect URI is invalid
+    """
+    clients = hass.data[DOMAIN]["clients"]
+    client = clients[client_id]
+    validate_redirect_uris(redirect_uris)
+    client["redirect_uris"] = redirect_uris
+    if consent_required is not None:
+        client["consent_required"] = bool(consent_required)
+    await hass.data[DOMAIN]["store"].async_save({"clients": clients})
+    return client

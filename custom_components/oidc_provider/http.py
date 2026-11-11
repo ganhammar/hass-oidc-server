@@ -22,9 +22,11 @@ from homeassistant.helpers.storage import Store
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import (
+    client_name_in_use,
     count_unused_dynamic_clients,
     create_client,
     prune_dynamic_clients,
+    update_client,
     validate_client_name,
     validate_redirect_uris,
 )
@@ -32,6 +34,9 @@ from .const import (
     ACCESS_TOKEN_EXPIRY,
     ACCESS_TOKEN_TYPE,
     AUTHORIZATION_CODE_EXPIRY,
+    CLIENT_KIND_DYNAMIC,
+    CLIENT_KIND_METADATA_DOCUMENT,
+    CLIENT_KIND_REGISTERED,
     CODE_CHALLENGE_METHOD_S256,
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
@@ -410,6 +415,72 @@ async def revoke_client_sessions(hass: HomeAssistant, client_id: str) -> int:
     return len(keys)
 
 
+async def remove_client(hass: HomeAssistant, client_id: str) -> tuple[bool, int]:
+    """Remove a client and end every session it holds.
+
+    A client identified by a metadata document URL is not stored, so only its
+    sessions end; it can sign in again unless metadata documents are off.
+
+    Returns:
+        Whether a stored client was removed, and how many sessions ended
+    """
+    ended = await revoke_client_sessions(hass, client_id)
+    clients = hass.data[DOMAIN]["clients"]
+    if client_id not in clients:
+        return False, ended
+    del clients[client_id]
+    await hass.data[DOMAIN]["store"].async_save({"clients": clients})
+    return True, ended
+
+
+def _managed_client(client_id: str, client: dict[str, Any], active_sessions: int) -> dict[str, Any]:
+    """Return a stored client as the client management page lists it."""
+    dynamic = client.get("registration") == REGISTRATION_DYNAMIC
+    return {
+        "client_id": client_id,
+        "client_name": client.get("client_name") or client_id,
+        "client_host": None,
+        "registration": CLIENT_KIND_DYNAMIC if dynamic else CLIENT_KIND_REGISTERED,
+        "redirect_uris": client.get("redirect_uris", []),
+        "consent_required": bool(client.get("consent_required", True)),
+        "created_at": client.get("created_at"),
+        "active_sessions": active_sessions,
+    }
+
+
+def managed_clients(hass: HomeAssistant) -> list[dict[str, Any]]:
+    """Return every client an administrator can manage, in name order.
+
+    Stored clients come first by name. Clients that are not stored, which are
+    those signed in through a metadata document, are known only through their
+    sessions and have no settings to edit.
+    """
+    clients = hass.data[DOMAIN].get("clients", {})
+    sessions = client_sessions(hass)
+    listing = [
+        _managed_client(client_id, client, sessions.get(client_id, {}).get("active_sessions", 0))
+        for client_id, client in clients.items()
+    ]
+    listing += [
+        {
+            "client_id": client_id,
+            "client_name": info["client_name"],
+            "client_host": info["client_host"],
+            "registration": CLIENT_KIND_METADATA_DOCUMENT,
+            "active_sessions": info["active_sessions"],
+        }
+        for client_id, info in sessions.items()
+        if client_id not in clients
+    ]
+    listing.sort(
+        key=lambda c: (
+            c["registration"] == CLIENT_KIND_METADATA_DOCUMENT,
+            c["client_name"].casefold(),
+        )
+    )
+    return listing
+
+
 def _prune_expired(entries: dict[str, dict[str, Any]]) -> None:
     """Drop the entries whose expires_at has passed."""
     now = time.time()
@@ -570,6 +641,7 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
     hass.http.register_view(OIDCRevocationView())
     hass.http.register_view(OIDCSessionsView())
     hass.http.register_view(OIDCSessionView())
+    hass.http.register_view(OIDCClientsView())
 
 
 class OIDCContinueView(HomeAssistantView):
@@ -2016,7 +2088,11 @@ class OIDCRevocationView(HomeAssistantView):
 class OIDCSessionsView(HomeAssistantView):
     """The signed-in user's sessions with OIDC clients, listed in the login panel."""
 
-    url = "/oidc/sessions"
+    # The panel reads the list again after ending a session. Home Assistant's
+    # service worker answers a GET from its cache outside /api, which would
+    # show the session that was just ended, so the panel uses the /api path.
+    url = "/api/oidc_provider/sessions"
+    extra_urls = ["/oidc/sessions"]
     name = "api:oidc:sessions"
     requires_auth = True
 
@@ -2030,7 +2106,8 @@ class OIDCSessionsView(HomeAssistantView):
 class OIDCSessionView(HomeAssistantView):
     """One of the signed-in user's sessions."""
 
-    url = "/oidc/sessions/{session_id}"
+    url = "/api/oidc_provider/sessions/{session_id}"
+    extra_urls = ["/oidc/sessions/{session_id}"]
     name = "api:oidc:session"
     requires_auth = True
 
@@ -2046,3 +2123,169 @@ class OIDCSessionView(HomeAssistantView):
                 _LOGGER.info("User %s ended a session of client %s", user.id, data["client_id"])
                 return web.json_response({"revoked": True})
         return web.json_response({"error": "not_found"}, status=404)
+
+
+def _client_error(error: str, message: str, status: int = 400) -> web.Response:
+    """Return a client management error the page can show."""
+    return _client_response({"error": error, "message": message}, status)
+
+
+def _client_response(body: dict[str, Any], status: int = 200) -> web.Response:
+    """Return a client management response that is never cached.
+
+    The list changes with every action on the page, and the response to a
+    registration carries the client secret.
+    """
+    return web.json_response(body, status=status, headers={"Cache-Control": "no-store"})
+
+
+def _redirect_uris_from(body: dict[str, Any]) -> list[str]:
+    """Return the redirect URIs of a client management request.
+
+    Raises:
+        ValueError: If they are not a non-empty list of strings
+    """
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list) or not all(isinstance(u, str) for u in redirect_uris):
+        raise ValueError("redirect_uris must be a list of strings")
+    redirect_uris = [uri.strip() for uri in redirect_uris if uri.strip()]
+    if not redirect_uris:
+        raise ValueError("At least one redirect URI is required")
+    return redirect_uris
+
+
+def _optional_bool(body: dict[str, Any], key: str) -> bool | None:
+    """Return a boolean field of a request body, or None when it is absent.
+
+    Raises:
+        ValueError: If the field holds anything but a boolean
+    """
+    value = body.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false")
+    return value
+
+
+class OIDCClientsView(HomeAssistantView):
+    """Client management for administrators, used by the login panel.
+
+    It does what the client actions do: list, register, update and revoke.
+    The client is named in the query string and not in the path, because the
+    ID of a metadata document client is a URL, and proxies treat encoded
+    slashes in a path differently. It is served under /api because Home
+    Assistant's service worker answers a GET from its cache anywhere else,
+    and the page reads the list again after every change.
+    """
+
+    url = "/api/oidc_provider/clients"
+    name = "api:oidc:clients"
+    requires_auth = True
+
+    @staticmethod
+    def _refusal(request: web.Request) -> web.Response | None:
+        """Return the response for a user who is not an administrator.
+
+        Callers compare the result with None: a response without headers of
+        its own is an empty mapping, and so false, on older aiohttp releases.
+        """
+        if request["hass_user"].is_admin:
+            return None
+        return _client_error("forbidden", "Only administrators can manage clients", 403)
+
+    @staticmethod
+    async def _body(request: web.Request) -> dict[str, Any]:
+        """Return the JSON object a request carries.
+
+        Raises:
+            ValueError: If the body is not a JSON object
+        """
+        try:
+            body = await request.json()
+        except ValueError as e:
+            raise ValueError("The request body must be JSON") from e
+        if not isinstance(body, dict):
+            raise ValueError("The request body must be a JSON object")
+        return body
+
+    async def get(self, request: web.Request) -> web.Response:
+        """List every client with its settings and session count."""
+        if (refusal := self._refusal(request)) is not None:
+            return refusal
+        return _client_response({"clients": managed_clients(request.app["hass"])})
+
+    async def post(self, request: web.Request) -> web.Response:
+        """Register a client. The response is the only place its secret appears."""
+        if (refusal := self._refusal(request)) is not None:
+            return refusal
+        hass = request.app["hass"]
+        try:
+            body = await self._body(request)
+            client_name = validate_client_name(body.get("client_name"))
+            redirect_uris = _redirect_uris_from(body)
+            consent_required = _optional_bool(body, "consent_required") or False
+            if client_name_in_use(hass, client_name):
+                return _client_error(
+                    "name_in_use", f"A client named '{client_name}' already exists", 409
+                )
+            client = await create_client(
+                hass,
+                client_name=client_name,
+                redirect_uris=redirect_uris,
+                consent_required=consent_required,
+            )
+        except ValueError as e:
+            return _client_error("invalid_request", str(e))
+
+        _LOGGER.info(
+            "Administrator %s registered client %s", request["hass_user"].id, client["client_id"]
+        )
+        return _client_response(
+            {
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "client_name": client["client_name"],
+                "redirect_uris": client["redirect_uris"],
+                "consent_required": client["consent_required"],
+            },
+            201,
+        )
+
+    async def patch(self, request: web.Request) -> web.Response:
+        """Change a stored client's redirect URIs and consent setting."""
+        if (refusal := self._refusal(request)) is not None:
+            return refusal
+        hass = request.app["hass"]
+        client_id = request.query.get("client_id", "")
+        try:
+            body = await self._body(request)
+            client = await update_client(
+                hass,
+                client_id,
+                _redirect_uris_from(body),
+                _optional_bool(body, "consent_required"),
+            )
+        except KeyError:
+            return _client_error("not_found", "No such client is registered", 404)
+        except ValueError as e:
+            return _client_error("invalid_request", str(e))
+
+        _LOGGER.info("Administrator %s updated client %s", request["hass_user"].id, client_id)
+        active = client_sessions(hass).get(client_id, {}).get("active_sessions", 0)
+        return _client_response(_managed_client(client_id, client, active))
+
+    async def delete(self, request: web.Request) -> web.Response:
+        """Revoke a client: remove it if it is stored and end its sessions."""
+        if (refusal := self._refusal(request)) is not None:
+            return refusal
+        client_id = request.query.get("client_id", "")
+        removed, ended = await remove_client(request.app["hass"], client_id)
+        if not removed and not ended:
+            return _client_error("not_found", "No such client is registered", 404)
+
+        _LOGGER.info(
+            "Administrator %s revoked client %s and ended %d sessions",
+            request["hass_user"].id,
+            client_id,
+            ended,
+        )
+        return _client_response({"removed": removed, "ended_sessions": ended})
