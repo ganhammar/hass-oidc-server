@@ -276,3 +276,101 @@ def test_names_are_spliced_into_text_as_written():
         f"Choose what {escaped} can do.",
         f"Choose what <bdi>{escaped}</bdi> can do.",
     ]
+
+
+RELOAD = """
+const panel = new OidcLoginPanel();
+panel._requestId = 'req';
+panel._hass = { locale: { language: 'en' } };
+const shown = [];
+panel._renderAccess = () => {
+  const access = panel._access;
+  shown.push({ view: access.view, rows: access.rows, selected: access.selected });
+};
+panel._renderCard = () => shown.push('plain');
+panel._wireDecision = () => {};
+panel.querySelectorAll = () => [];
+panel._renderError = (error) => shown.push(error.message);
+const requests = [];
+panel._fetchJson = async (url, init = {}) => {
+  requests.push(`${init.method || 'GET'} ${url}`);
+  if (init.method === 'POST') {
+    throw Object.assign(new Error('400 Invalid access choice'), { status: 400 });
+  }
+  if (now === null) {
+    throw Object.assign(new Error('400 Invalid or expired request'), { status: 400 });
+  }
+  return now;
+};
+panel._renderConsent(before);
+panel._access.view = 'detailed';
+for (const [group, option] of Object.entries(chosen)) {
+  panel._access.chooseOption(group, option);
+}
+await panel._onDecision(true);
+return {
+  requests,
+  shown: shown.slice(1),
+  notice: panel._notice || null,
+  deciding: panel._deciding,
+};
+"""
+
+
+def _details(access):
+    return {
+        "client_name": "App",
+        "redirect_host": "app.example.com",
+        "scopes": ["openid", "profile"],
+        "consent_required": True,
+        "client_host": None,
+        "redirect_is_loopback": False,
+        **({"access": access} if access else {}),
+    }
+
+
+@needs_node
+def test_a_refused_approval_shows_the_screen_again_from_the_current_access(stand_in):
+    """The ceiling was lowered after the screen loaded: the choice is kept as far as it
+    still fits, the view too, and a notice says what happened."""
+    before = _details(_access_model(stand_in))
+    now = _details(
+        _access_model(
+            stand_in,
+            {
+                "groups": {"lights": {"max": "read", "reason": "Limited."}},
+                "reason": "Not for you.",
+            },
+        )
+    )
+
+    result = _run_panel(RELOAD, before=before, now=now, chosen={**CONTROL, "cameras": "none"})
+
+    assert result["requests"] == [
+        "POST /oidc/continue",
+        "GET /oidc/continue?request_id=req&language=en",
+    ]
+    assert result["shown"] == [
+        {"view": "detailed", "rows": {**LOOK_ONLY, "cameras": "none"}, "selected": "_custom"}
+    ]
+    assert result["notice"] == (
+        "The access you can allow changed after this page opened. "
+        "Check your choice and approve again."
+    )
+    assert result["deciding"] is False
+
+    # A resource that no longer offers a choice gets the plain screen
+    result = _run_panel(RELOAD, before=before, now=_details(None), chosen=CONTROL)
+
+    assert result["shown"] == ["plain"]
+    assert result["notice"] is not None
+
+
+@needs_node
+def test_a_refused_approval_of_a_request_that_is_gone_shows_the_error(stand_in):
+    before = _details(_access_model(stand_in))
+
+    result = _run_panel(RELOAD, before=before, now=None, chosen=CONTROL)
+
+    assert result["shown"] == ["400 Invalid access choice"]
+    assert result["notice"] is None

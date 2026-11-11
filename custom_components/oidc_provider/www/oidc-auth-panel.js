@@ -35,6 +35,7 @@ const FALLBACK_STRINGS = {
   "consent.loopback": "This sends you back to an application on your own computer. Only approve if you started this sign-in yourself.",
   "consent.approve": "Approve",
   "consent.deny": "Deny",
+  "consent.changed": "The access you can allow changed after this page opened. Check your choice and approve again.",
   "consent.approved_title": "Access approved",
   "consent.denied_title": "Access denied",
   "consent.sending_back": "Sending you back to the application.",
@@ -637,7 +638,7 @@ function markup(value) {
 // The user's choice of access at a resource, and what follows from it: which
 // levels match, what is locked by the user's ceiling, and which notes hold.
 class AccessChoice {
-  constructor(model) {
+  constructor(model, start = null) {
     this.model = model;
     this.presets = model.presets;
     this.groups = model.sections.flatMap((section) => section.groups);
@@ -662,16 +663,17 @@ class AccessChoice {
       previous = rows;
     }
 
-    // The first time the default level, afterwards the user's last choice. A
-    // locked default gives way to the nearest open level below it, or else
-    // above it, and the screen never opens on a locked level's choice. A
-    // group the description gained since the last choice starts as in that
-    // level. The last choice is marked as such only when the ceiling leaves
-    // it as it was.
+    // The first time the default level, afterwards the user's last choice,
+    // or the rows in start when they are given. A locked default gives way to
+    // the nearest open level below it, or else above it, and the screen never
+    // opens on a locked level's choice. A group the description gained since
+    // the choice was made starts as in that level. The last choice is marked
+    // as such only when the ceiling leaves it as it was.
     const opening = this.openingPreset(model.default_preset);
     const base = opening ? opening.options : this.lowestRows();
     const remembered = model.remembered ? { ...base, ...model.remembered } : null;
-    const rows = remembered && this.clamp(remembered);
+    const wanted = start ? { ...base, ...start } : remembered;
+    const rows = wanted && this.clamp(wanted);
     this.rows = rows && !this.lockedChoice(rows) ? rows : this.clamp(base);
     const match = this.matching(this.rows);
     this.selected = match ? match.id : CUSTOM;
@@ -830,12 +832,7 @@ class OidcLoginPanel extends HTMLElement {
 
     try {
       await this._waitForHass();
-      const [details] = await Promise.all([
-        this._fetchJson(
-          `/oidc/continue?request_id=${encodeURIComponent(requestId)}&language=${encodeURIComponent(this._language())}`
-        ),
-        this._loadStrings(),
-      ]);
+      const [details] = await Promise.all([this._fetchJson(this._continueUrl()), this._loadStrings()]);
 
       if (details.consent_required) {
         this._renderConsent(details);
@@ -856,6 +853,11 @@ class OidcLoginPanel extends HTMLElement {
         this._renderError(sessionsError, 'panel.sessions_error_hint');
       }
     }
+  }
+
+  _continueUrl() {
+    const requestId = encodeURIComponent(this._requestId);
+    return `/oidc/continue?request_id=${requestId}&language=${encodeURIComponent(this._language())}`;
   }
 
   _language() {
@@ -910,20 +912,26 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   _consentAlert(details) {
+    const notice = this._notice ? `<ha-alert alert-type="info">${this._notice}</ha-alert>` : '';
     return `
         <ha-alert alert-type="warning">
           ${this._t('consent.alert', { client: markup(this._clientLabel(details)) })}
         </ha-alert>
+        ${notice}
       `;
   }
 
-  _renderConsent(details) {
+  // previous is the choice on the screen before it was loaded again: its rows
+  // are kept as far as the access offered now allows, and so is its view.
+  _renderConsent(details, previous = null) {
     this._details = details;
     if (details.access) {
-      this._access = new AccessChoice(details.access);
+      this._access = new AccessChoice(details.access, previous && previous.rows);
+      this._access.view = (previous && previous.view) || 'simple';
       this._renderAccess();
       return;
     }
+    this._access = null;
 
     const scopes = (details.scopes || []).map((scope) => {
       const key = `consent.scope_${scope}`;
@@ -1310,8 +1318,28 @@ class OidcLoginPanel extends HTMLElement {
       await this._decide(approve);
     } catch (error) {
       this._deciding = false;
+      if (approve && error.status === 400 && (await this._consentAgain())) {
+        return;
+      }
       this._renderError(error);
     }
+  }
+
+  // An approval refused while the request is still pending means the screen
+  // no longer fits what the resource allows, as when the user's ceiling was
+  // lowered after it loaded. The screen is shown again from the resource's
+  // current answers, with a notice. False when the request is gone.
+  async _consentAgain() {
+    let details;
+    try {
+      details = await this._fetchJson(this._continueUrl());
+    } catch (error) {
+      return false;
+    }
+    const previous = this._access && { rows: this._access.rows, view: this._access.view };
+    this._notice = this._t('consent.changed');
+    this._renderConsent(details, previous);
+    return true;
   }
 
   async _decide(approve) {

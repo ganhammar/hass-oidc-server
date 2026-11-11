@@ -56,6 +56,7 @@
       "loopback": "This sends you back to an application on your own computer. Only approve if you started this sign-in yourself.",
       "approve": "Approve",
       "deny": "Deny",
+      "changed": "The access you can allow changed after this page opened. Check your choice and approve again.",
       "approved_title": "Access approved",
       "denied_title": "Access denied",
       "sending_back": "Sending you back to the application."
