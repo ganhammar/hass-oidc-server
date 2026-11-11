@@ -83,7 +83,7 @@
       "sees_profile": "name",
       "sees_email": "email address",
       "sees_groups": "group memberships",
-      "change_later": "You can sign {app} out at any time under Connected applications."
+      "change_later": "You can change what {app} can do, or sign it out, at any time under Connected applications."
     },
     "sessions": {
       "heading": "Connected applications",
@@ -92,7 +92,16 @@
       "access": "Access: {level}",
       "meta": "Signed in {signed_in}, last used {last_used}",
       "never": "never",
+      "change_access": "Change access",
       "sign_out": "Sign out"
+    },
+    "change": {
+      "heading": "Change access for {client}",
+      "save": "Save",
+      "cancel": "Cancel",
+      "changed": "The access you can allow changed after this page opened. Check your choice and save again.",
+      "saved": "Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour.",
+      "gone": "{app} is no longer signed in, so its access cannot be changed."
     }
   }
 }
