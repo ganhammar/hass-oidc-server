@@ -57,7 +57,7 @@ Availability and the ceiling are functions rather than part of the description b
 | Key | What it is |
 |---|---|
 | `resource` | The resource indicators (RFC 8707) your tokens are bound to, as one string or a list. A path starting with `/` matches on whichever address the authorization request reached Home Assistant at, which is where you answer too: `/api/mcp` matches `https://ha.example.com/api/mcp` for a sign-in at `https://ha.example.com`. An absolute `http` or `https` URL matches as written. The scheme and host match in any case (RFC 3986) and the path exactly, so `/api/MCP` and `/api/mcp/` are not `/api/mcp`. List every path you answer on. A client's `resource` that matches none of them fails safe: the consent screen offers no choice, and the token carries none of your scopes. A client must send the same value as `resource` when it authorizes; the provider binds the token's `aud` to it as before. |
-| `name` | Your resource's name, shown in warnings and used in the default prompt. |
+| `name` | Your resource's name. The provider's log messages give it next to your integration's domain. The consent screen does not show it. |
 | `prompt` | The line above the levels. Defaults to "Choose what {app} can do." |
 | `detail_intro` | A paragraph under the heading of the detailed view. Use it to say what your settings mean. |
 | `scopes` | Every scope a choice can grant: `{scope: {"title": ..., "description": ...}}`, a title and one sentence each. They are advertised in the provider's discovery documents. |

@@ -205,7 +205,7 @@ async def test_a_resource_that_cannot_answer_gets_the_plain_screen(
     assert "access" not in data
     assert data["consent_required"] is False
     assert (
-        "Ignoring the resource description of integration oidc_stand_in for this sign-in"
+        "Ignoring the resource description of integration oidc_stand_in (Stand-in) for this sign-in"
         in caplog.text
     )
 
@@ -228,8 +228,8 @@ async def test_a_resource_that_does_not_answer_in_time_is_treated_as_failing(
     assert status == 200
     assert "access" not in data
     assert (
-        "Ignoring the resource description of integration oidc_stand_in for this sign-in: "
-        "it did not answer within 0.01 seconds"
+        "Ignoring the resource description of integration oidc_stand_in (Stand-in) for this "
+        "sign-in: it did not answer within 0.01 seconds"
     ) in caplog.text
 
     status, text = await _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
@@ -685,8 +685,9 @@ async def test_connected_applications_when_the_resource_cannot_describe_itself(s
 
     assert data["sessions"][0]["access"] is None
     assert data["resources"] == {}
-    assert "Not showing the access granted at the resource of integration oidc_stand_in" in (
-        caplog.text
+    assert (
+        "Not showing the access granted at the resource of integration oidc_stand_in (Stand-in)"
+        in caplog.text
     )
 
 
@@ -707,6 +708,6 @@ async def test_connected_applications_when_the_resource_does_not_answer_in_time(
 
     assert data["sessions"][0]["access"] is None
     assert (
-        "Not showing the access granted at the resource of integration oidc_stand_in: "
-        "it did not answer within 0.01 seconds"
+        "Not showing the access granted at the resource of integration oidc_stand_in "
+        "(Stand-in): it did not answer within 0.01 seconds"
     ) in caplog.text

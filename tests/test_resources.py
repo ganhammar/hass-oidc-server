@@ -166,8 +166,8 @@ async def test_plain_function_and_a_second_claim_on_a_resource(stand_in, caplog)
         )
     assert [described.domain for described in described_resources(hass)] == ["oidc_stand_in"]
     assert (
-        "Ignoring the resource description of integration other: integration oidc_stand_in "
-        "already describes /api/stand_in_http"
+        "Ignoring the resource description of integration other (Stand-in): integration "
+        "oidc_stand_in (Stand-in) already describes /api/stand_in_http"
     ) in caplog.text
 
     await _async_collect(hass, "oidc_stand_in", stand_in)
@@ -191,7 +191,10 @@ async def test_a_claim_differing_only_in_the_case_of_the_host_is_the_same_claim(
         )
 
     assert [described.domain for described in described_resources(hass)] == ["notes"]
-    assert "integration notes already describes https://notes.example.com/api" in caplog.text
+    assert (
+        "integration notes (Stand-in) already describes https://notes.example.com/api"
+        in caplog.text
+    )
     assert find_resource(hass, "https://NOTES.example.com/api", BASE).domain == "notes"
 
 

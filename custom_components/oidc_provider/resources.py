@@ -71,6 +71,11 @@ class DescribedResource:
     platform: Any
     description: dict[str, Any]
 
+    @property
+    def label(self) -> str:
+        """Name the resource in log messages: its integration's domain and its name."""
+        return f"{self.domain} ({self.description['name']})"
+
 
 # How long a resource module's function may take to answer, in seconds
 CALL_TIMEOUT = 10
@@ -140,10 +145,11 @@ async def _async_collect(hass: HomeAssistant, domain: str, platform: Any) -> Non
         )
         if shared and other.domain != domain:
             _LOGGER.warning(
-                "Ignoring the resource description of integration %s: integration %s "
+                "Ignoring the resource description of integration %s (%s): integration %s "
                 "already describes %s",
                 domain,
-                other.domain,
+                description["name"],
+                other.label,
                 ", ".join(shared),
             )
             return
@@ -151,7 +157,7 @@ async def _async_collect(hass: HomeAssistant, domain: str, platform: Any) -> Non
     registry[domain] = DescribedResource(domain, platform, description)
     _LOGGER.debug(
         "Integration %s describes the access it offers at %s",
-        domain,
+        registry[domain].label,
         ", ".join(description["resource"]),
     )
 
@@ -208,7 +214,7 @@ async def _async_ask(
     except InvalidDescription as err:
         _LOGGER.warning(
             "Ignoring the resource description of integration %s for this sign-in: %s",
-            described.domain,
+            described.label,
             err,
         )
         return None
@@ -216,7 +222,7 @@ async def _async_ask(
         _LOGGER.warning(
             "Ignoring the resource description of integration %s for this sign-in: "
             "it did not answer within %s seconds",
-            described.domain,
+            described.label,
             CALL_TIMEOUT,
         )
         return None
@@ -224,7 +230,7 @@ async def _async_ask(
         _LOGGER.warning(
             "Ignoring the resource description of integration %s for this sign-in: "
             "asking it failed",
-            described.domain,
+            described.label,
             exc_info=True,
         )
         return None
@@ -277,13 +283,15 @@ async def async_display_model(
         _LOGGER.warning(
             "Not showing the access granted at the resource of integration %s: "
             "it did not answer within %s seconds",
-            domain,
+            described.label,
             CALL_TIMEOUT,
         )
         return None
     except Exception as err:
         _LOGGER.warning(
-            "Not showing the access granted at the resource of integration %s: %s", domain, err
+            "Not showing the access granted at the resource of integration %s: %s",
+            described.label,
+            err,
         )
         return None
     return consent_model(description)
