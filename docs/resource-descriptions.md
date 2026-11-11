@@ -162,6 +162,8 @@ Options above `max` are shown locked with the group's reason and cannot be chose
 
 At least one preset must stay unlocked.
 
+Locking a preset locks its exact choice and its scope. An approval whose options are exactly a locked preset's is refused, also when the user sets them one by one in the detailed view; the screen then says why next to Approve and does not let the user approve. So a token never carries a locked preset's own `scopes`. A choice that differs from a locked preset in any group is not affected and carries the scopes of its options, so to keep an option out of reach, limit its group with `max`. The screen never opens on a locked preset's choice: a locked `default_preset` gives way to the nearest unlocked preset below it, or else above it, and a last choice that is exactly a locked preset gives way to that default.
+
 The ceiling on the consent screen is for the user's benefit. Enforce it yourself on every request too: a ceiling can be lowered after a token was issued.
 
 ## Validation

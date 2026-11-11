@@ -75,6 +75,7 @@
       "difference": "{area}: {option}",
       "last_choice": "Your choice last time",
       "not_available": "Not available",
+      "locked_choice": "These settings are the same as {level}. {reason}",
       "fine_print": "When you approve, you go back to {host}.",
       "fine_print_sees": "{app} will also see your {information}.",
       "sees_profile": "name",

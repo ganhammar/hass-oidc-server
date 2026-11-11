@@ -368,6 +368,20 @@ def test_choice(description):
             validate_choice(description, ceiling, data)
 
 
+def test_a_choice_that_is_exactly_a_locked_preset_is_refused(description):
+    """Locking a preset locks its exact choice, and with it the preset's own scopes."""
+    ceiling = validate_ceiling(description, {"locked_presets": ["admin"], "reason": "Not for you."})
+
+    with pytest.raises(InvalidChoice, match="those of preset admin, which is locked"):
+        validate_choice(description, ceiling, {"options": ADMIN})
+
+    # A choice a group away from it is checked as before
+    near = {**ADMIN, "cameras": "none"}
+    assert validate_choice(description, ceiling, {"options": near}) == near
+    # So is the same choice without the lock
+    assert validate_choice(description, None, {"options": ADMIN}) == ADMIN
+
+
 def test_known_options_drop_what_the_description_no_longer_has(description):
     stored = {"lights": "full", "cameras": "full", "garden": "read", "files": "none"}
     assert known_options(description, stored) == {"lights": "full", "files": "none"}

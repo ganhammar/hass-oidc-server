@@ -602,29 +602,55 @@ class AccessChoice {
     this.unavailable = model.unavailable || {};
     this.most = Math.max(...this.groups.map((group) => group.options.length));
 
-    // A level the resource locks for this user, and one that adds nothing the
-    // user may grant to the one before it
-    this.locked = new Set((model.ceiling && model.ceiling.locked_presets) || []);
+    // The levels the resource locks for this user. Their exact choice cannot
+    // be approved either, also when it is made in the detailed view.
+    const lockedIds = (model.ceiling && model.ceiling.locked_presets) || [];
+    this.lockedByCeiling = this.presets.filter((preset) => lockedIds.includes(preset.id));
+    // A level is locked as well when it adds nothing the user may grant to the
+    // one before it, or when the ceiling holds it at a locked level's choice
+    this.locked = new Set(lockedIds);
     let previous = null;
     for (const preset of this.presets) {
       const rows = this.presetRows(preset);
-      if (previous && this.same(rows, previous)) {
+      if ((previous && this.same(rows, previous)) || this.lockedChoice(rows)) {
         this.locked.add(preset.id);
       }
       previous = rows;
     }
 
-    // The first time the default level, afterwards the user's last choice.
-    // A group the description gained since then starts as in the default.
-    // The last choice is marked as such only when the ceiling leaves it as it was.
-    const fallback = this.presets.find((preset) => preset.id === model.default_preset) || this.presets[0];
-    const remembered = model.remembered ? { ...fallback.options, ...model.remembered } : null;
-    this.rows = remembered ? this.clamp(remembered) : this.presetRows(fallback);
+    // The first time the default level, afterwards the user's last choice. A
+    // locked default gives way to the nearest open level below it, or else
+    // above it, and the screen never opens on a locked level's choice. A
+    // group the description gained since the last choice starts as in that
+    // level. The last choice is marked as such only when the ceiling leaves
+    // it as it was.
+    const opening = this.openingPreset(model.default_preset);
+    const base = opening ? opening.options : this.lowestRows();
+    const remembered = model.remembered ? { ...base, ...model.remembered } : null;
+    const rows = remembered && this.clamp(remembered);
+    this.rows = rows && !this.lockedChoice(rows) ? rows : this.clamp(base);
     const match = this.matching(this.rows);
     this.selected = match ? match.id : CUSTOM;
     this.customRows = match ? null : { ...this.rows };
     this.lastChoice = remembered && this.same(this.rows, remembered) ? this.selected : null;
     this.view = 'simple';
+  }
+
+  // The level the screen opens on: the given one, or the nearest open level
+  // below it, or else above it. None when every level is locked.
+  openingPreset(id) {
+    const index = Math.max(0, this.presets.findIndex((preset) => preset.id === id));
+    const order = [...this.presets.slice(0, index + 1).reverse(), ...this.presets.slice(index + 1)];
+    return order.find((preset) => !this.locked.has(preset.id)) || null;
+  }
+
+  lowestRows() {
+    return Object.fromEntries(this.groups.map((group) => [group.id, group.options[0].id]));
+  }
+
+  // The level the ceiling locks whose exact choice the rows are, if any
+  lockedChoice(rows) {
+    return this.lockedByCeiling.find((preset) => this.same(preset.options, rows)) || null;
   }
 
   optionIds(gid) {
@@ -959,6 +985,7 @@ class OidcLoginPanel extends HTMLElement {
       <p class="fine-print">${finePrint}</p>
       ${loopbackNote}
       <p class="hint">${this._t('access.change_later', { app: markup(this._appName()) })}</p>
+      <div id="oidc-locked-choice" aria-live="polite"></div>
       <div class="action">
         <ha-button id="oidc-approve">${this._t('consent.approve')}</ha-button>
       </div>
@@ -1051,6 +1078,7 @@ class OidcLoginPanel extends HTMLElement {
       input.addEventListener('change', () => {
         access.choosePreset(input.value);
         this._updateLevelNotes();
+        this._updateApproval();
       });
     }
     this.querySelector('#oidc-to-detailed').addEventListener('click', () => {
@@ -1059,6 +1087,7 @@ class OidcLoginPanel extends HTMLElement {
       this.querySelector('#oidc-back').focus();
     });
     this._wireDecision();
+    this._updateApproval();
   }
 
   _areaRow(group) {
@@ -1194,13 +1223,29 @@ class OidcLoginPanel extends HTMLElement {
     this.querySelector('#oidc-preset').value = access.selected;
     this.querySelector('#oidc-custom-status').innerHTML =
       access.selected === CUSTOM ? this._statusHtml(access.rows) : '';
+    this._updateApproval();
+  }
+
+  // A choice that is exactly a level the ceiling locks cannot be approved.
+  // Approve is turned off and the reason shown right above it, in either view.
+  _updateApproval() {
+    const access = this._access;
+    const locked = access.lockedChoice(access.rows);
+    this.querySelector('#oidc-locked-choice').innerHTML = locked
+      ? `<div class="limit-reason">${icon('lock')}<span>${this._t('access.locked_choice', {
+          level: markup(this._res(locked.title)),
+          reason: markup(this._res(access.model.ceiling.reason)),
+        })}</span></div>`
+      : '';
+    this.querySelector('#oidc-approve').toggleAttribute('disabled', Boolean(locked));
   }
 
   // ---- Deciding -----------------------------------------------------------
 
   async _onDecision(approve) {
-    // One decision per request, even if the buttons have not upgraded yet
-    if (this._deciding) {
+    // One decision per request, even if the buttons have not upgraded yet,
+    // and no approval of a choice the ceiling locks
+    if (this._deciding || (approve && this._access && this._access.lockedChoice(this._access.rows))) {
       return;
     }
     this._deciding = true;

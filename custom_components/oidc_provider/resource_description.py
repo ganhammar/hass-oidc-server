@@ -348,11 +348,11 @@ def validate_ceiling(description: dict[str, Any], data: Any) -> dict[str, Any] |
 
     groups maps a group id to the highest option the user may choose there
     (max) and why (reason). A group left out has no limit. locked_presets
-    names presets the user may not pick, such as every level above the lowest
-    while the resource is read-only; a preset that would add nothing the user
-    may grant to the one before it is locked as well. reason says why a preset
-    is locked and is needed once anything is limited. None, or nothing
-    limited, means no ceiling.
+    names presets whose exact choice the user may not make, such as every
+    level above the lowest while the resource is read-only. The consent
+    screen also locks a preset that would add nothing the user may grant to
+    the one before it. reason says why a preset is locked and is needed once
+    anything is limited. None, or nothing limited, means no ceiling.
     """
     if data is None:
         return None
@@ -406,7 +406,9 @@ def validate_choice(
     """Return the option chosen for every group, or raise InvalidChoice.
 
     The choice is {"options": {group id: option id}} with one option for every
-    group, none of them above the ceiling.
+    group, none of them above the ceiling, and not exactly the options of a
+    preset the ceiling locks: locking a preset locks its choice, and with it
+    the preset's own scopes, in the detailed view too.
     """
     if not isinstance(choice, dict) or not isinstance(choice.get("options"), dict):
         raise InvalidChoice("expected an options dict")
@@ -424,6 +426,10 @@ def validate_choice(
         if limit is not None and ids.index(chosen[gid]) > ids.index(limit["max"]):
             raise InvalidChoice(f"the option for group {gid} is above the ceiling")
         options[gid] = chosen[gid]
+    locked = (ceiling or {}).get("locked_presets", [])
+    for preset in description["presets"]:
+        if preset["id"] in locked and preset["options"] == options:
+            raise InvalidChoice(f"the options are those of preset {preset['id']}, which is locked")
     return options
 
 

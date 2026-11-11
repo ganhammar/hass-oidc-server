@@ -277,6 +277,26 @@ async def test_an_approval_without_a_fitting_choice_is_refused(stand_in, access,
     assert hass.data[DOMAIN]["authorization_codes"] == {}
 
 
+async def test_approving_the_exact_choice_of_a_locked_preset_is_refused(stand_in):
+    """Locking a level locks its choice, so its scope cannot be had from the detailed view."""
+    admin = {**LOOK_ONLY, "lights": "full", "automations": "full", "files": "full"}
+    stand_in.CEILINGS[USER] = {"locked_presets": ["admin"], "reason": "Not for you."}
+    hass = await _hass(stand_in)
+
+    status, text = await _post(hass, {"approve": True, "access": {"options": admin}})
+
+    assert status == 400
+    assert "those of preset admin, which is locked" in text
+    assert "req" in hass.data[DOMAIN]["pending_auth_requests"]
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
+
+    status, _ = await _post(
+        hass, {"approve": True, "access": {"options": {**admin, "cameras": "none"}}}
+    )
+    assert status == 200
+    assert "stand_in:admin" not in _code(hass)["access"]["scopes"]
+
+
 async def test_a_denial_does_not_ask_the_resource(stand_in):
     hass = await _hass(stand_in)
 

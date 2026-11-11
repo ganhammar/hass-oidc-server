@@ -1702,6 +1702,53 @@ async def test_consent_shows_ceilings_and_unavailable_areas(
     assert "above the ceiling" in text
 
 
+async def test_a_locked_preset_cannot_be_approved_by_its_options(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    """Locking a level locks its exact choice and its scope, wherever the choice is made."""
+    admin = {**STAND_IN_LOOK_ONLY, "lights": "full", "automations": "full", "files": "full"}
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "locked_presets": ["admin"],
+        "reason": "Not available for your account.",
+    }
+    client = await hass_client()
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["ceiling"]["locked_presets"] == [
+        "admin"
+    ]
+
+    status, text = await _choose(client, request_id, admin)
+
+    assert status == 400
+    assert "those of preset admin, which is locked" in text
+
+    # The request is still pending, and a choice that is not the locked level is granted
+    status, body = await _choose(client, request_id, {**admin, "cameras": "none"})
+    assert status == 200, body
+    code = parse_qs(urlparse(body["redirect_url"]).query)["code"][0]
+    status, tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, tokens
+    assert "stand_in:admin" not in tokens["scope"].split()
+    assert "stand_in:files:full" in tokens["scope"].split()
+
+
 async def test_panel_strings_are_served_in_the_users_language(
     setup_provider: None, hass_client: ClientSessionGenerator
 ) -> None:
