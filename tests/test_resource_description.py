@@ -14,6 +14,7 @@ from custom_components.oidc_provider.resource_description import (
     known_options,
     matching_preset,
     resource_matches,
+    resources_overlap,
     validate_availability,
     validate_ceiling,
     validate_choice,
@@ -484,25 +485,48 @@ def test_matching_preset(description):
 
 
 @pytest.mark.parametrize(
-    ("indicator", "base", "matches"),
+    ("indicator", "matches"),
     [
-        ("https://ha.example.com/api/stand_in", "https://ha.example.com", True),
-        ("https://ha.example.com/api/stand_in_http", "https://ha.example.com/", True),
-        ("https://other.example.com/api/stand_in", "https://ha.example.com", False),
-        ("https://ha.example.com/api/stand_in/", "https://ha.example.com", False),
-        ("https://notes.example.com/api", "https://ha.example.com", True),
-        (None, "https://ha.example.com", False),
+        ("https://ha.example.com/api/stand_in", True),
+        ("https://ha.example.com/api/stand_in_http", True),
+        ("https://ha.example.com/api/stand_in/", False),
+        ("https://ha.example.com/api", False),
+        ("https://notes.example.com/api", True),
+        (None, False),
+        # A path names the resource at any address, so which address a request
+        # arrives at cannot decide whether the user is asked
+        ("https://other.example.com/api/stand_in", True),
+        ("http://192.168.1.10:8123/api/stand_in", True),
+        ("https://ha.example.com/api/stand_in?x=1", True),
         # Scheme and host in any case, the path exactly (RFC 3986 §6.2.2.1)
-        ("HTTPS://HA.Example.COM/api/stand_in", "https://ha.example.com", True),
-        ("https://ha.example.com/api/stand_in", "https://HA.example.com", True),
-        ("https://Notes.Example.com/api", "https://ha.example.com", True),
-        ("https://ha.example.com/API/stand_in", "https://ha.example.com", False),
-        ("https://notes.example.com/API", "https://ha.example.com", False),
+        ("HTTPS://HA.Example.COM/api/stand_in", True),
+        ("https://Notes.Example.com/api", True),
+        ("https://ha.example.com/API/stand_in", False),
+        ("https://notes.example.com/API", False),
+        ("https://notes.example.com/api?x=1", False),
     ],
 )
-def test_resource_matches(indicator, base, matches):
+def test_resource_matches(indicator, matches):
     resources = ["/api/stand_in", "/api/stand_in_http", "https://notes.example.com/api"]
-    assert resource_matches(resources, indicator, base) is matches
+    assert resource_matches(resources, indicator) is matches
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "shared"),
+    [
+        (["/api/a", "/api/b"], ["/api/b"], ["/api/b"]),
+        (["/api/a"], ["https://x.example.com/api/a"], ["/api/a"]),
+        (["https://x.example.com/api/a"], ["/api/a"], ["https://x.example.com/api/a"]),
+        (
+            ["https://x.example.com/api/a"],
+            ["HTTPS://X.example.com/api/a"],
+            ["https://x.example.com/api/a"],
+        ),
+        (["/api/a", "https://x.example.com/api"], ["/api/c", "https://y.example.com/api"], []),
+    ],
+)
+def test_resources_overlap(first, second, shared):
+    assert resources_overlap(first, second) == shared
 
 
 def test_consent_model_leaves_scopes_and_resources_on_the_server(description):

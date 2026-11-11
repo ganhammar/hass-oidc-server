@@ -84,9 +84,8 @@ def _resource(value: Any) -> str:
     """Validate where a resource answers: a path on this Home Assistant or a URL.
 
     A path starts with a single slash, names more than the root and is
-    matched against resource indicators on whichever address the
-    authorization request reached Home Assistant at. A URL is matched as it is
-    written. Neither holds whitespace, control characters or . and ..
+    matched against the path of a resource indicator, at any address. A URL
+    is matched as it is written. Neither holds whitespace, control characters or . and ..
     segments, which would make what is matched differ from where the resource
     answers.
     """
@@ -505,23 +504,41 @@ def comparable_resource(url: str) -> str:
     return f"{match.group(1).lower()}{match.group(2)}" if match else url
 
 
-def resource_matches(resources: list[str], indicator: str | None, base_url: str) -> bool:
+def resource_matches(resources: list[str], indicator: str | None) -> bool:
     """Return whether a resource indicator (RFC 8707) names a described resource.
 
-    A path is matched on the address the authorization request reached Home
-    Assistant at, which is where a resource server on this Home Assistant
-    answers too, and a URL as it is written. Scheme and host match in any
-    case and the path exactly, so an indicator that differs in its path names
-    no described resource.
+    A path names the resource at any address: an indicator matches when its
+    path is that path, whatever its scheme, host and query. Home Assistant
+    answers at several addresses and the client picks which one its requests
+    arrive at, so the answer cannot depend on that address without letting
+    the client decide whether the user is asked. An indicator for another
+    server with the same path matches too, which adds scopes its audience
+    does not read. A URL matches as it is written, with scheme and host in
+    any case. The path matches exactly either way.
     """
     if not indicator:
         return False
-    base = base_url.rstrip("/")
     wanted = comparable_resource(indicator)
+    path = urlsplit(indicator).path
     return any(
-        wanted == comparable_resource(f"{base}{resource}" if resource.startswith("/") else resource)
+        path == resource if resource.startswith("/") else wanted == comparable_resource(resource)
         for resource in resources
     )
+
+
+def resources_overlap(first: list[str], second: list[str]) -> list[str]:
+    """Return the resources of first that an indicator could match in second too."""
+    paths = {resource for resource in second if resource.startswith("/")}
+    urls = [resource for resource in second if not resource.startswith("/")]
+    return [
+        resource
+        for resource in first
+        if (
+            resource in paths or any(resource_matches([resource], url) for url in urls)
+            if resource.startswith("/")
+            else resource_matches(second, resource)
+        )
+    ]
 
 
 def _without_scopes(entry: dict[str, Any]) -> dict[str, Any]:

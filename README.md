@@ -226,7 +226,7 @@ A token bound to such an integration with none of its scopes grants nothing ther
 
 A session that began before the integration described its access carries no choice. At its next refresh it gets the access the integration names for such sessions, held at what the person may allow, and keeps it from then on as if the person had chosen it, so [Connected applications](#connected-applications) shows it too. It is not remembered as the person's choice for their next sign-in. Until that refresh, the access token the session already holds, valid for up to an hour, carries none of the integration's scopes. When the integration names no access for such sessions, or the person may not have it, the session ends at that refresh instead and the application signs in again, where the person chooses. When the integration cannot answer at that refresh, the session is refreshed without its scopes and the next refresh tries again.
 
-An application must name such an integration when it authorizes. Naming it only when redeeming the code is refused with `invalid_target` where the provider recognizes the address, which is best effort; a token issued that way carries none of the integration's scopes.
+An application must name such an integration when it authorizes. Naming it only when redeeming the code is refused with `invalid_target`.
 
 ### Using with Claude Connectors
 

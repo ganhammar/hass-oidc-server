@@ -145,6 +145,19 @@ async def test_choosing_access_stops_on_the_screen_for_a_client_registered_witho
     assert data["consent_required"] is True
 
 
+async def test_the_resource_is_recognised_at_another_address_of_home_assistant(stand_in):
+    """A client cannot skip the choice by naming an address the request did not arrive at."""
+    hass = await _hass(stand_in, consent_required=False)
+    hass.data[DOMAIN]["pending_auth_requests"]["req"][
+        "resource"
+    ] = "http://192.168.1.10:8123/api/stand_in"
+
+    _, data = await _get(hass)
+
+    assert data["consent_required"] is True
+    assert data["access"]["resource"] == "oidc_stand_in"
+
+
 async def test_ceiling_and_remembered_choice_are_shown(stand_in):
     ceiling = {
         "groups": {"files": {"max": "read", "reason": "Limited for your account."}},

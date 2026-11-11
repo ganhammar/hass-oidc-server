@@ -38,10 +38,10 @@ from .cimd import is_client_id_url
 from .const import DOMAIN, STORAGE_KEY_ACCESS_CHOICES, STORAGE_VERSION
 from .resource_description import (
     InvalidDescription,
-    comparable_resource,
     consent_model,
     known_options,
     resource_matches,
+    resources_overlap,
     validate_availability,
     validate_ceiling,
     validate_description,
@@ -136,13 +136,8 @@ async def _async_collect(hass: HomeAssistant, domain: str, platform: Any) -> Non
         return
 
     registry: dict[str, DescribedResource] = hass.data[DATA_RESOURCES]
-    claimed = {comparable_resource(resource) for resource in description["resource"]}
     for other in registry.values():
-        shared = sorted(
-            resource
-            for resource in other.description["resource"]
-            if comparable_resource(resource) in claimed
-        )
+        shared = sorted(resources_overlap(other.description["resource"], description["resource"]))
         if shared and other.domain != domain:
             _LOGGER.warning(
                 "Ignoring the resource description of integration %s (%s): integration %s "
@@ -167,15 +162,13 @@ def described_resources(hass: HomeAssistant) -> list[DescribedResource]:
     return list(hass.data.get(DATA_RESOURCES, {}).values())
 
 
-def find_resource(
-    hass: HomeAssistant, indicator: str | None, base_url: str
-) -> DescribedResource | None:
+def find_resource(hass: HomeAssistant, indicator: str | None) -> DescribedResource | None:
     """Return the description of the resource an indicator names, if one was collected."""
     return next(
         (
             described
             for described in described_resources(hass)
-            if resource_matches(described.description["resource"], indicator, base_url)
+            if resource_matches(described.description["resource"], indicator)
         ),
         None,
     )

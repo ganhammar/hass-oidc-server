@@ -195,12 +195,12 @@ async def test_a_claim_differing_only_in_the_case_of_the_host_is_the_same_claim(
         "integration notes (Stand-in) already describes https://notes.example.com/api"
         in caplog.text
     )
-    assert find_resource(hass, "https://NOTES.example.com/api", BASE).domain == "notes"
+    assert find_resource(hass, "https://NOTES.example.com/api").domain == "notes"
 
 
 async def test_find_resource_and_scopes(stand_in):
     hass = _mock_hass()
-    assert find_resource(hass, f"{BASE}/api/stand_in", BASE) is None
+    assert find_resource(hass, f"{BASE}/api/stand_in") is None
     assert resource_scopes(hass) == []
 
     await _async_collect(hass, "oidc_stand_in", stand_in)
@@ -211,10 +211,10 @@ async def test_find_resource_and_scopes(stand_in):
         hass, "notes", SimpleNamespace(async_describe_resource=lambda hass, language: notes)
     )
 
-    assert find_resource(hass, f"{BASE}/api/stand_in_http", BASE).domain == "oidc_stand_in"
-    assert find_resource(hass, "https://notes.example.com/api", BASE).domain == "notes"
-    assert find_resource(hass, f"{BASE}/api/elsewhere", BASE) is None
-    assert find_resource(hass, None, BASE) is None
+    assert find_resource(hass, f"{BASE}/api/stand_in_http").domain == "oidc_stand_in"
+    assert find_resource(hass, "https://notes.example.com/api").domain == "notes"
+    assert find_resource(hass, f"{BASE}/api/elsewhere") is None
+    assert find_resource(hass, None) is None
     scopes = resource_scopes(hass)
     assert scopes[:2] == ["stand_in:read", "stand_in:control"]
     assert scopes[-1] == "notes:write"

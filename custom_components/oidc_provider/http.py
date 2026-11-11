@@ -808,9 +808,7 @@ class OIDCContinueView(HomeAssistantView):
             "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
         }
 
-        described = find_resource(
-            hass, stored_request.get("resource"), get_issuer_from_request(request)
-        )
+        described = find_resource(hass, stored_request.get("resource"))
         if described is not None:
             access = await async_consent_access(
                 hass,
@@ -845,9 +843,7 @@ class OIDCContinueView(HomeAssistantView):
         an approval that carries one anyway is refused, since the screen showed
         something that no longer holds.
         """
-        described = find_resource(
-            hass, stored_request.get("resource"), get_issuer_from_request(request)
-        )
+        described = find_resource(hass, stored_request.get("resource"))
         rules = (
             await async_access_rules(hass, described, request["hass_user"]) if described else None
         )
@@ -1566,7 +1562,7 @@ class OIDCTokenView(HomeAssistantView):
         resource = auth_data.get("resource")
         if resource is None:
             resource = _normalize_resource(data.get("resource"))
-            if find_resource(hass, resource, get_issuer_from_request(_request)):
+            if find_resource(hass, resource):
                 return web.json_response(
                     {
                         "error": "invalid_target",
@@ -1770,9 +1766,7 @@ class OIDCTokenView(HomeAssistantView):
         the resource cannot answer (see _settle_access_from_before).
         """
         if not token_data.get("access"):
-            described = find_resource(
-                hass, token_data.get("resource"), get_issuer_from_request(_request)
-            )
+            described = find_resource(hass, token_data.get("resource"))
             if described is not None:
                 refusal = await self._settle_access_from_before(
                     hass, described, refresh_token, token_data
