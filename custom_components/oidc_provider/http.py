@@ -18,7 +18,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
+from homeassistant.generated.languages import LANGUAGES
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.translation import async_get_translations
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import (
@@ -75,6 +77,21 @@ from .const import (
     TOKEN_USE_ACCESS,
     TOKEN_USE_ID,
 )
+from .resource_description import (
+    InvalidChoice,
+    existing_sessions_options,
+    granted_scopes,
+    validate_choice,
+)
+from .resources import (
+    DescribedResource,
+    async_access_rules,
+    async_consent_access,
+    async_display_model,
+    async_remember_choice,
+    find_resource,
+    resource_scopes,
+)
 from .security import verify_client_secret
 from .token_validator import decode_access_token, get_issuer_from_request
 
@@ -104,6 +121,68 @@ def _issuer_for(request: web.Request) -> str:
     the auth-server metadata, and that metadata lives under /oidc.
     """
     return f"{get_issuer_from_request(request)}/oidc"
+
+
+def _panel_language(hass: HomeAssistant, requested: str | None) -> str:
+    """Return the language the login panel is shown in.
+
+    That is the one the panel asks for, which is the user's own, when Home
+    Assistant knows it, and otherwise the server's.
+    """
+    return requested if requested in LANGUAGES else hass.config.language
+
+
+# The translation category holding the login panel's text. Home Assistant
+# accepts nested text under it for an integration's own panels.
+PANEL_STRINGS_CATEGORY = "config_panel"
+
+
+async def async_panel_strings(hass: HomeAssistant, language: str) -> dict[str, str]:
+    """Return the login panel's text in a language, keyed as in the translations.
+
+    Keys missing from that language's translations come in English.
+    """
+    prefix = f"component.{DOMAIN}.{PANEL_STRINGS_CATEGORY}."
+    translations = await async_get_translations(hass, language, PANEL_STRINGS_CATEGORY, [DOMAIN])
+    return {
+        key.removeprefix(prefix): value
+        for key, value in translations.items()
+        if key.startswith(prefix)
+    }
+
+
+def _scopes_supported(hass: HomeAssistant) -> list[str]:
+    """Return the scopes the discovery documents advertise.
+
+    Those are the OpenID Connect scopes and every scope a resource describes.
+    A resource's scopes are granted as the user chooses on the consent screen,
+    whether or not the client asked for them, and each resource server lists
+    its own in its protected resource metadata (RFC 9728).
+    """
+    return [*SUPPORTED_SCOPES, *resource_scopes(hass)]
+
+
+def _with_access_scopes(scope: str, access: dict[str, Any] | None) -> str:
+    """Return a grant's scope with the scopes of the access chosen at its resource."""
+    scopes = scope.split()
+    if access:
+        scopes.extend(granted for granted in access["scopes"] if granted not in scopes)
+    return " ".join(scopes)
+
+
+def _access(
+    described: DescribedResource, description: dict[str, Any], options: dict[str, str]
+) -> dict[str, Any]:
+    """Return access at a resource as a grant keeps it.
+
+    That is the resource's integration, the option in every group of its
+    description and the scopes those options grant.
+    """
+    return {
+        "resource": described.domain,
+        "options": options,
+        "scopes": granted_scopes(description, options),
+    }
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -374,11 +453,19 @@ def user_sessions(hass: HomeAssistant, user_id: str) -> list[dict[str, Any]]:
         if data.get("user_id") != user_id:
             continue
         last_used = max((d.get("issued_at") or 0 for _, d in tokens), default=0)
+        access = data.get("access")
         sessions.append(
             {
                 "session_id": _session_id(key),
                 **_client_display(hass, data["client_id"], data),
                 "scopes": (data.get("scope") or "").split(),
+                # The access the user chose at the session's resource, as the
+                # option chosen in each group of the resource's description
+                "access": (
+                    {"resource": access["resource"], "options": access["options"]}
+                    if access
+                    else None
+                ),
                 "signed_in_at": data.get("auth_time"),
                 "last_used_at": last_used or None,
                 "expires_at": int(data["expires_at"]),
@@ -641,6 +728,7 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
     hass.http.register_view(OIDCRevocationView())
     hass.http.register_view(OIDCSessionsView())
     hass.http.register_view(OIDCSessionView())
+    hass.http.register_view(OIDCStringsView())
     hass.http.register_view(OIDCClientsView())
 
 
@@ -702,25 +790,80 @@ class OIDCContinueView(HomeAssistantView):
         if port:
             redirect_host = f"{redirect_host}:{port}"
 
-        return web.json_response(
-            {
-                "client_name": client.get("client_name", stored_request["client_id"]),
-                "redirect_host": redirect_host,
-                "scopes": stored_request["scope"].split(),
-                # A client with no recorded setting predates the flag and may
-                # have come from dynamic registration, so it prompts until an
-                # operator clears the flag.
-                "consent_required": bool(client.get("consent_required", True)),
-                # A metadata document client is identified by the host serving
-                # its document, which the draft says to show (§8.5).
-                "client_host": (
-                    client_id_host(stored_request["client_id"])
-                    if client.get("metadata_document")
-                    else None
-                ),
-                "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
-            }
+        details: dict[str, Any] = {
+            "client_name": client.get("client_name", stored_request["client_id"]),
+            "redirect_host": redirect_host,
+            "scopes": stored_request["scope"].split(),
+            # A client with no recorded setting predates the flag and may
+            # have come from dynamic registration, so it prompts until an
+            # operator clears the flag.
+            "consent_required": bool(client.get("consent_required", True)),
+            # A metadata document client is identified by the host serving
+            # its document, which the draft says to show (§8.5).
+            "client_host": (
+                client_id_host(stored_request["client_id"])
+                if client.get("metadata_document")
+                else None
+            ),
+            "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
+        }
+
+        described = find_resource(hass, stored_request.get("resource"))
+        if described is not None:
+            access = await async_consent_access(
+                hass,
+                described,
+                request["hass_user"],
+                stored_request["client_id"],
+                _panel_language(hass, request.query.get("language")),
+            )
+            if access is not None:
+                details["access"] = access
+                # What the client may do at the resource is the user's choice,
+                # so the sign-in stops on the consent screen even for a client
+                # registered without consent.
+                details["consent_required"] = True
+
+        return web.json_response(details)
+
+    @staticmethod
+    async def _chosen_access(
+        hass: HomeAssistant,
+        request: web.Request,
+        stored_request: dict[str, Any],
+        choice: Any,
+    ) -> dict[str, Any] | None | web.Response:
+        """Check the access chosen on the consent screen and return what it grants.
+
+        For a resource that describes the access it offers, an approval must
+        carry a choice that fits the description and the user's ceiling, which
+        are asked again here rather than trusted from the screen. The result
+        names the resource's integration, the option chosen in every group and
+        the scopes that grants. None means the resource offers no choice, and
+        an approval that carries one anyway is refused, since the screen showed
+        something that no longer holds.
+        """
+        described = find_resource(hass, stored_request.get("resource"))
+        rules = (
+            await async_access_rules(hass, described, request["hass_user"]) if described else None
         )
+        if rules is None:
+            if choice is None:
+                return None
+            return web.Response(
+                text="The access you chose can no longer be checked. "
+                "Start the sign-in again from the application.",
+                status=400,
+            )
+
+        description, ceiling = rules
+        if choice is None:
+            return web.Response(text="Choose what the application may do", status=400)
+        try:
+            options = validate_choice(description, ceiling, choice)
+        except InvalidChoice as err:
+            return web.Response(text=f"Invalid access choice: {err}", status=400)
+        return _access(described, description, options)
 
     async def post(self, request: web.Request) -> web.Response:
         """Record the user's decision on the pending request."""
@@ -739,6 +882,18 @@ class OIDCContinueView(HomeAssistantView):
             return result
         stored_request, client = result
         request_id = body["request_id"]
+        approve = body.get("approve") is True
+
+        access = None
+        if approve:
+            access = await self._chosen_access(hass, request, stored_request, body.get("access"))
+            if isinstance(access, web.Response):
+                return access
+
+        # A decision either way consumes the pending request. Another decision
+        # on it may have been made while the resource was asked above.
+        if hass.data[DOMAIN]["pending_auth_requests"].pop(request_id, None) is not stored_request:
+            return web.Response(text="Invalid or expired request", status=400)
 
         # Extract parameters
         client_id = stored_request["client_id"]
@@ -750,9 +905,6 @@ class OIDCContinueView(HomeAssistantView):
         code_challenge_method = stored_request.get("code_challenge_method")
         resource = stored_request.get("resource")
 
-        # A decision either way consumes the pending request
-        del hass.data[DOMAIN]["pending_auth_requests"][request_id]
-
         separator = "&" if "?" in redirect_uri else "?"
 
         def build_redirect(**params: str) -> str:
@@ -763,7 +915,7 @@ class OIDCContinueView(HomeAssistantView):
             params["iss"] = _issuer_for(request)
             return f"{redirect_uri}{separator}{urlencode(params)}"
 
-        if body.get("approve") is not True:
+        if not approve:
             _LOGGER.info("User %s denied authorization for client %s", user.id, client_id)
             return web.json_response({"redirect_url": build_redirect(error="access_denied")})
 
@@ -791,11 +943,18 @@ class OIDCContinueView(HomeAssistantView):
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "resource": resource,
+            # What the user chose the client may do at the resource, when the
+            # resource describes the access it offers
+            "access": access,
             # Kept with the session, so a client that is not stored, such as a
             # metadata document client, can still be named in session lists.
             "client_name": client.get("client_name"),
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
+        if access is not None:
+            await async_remember_choice(
+                hass, user.id, client_id, access["resource"], access["options"]
+            )
 
         # Return JSON with redirect URL (since fetch can't follow external redirects)
         return web.json_response({"redirect_url": build_redirect(code=auth_code)})
@@ -821,7 +980,7 @@ class OIDCDiscoveryView(HomeAssistantView):
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "claims_supported": [
@@ -868,7 +1027,7 @@ class OAuth2AuthorizationServerMetadataView(HomeAssistantView):
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
@@ -904,7 +1063,7 @@ class OAuth2AuthorizationServerMetadataAlternateView(HomeAssistantView):
             **_client_authentication_metadata(request.app["hass"]),
             **_revocation_metadata(request.app["hass"], base_url),
             "code_challenge_methods_supported": SUPPORTED_CODE_CHALLENGE_METHODS,
-            "scopes_supported": SUPPORTED_SCOPES,
+            "scopes_supported": _scopes_supported(request.app["hass"]),
             "authorization_response_iss_parameter_supported": True,
         }
         if _dynamic_registration_enabled(request.app["hass"]):
@@ -951,17 +1110,19 @@ class OIDCAuthorizationView(HomeAssistantView):
                 status=400,
             )
 
-        # Unrecognised scope values are ignored (OIDC Core §3.1.2.1). Only the
-        # granted scopes are stored, shown on the consent screen, and returned
-        # with the token.
-        granted_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
-        if len(granted_scopes) != len(requested_scopes):
+        # Only OpenID Connect scopes are granted from the request. Unrecognised
+        # scope values are ignored (OIDC Core §3.1.2.1), and the scopes of a
+        # resource that describes the access it offers are what the user
+        # chooses on the consent screen, whatever the client asked for. The
+        # token response's scope says what was granted (RFC 6749 §3.3).
+        oidc_scopes = [sc for sc in requested_scopes if sc in SUPPORTED_SCOPES]
+        if len(oidc_scopes) != len(requested_scopes):
             _LOGGER.debug(
-                "Ignoring unsupported scopes for client %s: %s",
+                "Not granting requested scopes for client %s: %s",
                 client_id,
                 " ".join(sc for sc in requested_scopes if sc not in SUPPORTED_SCOPES),
             )
-        scope = " ".join(granted_scopes)
+        scope = " ".join(oidc_scopes)
 
         # NOTE: max_age (OIDC Core §3.1.2.1) is intentionally not honored here.
         # The auth_time claim emitted in the id_token is stamped at the
@@ -1384,17 +1545,32 @@ class OIDCTokenView(HomeAssistantView):
                     status=400,
                 )
 
-        # Generate tokens
+        # Generate tokens. The scope is what the user approved: the OpenID
+        # Connect scopes, and the scopes of the access chosen at the resource.
         user_id = auth_data["user_id"]
-        scope = auth_data["scope"]
+        access = auth_data.get("access")
+        scope = _with_access_scopes(auth_data["scope"], access)
 
         nonce = auth_data.get("nonce")
         auth_time = auth_data.get("auth_time")
 
         # The token audience is bound to the resource requested at the authorize
         # step (RFC 8707). A token request MAY also carry a resource indicator;
-        # honor it only when the authorize step didn't specify one.
-        resource = auth_data.get("resource") or _normalize_resource(data.get("resource"))
+        # honor it only when the authorize step didn't specify one, and not for
+        # a resource that asks the user what the client may do there, since the
+        # user was not asked.
+        resource = auth_data.get("resource")
+        if resource is None:
+            resource = _normalize_resource(data.get("resource"))
+            if find_resource(hass, resource):
+                return web.json_response(
+                    {
+                        "error": "invalid_target",
+                        "error_description": "This resource asks the user what the "
+                        "application may do there; name it in the authorization request",
+                    },
+                    status=400,
+                )
 
         # Kept until the code would have expired, so a later presentation of the
         # same code can revoke what this redemption issues.
@@ -1421,6 +1597,9 @@ class OIDCTokenView(HomeAssistantView):
             "nonce": nonce,
             "auth_time": auth_time,
             "resource": resource,
+            # The access the user chose at the resource, kept so the session
+            # can show it and its refreshed tokens carry its scopes
+            "access": access,
             "client_name": auth_data.get("client_name"),
             "family": family,
             "issued_at": time.time(),
@@ -1579,14 +1758,33 @@ class OIDCTokenView(HomeAssistantView):
         refresh_token: str,
         token_data: dict[str, Any],
     ) -> web.Response:
-        """Issue fresh access and ID tokens for a stored refresh token."""
+        """Issue fresh access and ID tokens for a stored refresh token.
+
+        A session whose resource describes the access it offers, but which was
+        granted without a choice of that access, first gets the access the
+        resource gives such sessions, or is ended, or goes on without it while
+        the resource cannot answer (see _settle_access_from_before).
+        """
+        if not token_data.get("access"):
+            described = find_resource(hass, token_data.get("resource"))
+            if described is not None:
+                refusal = await self._settle_access_from_before(
+                    hass, described, refresh_token, token_data
+                )
+                if refusal is not None:
+                    return refusal
+
+        # Read once, so the tokens and the response agree even if another
+        # refresh of the session gives it access while they are issued
+        scope = token_data["scope"]
+
         # The access token keeps the original resource binding (RFC 8707), so
         # refreshed tokens stay valid at the same resource.
         access_token = await self._generate_access_token(
             _request,
             hass,
             token_data["user_id"],
-            token_data["scope"],
+            scope,
             token_data["client_id"],
             audience=token_data.get("resource"),
         )
@@ -1596,19 +1794,18 @@ class OIDCTokenView(HomeAssistantView):
             "token_type": "Bearer",
             "expires_in": ACCESS_TOKEN_EXPIRY,
             "refresh_token": refresh_token,
-            "scope": token_data["scope"],
+            "scope": scope,
         }
 
         # Re-issue an id_token when openid scope is granted (OIDC Core §12.2).
         # Original nonce and auth_time are carried forward; iat/exp/at_hash are
         # fresh. Refresh tokens stored without either field get None from .get().
-        scope_value = token_data["scope"] or ""
-        if SCOPE_OPENID in scope_value.split():
+        if SCOPE_OPENID in (scope or "").split():
             response_body["id_token"] = await self._generate_id_token(
                 _request,
                 hass,
                 token_data["user_id"],
-                token_data["scope"],
+                scope,
                 token_data["client_id"],
                 nonce=token_data.get("nonce"),
                 auth_time=token_data.get("auth_time"),
@@ -1621,6 +1818,106 @@ class OIDCTokenView(HomeAssistantView):
             return web.json_response({"error": "invalid_grant"}, status=400)
 
         return web.json_response(response_body)
+
+    @staticmethod
+    async def _access_from_before(
+        hass: HomeAssistant, described: DescribedResource, token_data: dict[str, Any]
+    ) -> dict[str, Any] | str | None:
+        """Return the access a session granted without a choice of it defaults to.
+
+        That is the preset the description names in existing_sessions_preset,
+        held at the user's ceiling, with the resource asked for its description
+        and the ceiling as when a user approves. Returns why the session ends
+        instead when the resource gives such sessions no access, when that
+        access is not a choice the user may make, or when the user no longer
+        exists. None when the resource cannot answer now.
+        """
+        no_default = f"integration {described.label} gives such sessions no access"
+        if "existing_sessions_preset" not in described.description:
+            return no_default
+        user = await hass.auth.async_get_user(token_data["user_id"])
+        if user is None:
+            return "its user no longer exists"
+        rules = await async_access_rules(
+            hass,
+            described,
+            user,
+            f"Refreshing a session of client {token_data['client_id']} without the scopes of "
+            f"integration {described.label} until it gives the session its access for "
+            "sessions from before",
+        )
+        if rules is None:
+            return None
+        description, ceiling = rules
+        options = existing_sessions_options(description, ceiling)
+        if options is None:
+            return no_default
+        try:
+            options = validate_choice(description, ceiling, {"options": options})
+        except InvalidChoice as err:
+            return f"its user may not have the access such sessions get: {err}"
+        return _access(described, description, options)
+
+    async def _settle_access_from_before(
+        self,
+        hass: HomeAssistant,
+        described: DescribedResource,
+        refresh_token: str,
+        token_data: dict[str, Any],
+    ) -> web.Response | None:
+        """Give a session granted without a choice of access the access it defaults to.
+
+        Such a session began before its resource described the access it
+        offers. The access it gets (see _access_from_before) is stored as the
+        session's access, as if the user had chosen it, so this refresh and
+        every later one carry its scopes. It is not remembered as the user's
+        choice for the next sign-in. When the resource cannot answer now, the
+        session is refreshed without the resource's scopes and the next
+        refresh asks again. When there is no such access for it, the session
+        is ended, and the client signs in again where the user chooses.
+
+        Returns the response that ends the request, or None to issue tokens.
+        """
+        outcome = await self._access_from_before(hass, described, token_data)
+
+        # The session may have changed while the resource was asked: ended, or
+        # given its access by another refresh of it.
+        if hass.data[DOMAIN]["refresh_tokens"].get(refresh_token) is not token_data:
+            return web.json_response({"error": "invalid_grant"}, status=400)
+        if token_data.get("access") or outcome is None:
+            return None
+
+        if isinstance(outcome, dict):
+            # Both are set before anything awaits, so a refresh racing this one
+            # finds the session with its access or without it, never between.
+            token_data["access"] = outcome
+            token_data["scope"] = _with_access_scopes(token_data["scope"], outcome)
+            await _save_refresh_tokens(hass)
+            _LOGGER.info(
+                "Gave a session of client %s, granted before integration %s described the "
+                "access it offers, the access it gives such sessions: %s",
+                token_data["client_id"],
+                described.label,
+                " ".join(outcome["scopes"]) or "no scopes",
+            )
+            return None
+
+        _revoke_family(hass, token_data["family"])
+        await _save_refresh_tokens(hass)
+        _LOGGER.info(
+            "Ended a session of client %s granted before its resource described the "
+            "access it offers, since %s; the client has to sign in again",
+            token_data["client_id"],
+            outcome,
+        )
+        return web.json_response(
+            {
+                "error": "invalid_grant",
+                "error_description": "The resource now asks what this application may "
+                "do there; sign in again",
+            },
+            status=400,
+        )
 
     async def _generate_access_token(
         self,
@@ -2097,10 +2394,32 @@ class OIDCSessionsView(HomeAssistantView):
     requires_auth = True
 
     async def get(self, request: web.Request) -> web.Response:
-        """List the user's live sessions."""
+        """List the user's live sessions.
+
+        With them comes the description of every resource a session chose
+        access at, in the language the panel asks for, so the panel can name
+        what was granted. A session whose resource cannot be described now is
+        listed without its access.
+        """
         hass = request.app["hass"]
         user = request["hass_user"]
-        return web.json_response({"sessions": user_sessions(hass, user.id)})
+        sessions = user_sessions(hass, user.id)
+        language = _panel_language(hass, request.query.get("language"))
+        resources: dict[str, dict[str, Any] | None] = {}
+        for session in sessions:
+            if session["access"] is None:
+                continue
+            domain = session["access"]["resource"]
+            if domain not in resources:
+                resources[domain] = await async_display_model(hass, domain, language)
+            if resources[domain] is None:
+                session["access"] = None
+        return web.json_response(
+            {
+                "sessions": sessions,
+                "resources": {domain: model for domain, model in resources.items() if model},
+            }
+        )
 
 
 class OIDCSessionView(HomeAssistantView):
@@ -2123,6 +2442,27 @@ class OIDCSessionView(HomeAssistantView):
                 _LOGGER.info("User %s ended a session of client %s", user.id, data["client_id"])
                 return web.json_response({"revoked": True})
         return web.json_response({"error": "not_found"}, status=404)
+
+
+class OIDCStringsView(HomeAssistantView):
+    """The login panel's text, in the signed-in user's language.
+
+    It is served under /api because Home Assistant's service worker answers a
+    GET from its cache anywhere else, which would show the text of the
+    release before an update.
+    """
+
+    url = "/api/oidc_provider/strings"
+    name = "api:oidc:strings"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the panel's text in the language the panel asks for."""
+        hass = request.app["hass"]
+        language = _panel_language(hass, request.query.get("language"))
+        return web.json_response(
+            {"language": language, "strings": await async_panel_strings(hass, language)}
+        )
 
 
 def _client_error(error: str, message: str, status: int = 400) -> web.Response:

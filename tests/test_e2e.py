@@ -49,7 +49,9 @@ from custom_components.oidc_provider.const import (
     CONF_ALLOW_DYNAMIC_REGISTRATION,
     DOMAIN,
     STORAGE_KEY_KEYS,
+    STORAGE_KEY_TOKENS,
 )
+from custom_components.oidc_provider.security import hash_client_secret
 from custom_components.oidc_provider.token_validator import validate_access_token
 
 # The issuer is derived from the request Host. Pin it with forwarded headers so
@@ -122,13 +124,14 @@ async def _start_authorization(
     code_challenge: str,
     resource: str | None,
     redirect_uri: str = REDIRECT_URI,
+    scope: str = "openid profile",
 ) -> str:
     """Send an authorization request to /authorize and return the pending request id."""
     params = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": "openid profile",
+        "scope": scope,
         "state": "test-state",
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
@@ -1606,3 +1609,752 @@ async def test_concurrent_rotations_do_not_bring_back_the_replaced_key(
     keys = list(hass.data[DOMAIN]["jwt_verification_keys"])
     assert len(keys) == 2
     assert original not in keys
+
+
+# --- Resource servers that describe the access they offer --------------------
+#
+# The stand-in integration under tests/stand_in ships an oidc_provider.py the
+# way another integration would. Home Assistant hands it to the provider
+# through its integration platforms, whichever of the two loads first.
+
+
+async def _setup_stand_in(hass: HomeAssistant) -> None:
+    assert await async_setup_component(hass, "oidc_stand_in", {})
+    await hass.async_block_till_done()
+
+
+def _described_domains(hass: HomeAssistant) -> list[str]:
+    from custom_components.oidc_provider.resources import described_resources
+
+    return [described.domain for described in described_resources(hass)]
+
+
+async def test_description_is_collected_from_a_resource_loaded_after_the_provider(
+    setup_provider: None, hass: HomeAssistant, stand_in
+) -> None:
+    assert _described_domains(hass) == []
+
+    await _setup_stand_in(hass)
+
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_description_is_collected_from_a_resource_loaded_before_the_provider(
+    enable_custom_integrations: None, hass: HomeAssistant, stand_in
+) -> None:
+    await _setup_stand_in(hass)
+
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
+
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_reloading_the_provider_keeps_the_descriptions(
+    setup_provider: None, hass: HomeAssistant, stand_in
+) -> None:
+    """Unloading the entry clears its data; the descriptions are kept for the next setup."""
+    await _setup_stand_in(hass)
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert _described_domains(hass) == ["oidc_stand_in"]
+
+
+async def test_malformed_description_is_ignored_with_a_warning(
+    setup_provider: None,
+    hass: HomeAssistant,
+    stand_in,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand_in.DESCRIPTION = {**stand_in.DESCRIPTION, "presets": []}
+
+    await _setup_stand_in(hass)
+
+    assert _described_domains(hass) == []
+    assert "Ignoring the resource description of integration oidc_stand_in" in caplog.text
+
+
+STAND_IN_RESOURCE = f"{ISSUER_BASE}/api/stand_in"
+STAND_IN_LOOK_ONLY = {
+    "lights": "read",
+    "cameras": "read",
+    "automations": "read",
+    "templates": "read",
+    "files": "none",
+}
+
+
+@pytest.fixture
+async def setup_stand_in(setup_provider: None, hass: HomeAssistant, stand_in) -> None:
+    """The provider and, after it, the stand-in resource server."""
+    await _setup_stand_in(hass)
+
+
+async def _consent_details(client: ClientSessionGenerator, request_id: str, **query) -> dict:
+    """Fetch what the consent screen shows for a pending request."""
+    resp = await client.get(
+        "/oidc/continue", params={"request_id": request_id, **query}, headers=FORWARDED
+    )
+    assert resp.status == 200, await resp.text()
+    return await resp.json()
+
+
+async def _choose(
+    client: ClientSessionGenerator, request_id: str, options: dict[str, str] | None
+) -> tuple[int, dict | str]:
+    """Approve a pending request with a choice of access."""
+    body = {"request_id": request_id, "approve": True}
+    if options is not None:
+        body["access"] = {"options": options}
+    resp = await client.post("/oidc/continue", json=body, headers=FORWARDED)
+    if resp.content_type == "application/json":
+        return resp.status, await resp.json()
+    return resp.status, await resp.text()
+
+
+async def test_consent_offers_the_access_a_resource_describes(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    details = await _consent_details(client, request_id, language="en")
+
+    access = details["access"]
+    assert details["consent_required"] is True
+    assert access["resource"] == "oidc_stand_in"
+    assert access["default_preset"] == "read"
+    assert [preset["title"] for preset in access["presets"]] == [
+        "Look only",
+        "Control devices",
+        "Edit the setup",
+        "Administer",
+    ]
+    assert access["remembered"] is None
+
+    choice = {**STAND_IN_LOOK_ONLY, "cameras": "none"}
+    status, body = await _choose(client, request_id, choice)
+    assert status == 200, body
+    assert "code=" in body["redirect_url"]
+
+    # The next sign-in of this client starts from the same choice
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["remembered"] == choice
+
+
+async def test_consent_for_a_resource_without_a_description_is_unchanged(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+
+    for resource in (RESOURCE, None):
+        request_id = await _start_authorization(
+            client,
+            client_id=registration["client_id"],
+            code_challenge=challenge,
+            resource=resource,
+        )
+        details = await _consent_details(client, request_id)
+        assert "access" not in details
+        assert details["consent_required"] is True
+
+        status, body = await _choose(client, request_id, None)
+        assert status == 200, body
+        assert "code=" in body["redirect_url"]
+
+
+async def test_consent_shows_ceilings_and_unavailable_areas(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    stand_in.UNAVAILABLE["files"] = "Turned off in the stand-in's options."
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "groups": {"lights": {"max": "read", "reason": "Limited to Read for your account."}},
+        "reason": "Not available for your account.",
+    }
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+
+    access = (await _consent_details(client, request_id))["access"]
+
+    assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
+    assert access["ceiling"]["groups"]["lights"]["max"] == "read"
+
+    # An unavailable area can still be chosen; one above the ceiling cannot
+    status, _ = await _choose(client, request_id, {**STAND_IN_LOOK_ONLY, "files": "full"})
+    assert status == 200
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    status, text = await _choose(client, request_id, {**STAND_IN_LOOK_ONLY, "lights": "full"})
+    assert status == 400
+    assert "above the ceiling" in text
+
+
+async def test_a_locked_preset_cannot_be_approved_by_its_options(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    """Locking a level locks its exact choice and its scope, wherever the choice is made."""
+    admin = {**STAND_IN_LOOK_ONLY, "lights": "full", "automations": "full", "files": "full"}
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "locked_presets": ["admin"],
+        "reason": "Not available for your account.",
+    }
+    client = await hass_client()
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["ceiling"]["locked_presets"] == [
+        "admin"
+    ]
+
+    status, text = await _choose(client, request_id, admin)
+
+    assert status == 400
+    assert "those of preset admin, which is locked" in text
+
+    # The request is still pending, and a choice that is not the locked level is granted
+    status, body = await _choose(client, request_id, {**admin, "cameras": "none"})
+    assert status == 200, body
+    code = parse_qs(urlparse(body["redirect_url"]).query)["code"][0]
+    status, tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, tokens
+    assert "stand_in:admin" not in tokens["scope"].split()
+    assert "stand_in:files:full" in tokens["scope"].split()
+
+
+async def test_panel_strings_are_served_in_the_users_language(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+
+    resp = await client.get("/api/oidc_provider/strings", params={"language": "de"})
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["language"] == "de"
+    # Only English ships, so it stands in for every language
+    assert data["strings"]["consent.heading"] == "Approve access?"
+    assert data["strings"]["access.back"] == "Back to levels"
+
+
+async def _sign_in_with_choice(
+    client: ClientSessionGenerator,
+    registration: dict,
+    options: dict[str, str] | None,
+    *,
+    resource: str = STAND_IN_RESOURCE,
+    scope: str = "openid profile",
+) -> tuple[int, dict]:
+    """Authorize for a resource, the stand-in's by default, approve with a choice and
+    redeem the code."""
+    verifier, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=resource,
+        scope=scope,
+    )
+    status, body = await _choose(client, request_id, options)
+    assert status == 200, body
+    code = parse_qs(urlparse(body["redirect_url"]).query)["code"][0]
+    return await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+
+
+async def test_chosen_access_is_in_the_token_and_survives_refresh(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+
+    # Exactly a level: the level's own scope
+    status, tokens = await _sign_in_with_choice(client, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile stand_in:read"
+
+    # Anything else: the scope of each area's setting
+    status, tokens = await _sign_in_with_choice(
+        client, registration, {**STAND_IN_LOOK_ONLY, "cameras": "none", "files": "full"}
+    )
+    assert status == 200, tokens
+    scope = (
+        "openid profile stand_in:lights:read stand_in:automations:read "
+        "stand_in:templates:read stand_in:files:full"
+    )
+    assert tokens["scope"] == scope
+
+    # The token is still bound to its resource, and the resource reads the scope
+    claims = validate_access_token(
+        hass, tokens["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims is not None
+    assert claims["scope"] == scope
+    assert (
+        validate_access_token(hass, tokens["access_token"], ISSUER_BASE, expected_audience=RESOURCE)
+        is None
+    )
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 200, refreshed
+    assert refreshed["scope"] == scope
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == scope
+
+
+async def test_choosing_nothing_grants_no_resource_scope(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    nothing = dict.fromkeys(STAND_IN_LOOK_ONLY, "none")
+
+    status, tokens = await _sign_in_with_choice(client, registration, nothing)
+
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 200, refreshed
+
+
+async def test_resource_scopes_a_client_asks_for_are_not_granted_unless_chosen(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Asking for a resource's scopes at the authorize step grants none of them; the
+    user's choice decides, and a resource without a description gets none at all."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    asked = "openid profile stand_in:admin stand_in:files:full"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, STAND_IN_LOOK_ONLY, scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile stand_in:read"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, dict.fromkeys(STAND_IN_LOOK_ONLY, "none"), scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, None, resource=RESOURCE, scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+    assert jwt.decode(tokens["access_token"], options={"verify_signature": False})["scope"] == (
+        "openid profile"
+    )
+
+
+STAND_IN_CONTROL = {**STAND_IN_LOOK_ONLY, "lights": "full"}
+
+
+async def test_sessions_stored_before_resources_described_access_at_refresh(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_storage: dict,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    """Sessions saved by a release without choices of access have no access key. Loaded
+    from storage, one for a resource that now describes its access gets the access that
+    resource names for such sessions at its next refresh, one whose user is gone ends
+    there, and one for any other resource refreshes as before."""
+    client_id = "stored-client"
+    hass_storage[f"{DOMAIN}.clients"] = {
+        "version": 1,
+        "key": f"{DOMAIN}.clients",
+        "data": {
+            "clients": {
+                client_id: {
+                    "client_name": "Stored client",
+                    "client_secret_hash": hash_client_secret("stored-secret"),
+                    "redirect_uris": [REDIRECT_URI],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "client_secret_basic",
+                    "consent_required": False,
+                }
+            }
+        },
+    }
+
+    def session(family: str, resource: str, user_id: str = hass_admin_user.id) -> dict:
+        return {
+            "user_id": user_id,
+            "client_id": client_id,
+            "scope": "openid profile",
+            "nonce": None,
+            "auth_time": int(time.time()) - 60,
+            "resource": resource,
+            "client_name": "Stored client",
+            "family": family,
+            "issued_at": time.time() - 60,
+            "expires_at": time.time() + 3600,
+        }
+
+    hass_storage[STORAGE_KEY_TOKENS] = {
+        "version": 1,
+        "key": STORAGE_KEY_TOKENS,
+        "data": {
+            "refresh_tokens": {
+                "described.token": session("described", STAND_IN_RESOURCE),
+                "gone.token": session("gone", STAND_IN_RESOURCE, user_id="someone-removed"),
+                "other.token": session("other", RESOURCE),
+            }
+        },
+    }
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
+    await _setup_stand_in(hass)
+    client = await hass_client()
+    registration = {"client_id": client_id, "client_secret": "stored-secret"}
+    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {
+        "described.token",
+        "gone.token",
+        "other.token",
+    }
+
+    status, body = await _refresh(client, registration, "described.token")
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile stand_in:control"
+    claims = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile stand_in:control"
+
+    status, body = await _refresh(client, registration, "gone.token")
+
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+    assert "sign in again" in body["error_description"]
+
+    status, body = await _refresh(client, registration, "other.token")
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile"
+    assert jwt.decode(body["access_token"], options={"verify_signature": False})["aud"] == RESOURCE
+    assert sorted(data["family"] for data in hass.data[DOMAIN]["refresh_tokens"].values()) == [
+        "described",
+        "other",
+    ]
+
+    # The session's access is saved with it
+    await hass.async_block_till_done()
+    saved = hass_storage[STORAGE_KEY_TOKENS]["data"]["refresh_tokens"]
+    [described] = [data for data in saved.values() if data["family"] == "described"]
+    assert described["access"] == {
+        "resource": "oidc_stand_in",
+        "options": STAND_IN_CONTROL,
+        "scopes": ["stand_in:control"],
+    }
+
+
+async def _session_from_before(
+    client: ClientSessionGenerator, hass: HomeAssistant
+) -> tuple[dict, dict]:
+    """Sign in for the stand-in's resource before it describes itself, then set it up.
+
+    Returns the client's registration and the tokens of that sign-in.
+    """
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    status, tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=registration["client_id"],
+        client_secret=registration["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+
+    await _setup_stand_in(hass)
+    return registration, tokens
+
+
+async def test_session_from_before_the_resource_described_itself_gets_its_access(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in,
+) -> None:
+    """A session that began before its resource described the access it offers carries
+    no choice. Its next refresh gives it the access the resource names for such sessions,
+    which it keeps as if chosen, without it becoming the user's choice for next time."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    scope = "openid profile stand_in:control"
+    assert refreshed["scope"] == scope
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == scope
+    # The access token the session held before carries none of the resource's scopes
+    claims = validate_access_token(
+        hass, tokens["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile"
+
+    # Connected applications shows it like any access
+    resp = await client.get("/oidc/sessions", params={"language": "en"})
+    [session] = (await resp.json())["sessions"]
+    assert session["access"] == {"resource": "oidc_stand_in", "options": STAND_IN_CONTROL}
+
+    # Later refreshes keep it, and rotation and reuse detection work as for any session
+    status, again = await _refresh(client, registration, refreshed["refresh_token"])
+    assert status == 200, again
+    assert again["scope"] == scope
+    assert again["refresh_token"] != refreshed["refresh_token"]
+    status, replayed = await _refresh(client, registration, refreshed["refresh_token"])
+    assert (status, replayed["refresh_token"], replayed["scope"]) == (
+        200,
+        again["refresh_token"],
+        scope,
+    )
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
+    assert (await _refresh(client, registration, again["refresh_token"]))[0] == 400
+
+    # The next sign-in starts from the resource's default, not from this access
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["remembered"] is None
+
+
+async def test_ceiling_lowers_the_access_of_a_session_from_before(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "groups": {"cameras": {"max": "none", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    assert refreshed["scope"] == (
+        "openid profile stand_in:lights:full stand_in:automations:read stand_in:templates:read"
+    )
+
+
+async def test_session_from_before_ends_when_its_access_is_locked(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    """The user may not have that access, so the client signs in again and the user
+    chooses."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "locked_presets": ["control"],
+        "reason": "Not available for your account.",
+    }
+
+    status, body = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+async def test_session_from_before_ends_when_its_resource_names_no_access_for_it(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
+) -> None:
+    stand_in.DESCRIPTION = {
+        key: value
+        for key, value in stand_in.DESCRIPTION.items()
+        if key != "existing_sessions_preset"
+    }
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    status, body = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+    assert "sign in again" in body["error_description"]
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.parametrize("breakage", ["raises", "hangs"])
+async def test_session_from_before_is_kept_while_its_resource_cannot_answer(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stand_in,
+    breakage: str,
+) -> None:
+    """The session is refreshed without the resource's scopes, and the next refresh,
+    with the resource answering again, gives it its access."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    async def fail(hass: HomeAssistant, user, language: str) -> None:
+        if breakage == "hangs":
+            await asyncio.Event().wait()
+        raise RuntimeError("no ceiling today")
+
+    with monkeypatch.context() as patched:
+        patched.setattr("custom_components.oidc_provider.resources.CALL_TIMEOUT", 0.01)
+        patched.setattr(stand_in, "async_get_ceiling", fail)
+        status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    assert refreshed["scope"] == "openid profile"
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile"
+    assert "until it gives the session its access for sessions from before" in caplog.text
+
+    status, again = await _refresh(client, registration, refreshed["refresh_token"])
+
+    assert status == 200, again
+    assert again["scope"] == "openid profile stand_in:control"
+
+
+async def test_described_resource_named_only_when_redeeming_the_code_is_refused(
+    setup_stand_in: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client, client_id=registration["client_id"], code_challenge=challenge, resource=None
+    )
+
+    resp = await client.post(
+        "/oidc/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": registration["client_id"],
+            "client_secret": registration["client_secret"],
+            "code_verifier": verifier,
+            "resource": STAND_IN_RESOURCE,
+        },
+        headers=FORWARDED,
+    )
+
+    assert resp.status == 400
+    assert (await resp.json())["error"] == "invalid_target"
+
+
+async def test_discovery_advertises_the_described_scopes(
+    setup_stand_in: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    for path in DISCOVERY_PATHS:
+        resp = await client.get(path, headers=FORWARDED)
+        scopes = (await resp.json())["scopes_supported"]
+        assert scopes[:4] == ["openid", "profile", "email", "groups"], path
+        assert {"stand_in:read", "stand_in:admin", "stand_in:lights:full"} <= set(scopes), path
+
+
+async def test_connected_applications_show_the_access_granted(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    choice = {**STAND_IN_LOOK_ONLY, "cameras": "none"}
+    status, _ = await _sign_in_with_choice(client, registration, choice)
+    assert status == 200
+
+    resp = await client.get("/oidc/sessions", params={"language": "en"})
+
+    data = await resp.json()
+    [session] = data["sessions"]
+    assert session["access"] == {"resource": "oidc_stand_in", "options": choice}
+    assert data["resources"]["oidc_stand_in"]["presets"][0]["title"] == "Look only"

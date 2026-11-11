@@ -1,8 +1,28 @@
 """Pytest configuration and fixtures."""
 
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+# A stand-in resource server, found by Home Assistant as a custom integration
+# named oidc_stand_in. It lives outside the repository's custom_components so
+# that only the provider is validated and released.
+sys.path.append(str(Path(__file__).parent / "stand_in"))
+
+
+@pytest.fixture
+def stand_in():
+    """Return the stand-in's oidc_provider module, with its state reset afterwards."""
+    from custom_components.oidc_stand_in import oidc_provider as module
+
+    description = module.DESCRIPTION
+    yield module
+    module.DESCRIPTION = description
+    module.UNAVAILABLE.clear()
+    module.CEILINGS.clear()
+    module.CALLS.clear()
 
 
 @pytest.fixture

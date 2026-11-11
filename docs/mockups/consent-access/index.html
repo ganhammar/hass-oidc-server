@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Consent access mockups</title>
+<style>
+  :root {
+    color-scheme: light;
+    --primary-background-color: #fafafa;
+    --card-background-color: #ffffff;
+    --primary-text-color: #141414;
+    --secondary-text-color: #5e5e5e;
+    --divider-color: rgba(0, 0, 0, 0.12);
+    --disabled-color: #bdbdbd;
+    --disabled-text-color: #bdbdbd;
+    --primary-color: #009ac7;
+    --link-color: #006787;
+    --selected-color: #006787;
+    --on-selected-color: #ffffff;
+    --stage-color: #ececec;
+    --font-body: Roboto, Noto, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --primary-background-color: #111111;
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --divider-color: rgba(225, 225, 225, 0.12);
+    --disabled-color: #464646;
+    --disabled-text-color: #6f6f6f;
+    --link-color: #37c8fd;
+    --selected-color: #7bd4fb;
+    --on-selected-color: #002e3e;
+    --stage-color: #050505;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--font-body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    background: var(--primary-background-color);
+    color: var(--primary-text-color);
+  }
+  a { color: var(--link-color); }
+  a:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; border-radius: 2px; }
+
+  .layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); height: 100%; }
+  .side {
+    overflow-y: auto;
+    padding: 24px 20px;
+    border-right: 1px solid var(--divider-color);
+    background: var(--card-background-color);
+  }
+  .stage { overflow: auto; background: var(--stage-color); display: flex; justify-content: center; padding: 24px; }
+  h1 { font-size: 22px; font-weight: 400; line-height: 1.25; margin: 0 0 8px; }
+  h2 { font-size: 14px; font-weight: 500; margin: 24px 0 8px; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--secondary-text-color); }
+  ul.try { margin: 0; padding-left: 18px; }
+  ul.try li + li { margin-top: 6px; }
+  .links { list-style: none; margin: 0; padding: 0; }
+  .links li + li { margin-top: 4px; }
+
+  fieldset { border: 0; margin: 0 0 14px; padding: 0; min-width: 0; }
+  legend { padding: 0; margin-bottom: 6px; font-size: 12px; color: var(--secondary-text-color); }
+
+  /* Segmented controls, as in the mockups */
+  .segmented { position: relative; display: flex; gap: 4px; padding: 4px; min-height: 40px; border-radius: 10px; }
+  .segmented::before { content: ""; position: absolute; inset: 0; border-radius: 10px; background: var(--disabled-color); opacity: 0.2; }
+  .seg {
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-weight: 500;
+    text-align: center;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+  .seg input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: inherit; }
+  .seg span { position: relative; pointer-events: none; }
+  .seg:has(input:checked) { background: var(--selected-color); color: var(--on-selected-color); }
+  .seg:has(input:focus-visible) { box-shadow: 0 0 0 2px var(--primary-color); }
+
+  select {
+    width: 100%;
+    height: 40px;
+    padding: 0 8px;
+    font: inherit;
+    color: var(--primary-text-color);
+    background: var(--card-background-color);
+    border: 1px solid var(--divider-color);
+    border-radius: 6px;
+  }
+  select:disabled { color: var(--disabled-text-color); }
+
+  .readout {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    padding: 10px 12px;
+    border: 1px dashed var(--divider-color);
+    border-radius: 8px;
+    color: var(--secondary-text-color);
+    overflow-wrap: anywhere;
+  }
+  .readout code { color: var(--primary-text-color); }
+  .restart {
+    margin-top: 8px;
+    height: 32px;
+    padding: 0 12px;
+    font: inherit;
+    font-weight: 500;
+    color: var(--link-color);
+    background: transparent;
+    border: 1px solid var(--divider-color);
+    border-radius: 9999px;
+    cursor: pointer;
+  }
+  .restart:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+
+  .frame-wrap { flex: none; }
+  .frame-wrap.phone { width: 390px; height: min(844px, calc(100vh - 48px)); }
+  .frame-wrap.wide { width: 100%; height: calc(100vh - 48px); }
+  iframe {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 1px solid var(--divider-color);
+    background: var(--primary-background-color);
+  }
+  .frame-wrap.phone iframe { border-radius: 28px; box-shadow: 0 6px 12px -3px rgba(0, 0, 0, 0.12), 0 16px 32px -6px rgba(0, 0, 0, 0.2); }
+  .frame-wrap.wide iframe { border-radius: 12px; }
+
+  @media (max-width: 860px) {
+    .layout { display: block; height: auto; }
+    .side { border-right: 0; border-bottom: 1px solid var(--divider-color); }
+    .stage { padding: 16px; }
+    .frame-wrap.phone { width: min(390px, 100%); height: 844px; }
+    .frame-wrap.wide { height: 900px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="side">
+    <h1>Choosing what an assistant may do</h1>
+    <p class="muted">Mockups of a new consent screen and Connected applications page for this integration. Nothing here is built yet. The decisions, the exact wording and the open questions are in <a href="NOTES.md">NOTES.md</a>.</p>
+
+    <fieldset>
+      <legend>Page</legend>
+      <div class="segmented">
+        <label class="seg"><input type="radio" name="page" value="consent-simple.html" checked><span>Levels</span></label>
+        <label class="seg"><input type="radio" name="page" value="consent-detailed.html"><span>In detail</span></label>
+        <label class="seg"><input type="radio" name="page" value="connected-applications.html"><span>Connected apps</span></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Width</legend>
+      <div class="segmented">
+        <label class="seg"><input type="radio" name="width" value="phone" checked><span>Phone</span></label>
+        <label class="seg"><input type="radio" name="width" value="wide"><span>Wide</span></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Theme</legend>
+      <div class="segmented">
+        <label class="seg"><input type="radio" name="theme" value="light" checked><span>Light</span></label>
+        <label class="seg"><input type="radio" name="theme" value="dark"><span>Dark</span></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend><label for="scenario">Situation (consent screen only)</label></legend>
+      <select id="scenario">
+        <option value="first">First connection, administrator</option>
+        <option value="returning">Reconnecting, custom choice last time</option>
+        <option value="limited">Household member with limits</option>
+      </select>
+    </fieldset>
+
+    <div class="readout" id="readout">
+      <div>Token scope: <code id="scope"></code></div>
+      <div>Session ends: <code id="ends"></code></div>
+    </div>
+    <p><button type="button" class="restart" id="restart">Start the page again</button></p>
+
+    <h2>Things to try</h2>
+    <ul class="try">
+      <li>Pick <b>Control devices</b>: a short note about actions appears under it.</li>
+      <li>Open <b>Choose in detail</b>, start from <b>Administer</b>, then set <b>Cameras and images</b> to None and <b>Dashboards</b> to Read. This is the example from the design issue: the choice becomes Custom and the notes under Cameras, Dashboards and System appear.</li>
+      <li>Go <b>Back to levels</b>: the choice is kept as a fifth option, Custom, with a short summary.</li>
+      <li>Set an area to <b>None</b> while Entities and their states is at Full, or Templates to Read while Entities is None, to see the other limits.</li>
+      <li>Switch the situation to <b>Household member with limits</b>: Administer is locked, Config files and AppDaemon apps are not available, and Full is locked on Diagnostics and Integrations for two different reasons.</li>
+      <li>Switch to <b>Reconnecting</b>: the choice from last time is preselected and marked.</li>
+    </ul>
+
+    <h2>Open on their own</h2>
+    <ul class="links">
+      <li><a href="consent-simple.html">consent-simple.html</a></li>
+      <li><a href="consent-detailed.html">consent-detailed.html</a></li>
+      <li><a href="connected-applications.html">connected-applications.html</a></li>
+      <li><a href="NOTES.md">NOTES.md</a></li>
+    </ul>
+  </aside>
+
+  <main class="stage">
+    <div class="frame-wrap phone" id="frame-wrap">
+      <iframe id="frame" title="Mockup preview"></iframe>
+    </div>
+  </main>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const frame = document.getElementById('frame');
+  const wrap = document.getElementById('frame-wrap');
+  const scenario = document.getElementById('scenario');
+  const readout = document.getElementById('readout');
+  const value = (name) => document.querySelector(`input[name="${name}"]:checked`).value;
+
+  function load() {
+    const page = value('page');
+    const isConsent = page.startsWith('consent');
+    scenario.disabled = !isConsent;
+    readout.hidden = !isConsent;
+    const query = new URLSearchParams({ embed: '1', theme: value('theme'), scenario: scenario.value });
+    frame.src = `${page}?${query}`;
+  }
+
+  function applyTheme() {
+    document.documentElement.dataset.theme = value('theme');
+    frame.contentWindow?.postMessage({ type: 'mockup', theme: value('theme') }, '*');
+  }
+
+  for (const input of document.querySelectorAll('input[name="page"]')) input.addEventListener('change', load);
+  for (const input of document.querySelectorAll('input[name="theme"]')) input.addEventListener('change', applyTheme);
+  for (const input of document.querySelectorAll('input[name="width"]')) {
+    input.addEventListener('change', () => { wrap.className = `frame-wrap ${value('width')}`; });
+  }
+  document.getElementById('restart').addEventListener('click', load);
+  scenario.addEventListener('change', () => {
+    frame.contentWindow?.postMessage({ type: 'mockup', scenario: scenario.value }, '*');
+  });
+  window.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type !== 'mockup-state') return;
+    document.getElementById('scope').textContent = data.scope;
+    document.getElementById('ends').textContent = data.ends;
+  });
+
+  if (matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.querySelector('input[name="theme"][value="dark"]').checked = true;
+  }
+  document.documentElement.dataset.theme = value('theme');
+  load();
+})();
+</script>
+</body>
+</html>

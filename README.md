@@ -11,6 +11,7 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 - **Claude and other MCP clients connect without registration** through Client ID Metadata Documents
 - **Client management page** for administrators to register, edit and revoke clients, with the same operations available as actions
 - **Consent screen** for clients you did not register yourself, styled like the Home Assistant login
+- **Choose what an application may do**: an integration that accepts these tokens can describe the access it offers, and the consent screen lets each person choose it, as a level or area by area; the choice goes into the access token as scopes
 - **No external dependencies** - runs entirely within Home Assistant
 
 This integration acts as an OIDC abstraction layer on top of Home Assistant's built-in authentication system. It does not create new user accounts or add additional login methods—users authenticate with their existing Home Assistant credentials through the standard login interface.
@@ -131,6 +132,20 @@ Clients that registered themselves through `/oidc/register` (when [enabled](#opt
 
 Clients you register yourself, on the [Clients tab](#managing-clients) or with the `register_client` action, skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Edit the ones you registered yourself on the Clients tab, or use the `update_client` action with `consent_required: false`.
 
+#### Choosing what an application may do
+
+An integration that accepts this provider's tokens, such as an MCP server, can describe the access it offers. When an application signs in for such an integration (the `resource` it names is one of that integration's addresses), the consent screen asks what the application may do there:
+
+- It opens on the integration's levels, such as "Look only" or "Control devices", each with one sentence on what it allows. A note appears under the selected level when there is something its name does not say.
+- **Choose in detail** shows one setting per area, such as None, Read or Full, with what the current setting means and notes where an area reaches past another. A choice that matches no level is called Custom, with how it differs from the closest level.
+- The first time, the integration's default level is selected; after that, the person's last choice for that application. It is marked "Your choice last time".
+- An area that is unavailable right now, for example because it is turned off in that integration's options, can still be chosen and says why. Settings above what an administrator allows for the person are locked, with the reason, as is a level that would add nothing they may allow.
+- The screen says the application can be signed out later under [Connected applications](#connected-applications).
+
+The choice goes into the access token as scopes (see [Tokens](#tokens)), and the integration decides what each scope allows. This provider enforces none of it. A sign-in for such an integration stops on the screen even for a client registered without **Require consent**, since the choice is each person's to make; the last choice is preselected, so approving is one tap. Sign-ins for anything else work as described above, and an integration that has not described itself gets the approve or deny screen as before.
+
+Integration authors: see [Describing a resource to the OIDC Provider](docs/resource-descriptions.md).
+
 ### Updating a Client with an Action
 
 To update redirect URIs for an existing client:
@@ -169,7 +184,7 @@ Revoking a client also ends every session it holds, so its refresh tokens stop w
 
 ### Connected Applications
 
-Each user can see the applications signed in with their Home Assistant account at `https://your-ha-instance/oidc_login`, with when each signed in and was last used, and sign any of them out. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
+Each user can see the applications signed in with their Home Assistant account at `https://your-ha-instance/oidc_login`, with when each signed in and was last used, and sign any of them out. For an application that was given a choice of access, the list shows what was chosen: the level's name, or Custom with how it differs from the closest level. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
 
 ### Rotating the Signing Key
 
@@ -205,6 +220,14 @@ Both redirects back to the client, with `code` on approval or `error=access_deni
 
 Access tokens are JWTs in the RFC 9068 profile. The header has `typ: at+jwt` and the `kid` of the signing key, and the claims include `iss`, `sub`, `aud`, `client_id`, `scope`, `jti`, `iat`, `exp` and `token_use: access`. `/oidc/userinfo` and the validator hass-mcp-server uses accept only access tokens, so an ID token is refused there.
 
+`scope` holds the OpenID Connect scopes granted and, for a token bound to an integration that describes its access, the scopes of the access the person chose, whatever the application asked for. The token response's `scope` says the same, so the application learns what it was granted. Refreshed tokens keep the same scopes and the same `aud`.
+
+A token bound to such an integration with none of its scopes grants nothing there, whether the person chose nothing or the token was issued before the integration described its access; the integration cannot tell the two apart. An integration that enforces its scopes refuses such a token at once, and depending on how it refuses, the application refreshes first or authorizes again straight away, where the person chooses.
+
+A session that began before the integration described its access carries no choice. At its next refresh it gets the access the integration names for such sessions, held at what the person may allow, and keeps it from then on as if the person had chosen it, so [Connected applications](#connected-applications) shows it too. It is not remembered as the person's choice for their next sign-in. Until that refresh, the access token the session already holds, valid for up to an hour, carries none of the integration's scopes. When the integration names no access for such sessions, or the person may not have it, the session ends at that refresh instead and the application signs in again, where the person chooses. When the integration cannot answer at that refresh, the session is refreshed without its scopes and the next refresh tries again.
+
+An application must name such an integration when it authorizes. Naming it only when redeeming the code is refused with `invalid_target`.
+
 ### Using with Claude Connectors
 
 With [client metadata documents](#client-id-metadata-documents) on (the default), there is nothing to register:
@@ -232,6 +255,7 @@ To use a client you registered yourself instead, register one as described above
 - **Public Clients**: Clients without a secret, from metadata documents or registered with `token_endpoint_auth_method: none`, must use PKCE whatever the PKCE option says. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) match on any port, as RFC 8252 requires for native apps
 - **Registration limits**: `/oidc/register` accepts at most 20 registrations per hour in total, at most 5 of them from one address, and at most 200 dynamically registered clients that have not had a token issued yet. Beyond that it answers `429` with `temporarily_unavailable` (and a `Retry-After` header for the hourly limits) and creates nothing. Clients a user has approved do not count toward the 200.
 - **Limits Behind a Reverse Proxy**: The per-address limits on registrations, pending sign-ins and metadata document fetches count by the client address Home Assistant sees. Behind a reverse proxy, turn on [`use_x_forwarded_for`](https://www.home-assistant.io/integrations/http/#use_x_forwarded_for) and list the proxy in `trusted_proxies` so Home Assistant sees each client's own address. Otherwise every request appears to come from the proxy, and those limits apply to all clients together
+- **Access Chosen at a Resource**: The scopes in a token are what the person chose on the consent screen, checked against what the integration describes and the person's ceiling when they approve. Scopes the application asks for never widen that. The integration that receives the token enforces the scopes; this provider only records and passes them on
 - **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
 
 ## Supported Scopes
@@ -239,6 +263,9 @@ To use a client you registered yourself instead, register one as described above
 - `openid` - Required for OIDC
 - `profile` - User profile information
 - `email` - User email (uses HA user ID as fallback)
+- `groups` - The user's Home Assistant groups
+
+The discovery documents also list every scope an integration describes (see [Choosing what an application may do](#choosing-what-an-application-may-do)). Those are granted as the person chooses on the consent screen, not from the authorization request.
 
 ## Troubleshooting
 

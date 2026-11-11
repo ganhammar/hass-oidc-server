@@ -6,6 +6,8 @@ DOMAIN = "oidc_provider"
 STORAGE_VERSION = 1
 STORAGE_KEY_KEYS = f"{DOMAIN}.keys"
 STORAGE_KEY_TOKENS = f"{DOMAIN}.tokens"
+# The access each user last chose for each client at each described resource
+STORAGE_KEY_ACCESS_CHOICES = f"{DOMAIN}.access_choices"
 
 # Token expiry times (in seconds)
 ACCESS_TOKEN_EXPIRY = 3600  # 1 hour

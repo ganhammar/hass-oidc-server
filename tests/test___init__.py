@@ -70,13 +70,15 @@ def mock_token_store():
 class TestAsyncSetup:
     """Test async_setup function."""
 
-    async def test_async_setup_initializes_domain_data(self, mock_hass):
-        """Test async_setup initializes domain data."""
+    @patch("custom_components.oidc_provider.async_setup_resources")
+    async def test_async_setup_initializes_domain_data(self, mock_resources, mock_hass):
+        """Test async_setup initializes domain data and starts collecting resources."""
         result = await async_setup(mock_hass, {})
 
         assert result is True
         assert DOMAIN in mock_hass.data
         assert mock_hass.data[DOMAIN] == {}
+        mock_resources.assert_awaited_once_with(mock_hass)
 
 
 class TestAsyncSetupEntry:
