@@ -49,7 +49,9 @@ from custom_components.oidc_provider.const import (
     CONF_ALLOW_DYNAMIC_REGISTRATION,
     DOMAIN,
     STORAGE_KEY_KEYS,
+    STORAGE_KEY_TOKENS,
 )
+from custom_components.oidc_provider.security import hash_client_secret
 from custom_components.oidc_provider.token_validator import validate_access_token
 
 # The issuer is derived from the request Host. Pin it with forwarded headers so
@@ -122,13 +124,14 @@ async def _start_authorization(
     code_challenge: str,
     resource: str | None,
     redirect_uri: str = REDIRECT_URI,
+    scope: str = "openid profile",
 ) -> str:
     """Send an authorization request to /authorize and return the pending request id."""
     params = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": "openid profile",
+        "scope": scope,
         "state": "test-state",
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
@@ -1765,15 +1768,22 @@ async def test_panel_strings_are_served_in_the_users_language(
 
 
 async def _sign_in_with_choice(
-    client: ClientSessionGenerator, registration: dict, options: dict[str, str] | None
+    client: ClientSessionGenerator,
+    registration: dict,
+    options: dict[str, str] | None,
+    *,
+    resource: str = STAND_IN_RESOURCE,
+    scope: str = "openid profile",
 ) -> tuple[int, dict]:
-    """Authorize for the stand-in's resource, approve with a choice and redeem the code."""
+    """Authorize for a resource, the stand-in's by default, approve with a choice and
+    redeem the code."""
     verifier, challenge = _pkce_pair()
     request_id = await _start_authorization(
         client,
         client_id=registration["client_id"],
         code_challenge=challenge,
-        resource=STAND_IN_RESOURCE,
+        resource=resource,
+        scope=scope,
     )
     status, body = await _choose(client, request_id, options)
     assert status == 200, body
@@ -1842,6 +1852,114 @@ async def test_choosing_nothing_grants_no_resource_scope(
     assert tokens["scope"] == "openid profile"
     status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
     assert status == 200, refreshed
+
+
+async def test_resource_scopes_a_client_asks_for_are_not_granted_unless_chosen(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    """Asking for a resource's scopes at the authorize step grants none of them; the
+    user's choice decides, and a resource without a description gets none at all."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    asked = "openid profile stand_in:admin stand_in:files:full"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, STAND_IN_LOOK_ONLY, scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile stand_in:read"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, dict.fromkeys(STAND_IN_LOOK_ONLY, "none"), scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+
+    status, tokens = await _sign_in_with_choice(
+        client, registration, None, resource=RESOURCE, scope=asked
+    )
+    assert status == 200, tokens
+    assert tokens["scope"] == "openid profile"
+    assert jwt.decode(tokens["access_token"], options={"verify_signature": False})["scope"] == (
+        "openid profile"
+    )
+
+
+async def test_sessions_stored_before_resources_described_access_at_refresh(
+    enable_custom_integrations: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_storage: dict,
+    stand_in,
+) -> None:
+    """Sessions saved by a release without choices of access have no access key. Loaded
+    from storage, one for a resource that now describes its access ends at its next
+    refresh, and one for any other resource refreshes as before."""
+    client_id = "stored-client"
+    hass_storage[f"{DOMAIN}.clients"] = {
+        "version": 1,
+        "key": f"{DOMAIN}.clients",
+        "data": {
+            "clients": {
+                client_id: {
+                    "client_name": "Stored client",
+                    "client_secret_hash": hash_client_secret("stored-secret"),
+                    "redirect_uris": [REDIRECT_URI],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "client_secret_basic",
+                    "consent_required": False,
+                }
+            }
+        },
+    }
+
+    def session(family: str, resource: str) -> dict:
+        return {
+            "user_id": "someone",
+            "client_id": client_id,
+            "scope": "openid profile",
+            "nonce": None,
+            "auth_time": int(time.time()) - 60,
+            "resource": resource,
+            "client_name": "Stored client",
+            "family": family,
+            "issued_at": time.time() - 60,
+            "expires_at": time.time() + 3600,
+        }
+
+    hass_storage[STORAGE_KEY_TOKENS] = {
+        "version": 1,
+        "key": STORAGE_KEY_TOKENS,
+        "data": {
+            "refresh_tokens": {
+                "described.token": session("described", STAND_IN_RESOURCE),
+                "other.token": session("other", RESOURCE),
+            }
+        },
+    }
+    await _setup_entry(
+        hass,
+        minor_version=OIDCProviderConfigFlow.MINOR_VERSION,
+        options={CONF_ALLOW_DYNAMIC_REGISTRATION: True},
+    )
+    await _setup_stand_in(hass)
+    client = await hass_client()
+    registration = {"client_id": client_id, "client_secret": "stored-secret"}
+    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {"described.token", "other.token"}
+
+    status, body = await _refresh(client, registration, "described.token")
+
+    assert status == 400
+    assert body["error"] == "invalid_grant"
+    assert "sign in again" in body["error_description"]
+
+    status, body = await _refresh(client, registration, "other.token")
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile"
+    assert jwt.decode(body["access_token"], options={"verify_signature": False})["aud"] == RESOURCE
+    assert [data["family"] for data in hass.data[DOMAIN]["refresh_tokens"].values()] == ["other"]
 
 
 async def test_session_from_before_the_resource_described_itself_ends_at_refresh(
