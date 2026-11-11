@@ -1,8 +1,9 @@
 // OIDC login panel. Shows the consent screen for a pending authorization
 // request and completes the redirect back to the client. Opened without a
 // pending request, it lists the applications signed in as the current user
-// and lets them end those sessions. Administrators also get a Clients tab
-// there, to register, edit and revoke clients.
+// and lets them change the access of those sessions or end them.
+// Administrators also get a Clients tab there, to register, edit and revoke
+// clients.
 //
 // The layout mirrors Home Assistant's own login page (ha-authorize): a
 // centered column with the HA icon above a card, built from HA's CSS
@@ -11,9 +12,10 @@
 // When the request is for a resource that describes the access it offers,
 // the consent screen lets the user choose that access: one of the resource's
 // levels, or one setting per area in a detailed view. The resource supplies
-// that text in the user's language. The panel's own text comes from the
-// integration's translations, through STRINGS_URL, with the English bundled
-// for when they cannot be loaded.
+// that text in the user's language. Changing a session's access on
+// Connected applications shows the same choice, with Save and Cancel. The
+// panel's own text comes from the integration's translations, through
+// STRINGS_URL, with the English bundled for when they cannot be loaded.
 
 // The panel's text in English, the same as in translations/en.json, which a
 // test keeps it in step with. It is shown until the translations have
@@ -60,14 +62,21 @@ const FALLBACK_STRINGS = {
   "access.sees_profile": "name",
   "access.sees_email": "email address",
   "access.sees_groups": "group memberships",
-  "access.change_later": "You can sign {app} out at any time under Connected applications.",
+  "access.change_later": "You can change what {app} can do, or sign it out, at any time under Connected applications.",
   "sessions.heading": "Connected applications",
   "sessions.intro": "These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.",
   "sessions.empty": "No applications are signed in with your Home Assistant account.",
   "sessions.access": "Access: {level}",
   "sessions.meta": "Signed in {signed_in}, last used {last_used}",
   "sessions.never": "never",
-  "sessions.sign_out": "Sign out"
+  "sessions.change_access": "Change access",
+  "sessions.sign_out": "Sign out",
+  "change.heading": "Change access for {client}",
+  "change.save": "Save",
+  "change.cancel": "Cancel",
+  "change.changed": "The access you can allow changed after this page opened. Check your choice and save again.",
+  "change.saved": "Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour.",
+  "change.gone": "{app} is no longer signed in, so its access cannot be changed."
 };
 
 // The value of the level choice that stands for a custom choice. Preset ids
@@ -115,7 +124,6 @@ const STYLES = `
     color: var(--primary-text-color, #212121);
   }
   .oidc-content {
-    width: 100%;
     max-width: 400px;
     margin: 0 auto;
     padding: 0 16px;
@@ -181,6 +189,14 @@ const STYLES = `
   }
   .oidc-session .action {
     margin-top: 8px;
+  }
+  .oidc-session-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .oidc-session-actions ha-button {
+    flex: 1 1 0;
+    min-width: 0;
   }
   .oidc-session-meta {
     color: var(--secondary-text-color, #727272);
@@ -980,6 +996,7 @@ class OidcLoginPanel extends HTMLElement {
 
   async _showTab(tab, notice = '') {
     this._tab = tab;
+    this._changing = null;
     try {
       if (tab === 'clients') {
         await this._renderClients(notice, 'info');
@@ -1072,14 +1089,23 @@ class OidcLoginPanel extends HTMLElement {
     });
   }
 
+  _noticeHtml() {
+    return this._notice ? `<ha-alert alert-type="info">${this._notice}</ha-alert>` : '';
+  }
+
   _consentAlert(details) {
-    const notice = this._notice ? `<ha-alert alert-type="info">${this._notice}</ha-alert>` : '';
     return `
         <ha-alert alert-type="warning">
           ${this._t('consent.alert', { client: markup(this._clientLabel(details)) })}
         </ha-alert>
-        ${notice}
+        ${this._noticeHtml()}
       `;
+  }
+
+  // What is above the card of a choice of access: on the consent screen, who
+  // is asking; when changing a session's access, only a notice, if any
+  _choiceAlert() {
+    return this._changing ? this._noticeHtml() : this._consentAlert(this._details);
   }
 
   // previous is the choice on the screen before it was loaded again: its rows
@@ -1124,6 +1150,11 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   _wireDecision() {
+    if (this._changing) {
+      this.querySelector('#oidc-save').addEventListener('click', () => this._onSave());
+      this.querySelector('#oidc-cancel-change').addEventListener('click', () => this._leaveChange());
+      return;
+    }
     this.querySelector('#oidc-approve').addEventListener('click', () => this._onDecision(true));
     this.querySelector('#oidc-deny').addEventListener('click', () => this._onDecision(false));
   }
@@ -1190,6 +1221,16 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   _accessFooter() {
+    if (this._changing) {
+      return `
+      <div id="oidc-locked-choice" aria-live="polite"></div>
+      <div class="action">
+        <ha-button id="oidc-save">${this._t('change.save')}</ha-button>
+      </div>
+      <div class="action">
+        <ha-button id="oidc-cancel-change" appearance="plain" variant="neutral">${this._t('change.cancel')}</ha-button>
+      </div>`;
+    }
     const details = this._details;
     const host = markup(`<b><bdi>${escapeHtml(details.redirect_host)}</bdi></b>`);
     const scopes = details.scopes || [];
@@ -1272,6 +1313,26 @@ class OidcLoginPanel extends HTMLElement {
     }
   }
 
+  // The heading of the simple view. When changing a session's access, it
+  // names the application, with when that session signed in and was last
+  // used, which tells two sessions of one application apart.
+  _choiceHeading() {
+    const session = this._changing;
+    if (!session) {
+      return `<h1 tabindex="-1">${this._t('consent.heading')}</h1>`;
+    }
+    const name = `<bdi>${escapeHtml(session.client_name)}</bdi>`;
+    const client = session.client_host
+      ? this._t('panel.client_from_host', {
+          client: markup(name),
+          host: markup(`<bdi>${escapeHtml(session.client_host)}</bdi>`),
+        })
+      : name;
+    return `
+        <h1 tabindex="-1">${this._t('change.heading', { client: markup(client) })}</h1>
+        <p class="hint">${this._sessionMeta(session)}</p>`;
+  }
+
   _renderSimple() {
     const access = this._access;
     const prompt = access.model.prompt
@@ -1280,7 +1341,7 @@ class OidcLoginPanel extends HTMLElement {
 
     this._renderCard(
       `
-        <h1 tabindex="-1">${this._t('consent.heading')}</h1>
+        ${this._choiceHeading()}
         <fieldset>
           <legend class="prompt">${prompt}</legend>
           <div class="level-list">
@@ -1293,7 +1354,7 @@ class OidcLoginPanel extends HTMLElement {
         </button>
         ${this._accessFooter()}
       `,
-      this._consentAlert(this._details)
+      this._choiceAlert()
     );
 
     this._updateLevelNotes();
@@ -1398,7 +1459,7 @@ class OidcLoginPanel extends HTMLElement {
         <div class="areas">${sections}</div>
         ${this._accessFooter()}
       `,
-      this._consentAlert(this._details),
+      this._choiceAlert(),
       true
     );
 
@@ -1449,8 +1510,9 @@ class OidcLoginPanel extends HTMLElement {
     this._updateApproval();
   }
 
-  // A choice that is exactly a level the ceiling locks cannot be approved.
-  // Approve is turned off and the reason shown right above it, in either view.
+  // A choice that is exactly a level the ceiling locks cannot be approved or
+  // saved. Approve or Save is turned off and the reason shown right above it,
+  // in either view.
   _updateApproval() {
     const access = this._access;
     const locked = access.lockedChoice(access.rows);
@@ -1460,7 +1522,7 @@ class OidcLoginPanel extends HTMLElement {
           reason: markup(this._res(access.model.ceiling.reason)),
         })}</span></div>`
       : '';
-    this.querySelector('#oidc-approve').toggleAttribute('disabled', Boolean(locked));
+    this.querySelector(this._changing ? '#oidc-save' : '#oidc-approve').toggleAttribute('disabled', Boolean(locked));
   }
 
   // ---- Deciding -----------------------------------------------------------
@@ -1557,6 +1619,15 @@ class OidcLoginPanel extends HTMLElement {
       </div>`;
   }
 
+  _sessionMeta(session) {
+    const formatTime = (seconds) =>
+      seconds ? escapeHtml(new Date(seconds * 1000).toLocaleString()) : this._t('sessions.never');
+    return this._t('sessions.meta', {
+      signed_in: markup(formatTime(session.signed_in_at)),
+      last_used: markup(formatTime(session.last_used_at)),
+    });
+  }
+
   async _renderSessions(notice = '') {
     const { sessions, resources = {} } = await this._fetchJson(
       `${SESSIONS_URL}?language=${encodeURIComponent(this._language())}`
@@ -1565,9 +1636,8 @@ class OidcLoginPanel extends HTMLElement {
     if (this._home && this._tab !== 'sessions') {
       return;
     }
-    const formatTime = (seconds) =>
-      seconds ? escapeHtml(new Date(seconds * 1000).toLocaleString()) : this._t('sessions.never');
-    const items = sessions.map((session) => {
+    this._sessions = sessions;
+    const items = sessions.map((session, index) => {
       const name = `<b><bdi>${escapeHtml(session.client_name)}</bdi></b>`;
       const label = session.client_host
         ? this._t('panel.client_from_host', {
@@ -1575,15 +1645,18 @@ class OidcLoginPanel extends HTMLElement {
             host: markup(`<bdi>${escapeHtml(session.client_host)}</bdi>`),
           })
         : name;
+      // Offered for every session whose resource describes the access it
+      // offers, also one that has no choice of it yet
+      const change = session.access_offered_by
+        ? `<ha-button appearance="plain" data-change="${index}">${this._t('sessions.change_access')}</ha-button>`
+        : '';
       return `
         <div class="oidc-session">
           ${label}
           ${this._sessionAccess(session, resources)}
-          <div class="oidc-session-meta">${this._t('sessions.meta', {
-            signed_in: markup(formatTime(session.signed_in_at)),
-            last_used: markup(formatTime(session.last_used_at)),
-          })}</div>
-          <div class="action">
+          <div class="oidc-session-meta">${this._sessionMeta(session)}</div>
+          <div class="action oidc-session-actions">
+            ${change}
             <ha-button appearance="plain" variant="danger" data-session="${escapeHtml(session.session_id)}">${this._t('sessions.sign_out')}</ha-button>
           </div>
         </div>
@@ -1601,6 +1674,108 @@ class OidcLoginPanel extends HTMLElement {
     for (const button of this.querySelectorAll('ha-button[data-session]')) {
       button.addEventListener('click', () => this._endSession(button.dataset.session));
     }
+    for (const button of this.querySelectorAll('ha-button[data-change]')) {
+      button.addEventListener('click', () => this._openChange(this._sessions[button.dataset.change]));
+    }
+  }
+
+  // ---- Changing a session's access ----------------------------------------
+
+  _changeUrl(session) {
+    return `${SESSIONS_URL}/${encodeURIComponent(session.session_id)}/access`;
+  }
+
+  // Opens the choice of a session's access on what the session has now, or
+  // for a session without a choice yet, on what it would get by default. The
+  // user's ceiling and locked levels apply as they are now.
+  async _openChange(session) {
+    if (!this._startRequest()) {
+      return;
+    }
+    let details;
+    try {
+      details = await this._fetchJson(`${this._changeUrl(session)}?language=${encodeURIComponent(this._language())}`);
+    } catch (error) {
+      this._busy = false;
+      await this._changeFailed(session, error);
+      return;
+    }
+    this._busy = false;
+    // The user may have switched tabs while the choice was on its way
+    if (this._tab !== 'sessions') {
+      return;
+    }
+    this._notice = '';
+    this._renderChange(session, details);
+  }
+
+  // previous is the choice on the screen before it was loaded again: its rows
+  // are kept as far as the access offered now allows, and so is its view.
+  _renderChange(session, details, previous = null) {
+    this._changing = session;
+    this._details = details;
+    this._access = new AccessChoice(details.access, previous ? previous.rows : details.access.current);
+    this._access.view = (previous && previous.view) || 'simple';
+    this._renderAccess();
+  }
+
+  async _onSave() {
+    const access = this._access;
+    if (this._busy || access.lockedChoice(access.rows)) {
+      return;
+    }
+    const session = this._changing;
+    this._startRequest();
+    try {
+      await this._fetchJson(this._changeUrl(session), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ options: access.rows }),
+      });
+    } catch (error) {
+      this._busy = false;
+      if (error.status === 400 && (await this._changeAgain())) {
+        return;
+      }
+      await this._changeFailed(session, error);
+      return;
+    }
+    this._busy = false;
+    await this._leaveChange(this._t('change.saved', { app: markup(this._appName(session.client_name)) }));
+  }
+
+  // A choice refused while the session is still there means the screen no
+  // longer fits what the resource allows, as when the user's ceiling was
+  // lowered after it loaded. The choice is shown again from the resource's
+  // current answers, with a notice. False when it cannot be.
+  async _changeAgain() {
+    let details;
+    try {
+      details = await this._fetchJson(`${this._changeUrl(this._changing)}?language=${encodeURIComponent(this._language())}`);
+    } catch (error) {
+      return false;
+    }
+    const previous = { rows: this._access.rows, view: this._access.view };
+    this._notice = this._t('change.changed');
+    this._renderChange(this._changing, details, previous);
+    return true;
+  }
+
+  // A session that is gone, signed out elsewhere or expired, is no longer
+  // listed, which the list says. Anything else is an error.
+  async _changeFailed(session, error) {
+    if (error.status === 404) {
+      await this._leaveChange(this._t('change.gone', { app: markup(this._appName(session.client_name)) }));
+      return;
+    }
+    this._changing = null;
+    this._renderError(error, 'panel.sessions_error_hint');
+  }
+
+  async _leaveChange(notice = '') {
+    this._access = null;
+    this._notice = '';
+    await this._showTab('sessions', notice);
   }
 
   async _endSession(sessionId) {
@@ -1931,7 +2106,7 @@ class OidcLoginPanel extends HTMLElement {
         <h1 tabindex="-1">${this._t('panel.error_title')}</h1>
         <p>${Object.hasOwn(this._strings, hint) ? this._t(hint) : escapeHtml(hint)}</p>
       `,
-      `<ha-alert alert-type="error">${escapeHtml(error.message)}</ha-alert>`
+      `<ha-alert alert-type="error">${escapeHtml(error.detail || error.message)}</ha-alert>`
     );
   }
 

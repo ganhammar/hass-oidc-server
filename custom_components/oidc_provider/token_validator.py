@@ -2,6 +2,7 @@
 
 import ipaddress
 import logging
+import re
 from typing import Any
 
 import jwt
@@ -40,6 +41,28 @@ def _describe_token(token: str) -> str:
     return " ".join(parts)
 
 
+# A host as a request may name it: a name or an address, with or without a port.
+# A name may hold underscores, as container names do, and end in a dot. Anything
+# else in a host header, such as a path, is not a host.
+_HOST_PATTERN = re.compile(
+    r"(?:[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?\.?|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?"
+)
+_HOST_HEADERS = ("X-Forwarded-Host", "Host")
+
+
+def _named_host(request: web.Request) -> str | None:
+    """Return the host the request names, from X-Forwarded-Host or else Host.
+
+    A header that holds anything but a host is passed over, so a client cannot
+    put a path or another URL into the issuer and the addresses built from it.
+    """
+    for header in _HOST_HEADERS:
+        host = request.headers.get(header)
+        if isinstance(host, str) and _HOST_PATTERN.fullmatch(host):
+            return host
+    return None
+
+
 def _is_ip_host(host: str) -> bool:
     """Return True when host (optionally host:port) is a bare IP address."""
     bare = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
@@ -57,7 +80,9 @@ def get_issuer_from_request(request: web.Request) -> str:
     Resolution order: a domain host from X-Forwarded-Host or Host wins
     (for reverse proxy setups). When the host is missing or a bare IP
     address, Home Assistant's configured external URL is preferred,
-    followed by the IP host and finally the raw request origin.
+    followed by the IP host. A header that holds anything but a host is
+    passed over, and the request's own origin stands in only when no host
+    header was sent.
 
     Args:
         request: The aiohttp web request
@@ -70,8 +95,11 @@ def get_issuer_from_request(request: web.Request) -> str:
     # and X-Forwarded-Proto without setting X-Forwarded-Host, so fall back to the
     # Host header. The protocol comes from X-Forwarded-Proto when the proxy
     # terminates TLS, otherwise from the request scheme.
-    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host")
-    proto = request.headers.get("X-Forwarded-Proto") or request.url.scheme
+    host = _named_host(request)
+    proto = request.headers.get("X-Forwarded-Proto")
+    proto = proto.lower() if isinstance(proto, str) else None
+    if proto not in ("http", "https"):
+        proto = request.url.scheme
 
     if host and not _is_ip_host(host):
         return f"{proto}://{host}"
@@ -87,6 +115,14 @@ def get_issuer_from_request(request: web.Request) -> str:
 
     if host:
         return f"{proto}://{host}"
+
+    # No header names a host. The request's own origin is built from the Host
+    # header as it was sent, so it stands in only when no host header came at
+    # all; one that holds something else never reaches the issuer.
+    if any(
+        isinstance(sent := request.headers.get(header), str) and sent for header in _HOST_HEADERS
+    ):
+        return _get_ha_internal_url(request) or f"{proto}://localhost"
 
     return str(request.url.origin())
 
@@ -104,6 +140,20 @@ def _get_ha_external_url(request: web.Request) -> str | None:
             return None
 
         return get_url(hass, allow_internal=False, prefer_external=True)
+    except Exception:
+        return None
+
+
+def _get_ha_internal_url(request: web.Request) -> str | None:
+    """Try to get the URL Home Assistant is configured to be reached at inside the network."""
+    try:
+        hass = request.app.get("hass")
+        if not isinstance(hass, HomeAssistant):
+            return None
+
+        from homeassistant.helpers.network import get_url
+
+        return get_url(hass, allow_external=False, allow_cloud=False).rstrip("/")
     except Exception:
         return None
 

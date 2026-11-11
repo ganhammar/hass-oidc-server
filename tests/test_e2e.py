@@ -1456,14 +1456,18 @@ async def test_client_management_page_requires_an_admin(
     assert (await (await hass_client_no_auth()).get(CLIENTS_URL)).status == 401
 
 
-async def test_options_dialog_links_to_client_management(
+async def test_options_dialog_links_to_client_management_and_connected_applications(
     setup_provider: None, hass: HomeAssistant
 ) -> None:
-    """The Configure dialog points administrators at the Clients tab of the panel."""
+    """The Configure dialog on the integration's page points administrators at the Clients
+    tab of the panel, and at their own connected applications."""
     entry = hass.config_entries.async_entries(DOMAIN)[0]
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["description_placeholders"] == {"clients_url": "/oidc_login?tab=clients"}
+    assert result["description_placeholders"] == {
+        "clients_url": "/oidc_login?tab=clients",
+        "sessions_url": "/oidc_login",
+    }
 
 
 @pytest.mark.parametrize(
@@ -2358,3 +2362,199 @@ async def test_connected_applications_show_the_access_granted(
     [session] = data["sessions"]
     assert session["access"] == {"resource": "oidc_stand_in", "options": choice}
     assert data["resources"]["oidc_stand_in"]["presets"][0]["title"] == "Look only"
+
+
+# --- Changing the access of a connected application ---------------------------
+
+
+async def _session_access(
+    client: ClientSessionGenerator, session_id: str, options: dict[str, str] | None = None
+) -> tuple[int, dict]:
+    """Read a session's choice of access, or change it to the options given."""
+    url = f"{SESSIONS_URL}/{session_id}/access"
+    if options is None:
+        resp = await client.get(url, params={"language": "en"})
+    else:
+        resp = await client.put(url, json={"options": options})
+    return resp.status, await resp.json()
+
+
+async def _only_session(client: ClientSessionGenerator) -> dict:
+    resp = await client.get(SESSIONS_URL, params={"language": "en"})
+    [session] = (await resp.json())["sessions"]
+    return session
+
+
+async def test_user_changes_the_access_a_session_was_granted(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_storage: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new access replaces the old in the session and its scopes, applies from the
+    next refresh, and is the user's choice for the client next time."""
+    client = await hass_client()
+    registration = await _register_client(client)
+    status, tokens = await _sign_in_with_choice(client, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200, tokens
+    session = await _only_session(client)
+    assert session["access_offered_by"] == "oidc_stand_in"
+
+    status, offered = await _session_access(client, session["session_id"])
+    assert status == 200, offered
+    assert offered["client_name"] == "Test MCP Client"
+    assert offered["access"]["current"] == STAND_IN_LOOK_ONLY
+    assert offered["access"]["presets"][0]["title"] == "Look only"
+
+    choice = {**STAND_IN_LOOK_ONLY, "cameras": "none", "files": "full"}
+    status, body = await _session_access(client, session["session_id"], choice)
+    assert status == 200, body
+
+    # Listed with its new access, and saved with it
+    assert (await _only_session(client))["access"] == {
+        "resource": "oidc_stand_in",
+        "options": choice,
+    }
+    [stored] = hass_storage[STORAGE_KEY_TOKENS]["data"]["refresh_tokens"].values()
+    assert stored["access"]["options"] == choice
+
+    # The access token already issued keeps its scopes until it expires
+    claims = validate_access_token(
+        hass, tokens["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile stand_in:read"
+
+    # The next refresh carries exactly the new scopes
+    scope = (
+        "openid profile stand_in:lights:read stand_in:automations:read "
+        "stand_in:templates:read stand_in:files:full"
+    )
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+    assert status == 200, refreshed
+    assert refreshed["scope"] == scope
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == scope
+
+    # Rotation and reuse detection work as for any session
+    status, replayed = await _refresh(client, registration, tokens["refresh_token"])
+    assert (status, replayed["refresh_token"], replayed["scope"]) == (
+        200,
+        refreshed["refresh_token"],
+        scope,
+    )
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+    # The next sign-in starts from the changed access
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["remembered"] == choice
+
+
+async def test_only_the_user_who_signed_in_can_change_a_sessions_access(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_read_only_access_token: str,
+) -> None:
+    admin = await hass_client()
+    registration = await _register_client(admin)
+    status, _ = await _sign_in_with_choice(admin, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200
+    session = await _only_session(admin)
+    other = await hass_client(hass_read_only_access_token)
+
+    assert (await _session_access(other, session["session_id"]))[0] == 404
+    status, body = await _session_access(other, session["session_id"], STAND_IN_CONTROL)
+
+    assert (status, body["error"]) == (404, "not_found")
+    assert (await _only_session(admin))["access"]["options"] == STAND_IN_LOOK_ONLY
+    resp = await other.get(SESSIONS_URL)
+    assert (await resp.json())["sessions"] == []
+
+
+async def test_changing_access_is_checked_against_the_ceiling_and_locked_levels(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    status, _ = await _sign_in_with_choice(client, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200
+    session_id = (await _only_session(client))["session_id"]
+    ceiling = {
+        "groups": {"files": {"max": "read", "reason": "Limited for your account."}},
+        "locked_presets": ["control"],
+        "reason": "Not available for your account.",
+    }
+    stand_in.CEILINGS[hass_admin_user.id] = ceiling
+
+    status, offered = await _session_access(client, session_id)
+    assert offered["access"]["ceiling"] == ceiling
+
+    for refused in ({**STAND_IN_LOOK_ONLY, "files": "full"}, STAND_IN_CONTROL):
+        status, body = await _session_access(client, session_id, refused)
+        assert (status, body["error"]) == (400, "invalid_choice"), body
+    assert (await _only_session(client))["access"]["options"] == STAND_IN_LOOK_ONLY
+
+    allowed = {**STAND_IN_CONTROL, "files": "read"}
+    assert (await _session_access(client, session_id, allowed))[0] == 200
+    assert (await _only_session(client))["access"]["options"] == allowed
+
+
+async def test_a_session_from_before_opens_on_its_default_and_saving_sets_its_access(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    stand_in,
+) -> None:
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+    session = await _only_session(client)
+    assert (session["access"], session["access_offered_by"]) == (None, "oidc_stand_in")
+
+    status, offered = await _session_access(client, session["session_id"])
+    assert status == 200, offered
+    assert offered["access"]["current"] == STAND_IN_CONTROL
+
+    assert (await _session_access(client, session["session_id"], STAND_IN_LOOK_ONLY))[0] == 200
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    assert refreshed["scope"] == "openid profile stand_in:read"
+
+
+async def test_changing_access_while_the_resource_cannot_answer_changes_nothing(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in,
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    status, _ = await _sign_in_with_choice(client, registration, STAND_IN_LOOK_ONLY)
+    assert status == 200
+    session_id = (await _only_session(client))["session_id"]
+
+    async def fail(hass: HomeAssistant, user, language: str) -> None:
+        raise RuntimeError("no ceiling today")
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", fail)
+
+    assert (await _session_access(client, session_id))[0] == 503
+    status, body = await _session_access(client, session_id, STAND_IN_CONTROL)
+    assert (status, body["error"]) == (503, "unavailable")
+    assert (await _only_session(client))["access"]["options"] == STAND_IN_LOOK_ONLY

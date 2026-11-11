@@ -375,3 +375,238 @@ def test_a_refused_approval_of_a_request_that_is_gone_shows_the_error(stand_in):
 
     assert result["shown"] == ["400 Invalid access choice"]
     assert result["notice"] is None
+
+
+# --- Changing a session's access ----------------------------------------------
+
+
+def _change_model(stand_in, ceiling=None, *, current=None, remembered=None) -> dict[str, Any]:
+    """Return what the session access endpoint gives the panel of the stand-in's resource."""
+    return {**_access_model(stand_in, ceiling, remembered=remembered), "current": current}
+
+
+CUSTOM = {**LOOK_ONLY, "cameras": "none", "files": "read"}
+
+
+@needs_node
+def test_changing_access_opens_on_the_sessions_current_choice(stand_in):
+    opening = """
+    const access = new AccessChoice(model, model.current);
+    return { selected: access.selected, rows: access.rows, lastChoice: access.lastChoice };
+    """
+
+    result = _run_panel(opening, model=_change_model(stand_in, current=CUSTOM))
+    assert result == {"selected": "_custom", "rows": CUSTOM, "lastChoice": None}
+
+    # The ceiling as it is now holds the choice down
+    ceiling = {"groups": {"files": {"max": "none", "reason": "Limited."}}, "reason": "No."}
+    result = _run_panel(opening, model=_change_model(stand_in, ceiling, current=ADMIN))
+    assert result["rows"] == {**ADMIN, "files": "none"}
+    assert result["selected"] == "configure"
+
+    # A choice that is now a locked level's gives way to the default
+    locked = {"locked_presets": ["admin"], "reason": "Not for you."}
+    result = _run_panel(opening, model=_change_model(stand_in, locked, current=ADMIN))
+    assert (result["selected"], result["rows"]) == ("read", LOOK_ONLY)
+
+    # Without current options, the choice opens as the consent screen would
+    result = _run_panel(opening, model=_change_model(stand_in, remembered=CONTROL))
+    assert (result["selected"], result["lastChoice"]) == ("control", "control")
+
+
+CHANGE = """
+const panel = new OidcLoginPanel();
+panel._hass = { locale: { language: 'en' } };
+panel._home = true;
+panel._tab = 'sessions';
+const shown = [];
+panel._renderAccess = () => {
+  const access = panel._access;
+  shown.push({
+    view: access.view,
+    rows: access.rows,
+    selected: access.selected,
+    notice: panel._notice || null,
+    heading: panel._choiceHeading(),
+  });
+};
+panel._showTab = async (tab, notice = '') => {
+  panel._changing = null;
+  shown.push({ tab, notice });
+};
+panel.querySelectorAll = () => [];
+panel._renderError = (error) => shown.push(error.message);
+const requests = [];
+panel._fetchJson = async (url, init = {}) => {
+  requests.push([init.method || 'GET', url, init.body ? JSON.parse(init.body) : null]);
+  const answer = answers.shift();
+  if (answer.status) {
+    throw Object.assign(new Error(`${answer.status} refused`), { status: answer.status });
+  }
+  return answer;
+};
+await panel._openChange(session);
+"""
+
+SESSION = {
+    "session_id": "sid",
+    "client_name": "App $&",
+    "client_host": "app.example.com",
+    "signed_in_at": None,
+    "last_used_at": None,
+    "access_offered_by": "oidc_stand_in",
+}
+ACCESS_URL = "/api/oidc_provider/sessions/sid/access"
+
+
+def _change_details(access):
+    return {"client_name": "App $&", "client_host": "app.example.com", "access": access}
+
+
+@needs_node
+def test_saving_a_change_of_access(stand_in):
+    details = _change_details(_change_model(stand_in, current=CUSTOM))
+
+    result = _run_panel(
+        CHANGE + """
+        panel._access.choosePreset('control');
+        await panel._onSave();
+        return { requests, shown };
+        """,
+        session=SESSION,
+        answers=[details, {"access": {}}],
+    )
+
+    assert result["requests"] == [
+        ["GET", f"{ACCESS_URL}?language=en", None],
+        ["PUT", ACCESS_URL, {"options": CONTROL}],
+    ]
+    opened, listed = result["shown"]
+    assert (opened["view"], opened["rows"], opened["selected"]) == ("simple", CUSTOM, "_custom")
+    # The heading names the application being changed, as the list does
+    assert "Change access for <bdi>App $&amp;</bdi> from <bdi>app.example.com</bdi>" in (
+        opened["heading"]
+    )
+    # Back on the list, which says when the change takes effect
+    assert listed == {
+        "tab": "sessions",
+        "notice": "Saved. The access you chose applies the next time <bdi>App $&amp;</bdi> "
+        "gets new access; access it already has runs out within the hour.",
+    }
+
+
+@needs_node
+def test_a_refused_change_shows_the_choice_again_from_the_current_access(stand_in):
+    """As on the consent screen: the choice is kept as far as it still fits, the view
+    too, and a notice says what happened."""
+    before = _change_details(_change_model(stand_in, current=CUSTOM))
+    ceiling = {"groups": {"lights": {"max": "read", "reason": "Limited."}}, "reason": "No."}
+    now = _change_details(_change_model(stand_in, ceiling, current=CUSTOM))
+
+    result = _run_panel(
+        CHANGE + """
+        panel._access.view = 'detailed';
+        panel._access.chooseOption('lights', 'full');
+        await panel._onSave();
+        return { requests, shown, busy: panel._busy, changing: panel._changing.session_id };
+        """,
+        session=SESSION,
+        answers=[before, {"status": 400}, now],
+    )
+
+    assert [request[0] for request in result["requests"]] == ["GET", "PUT", "GET"]
+    again = result["shown"][-1]
+    assert again["view"] == "detailed"
+    assert again["rows"] == CUSTOM
+    assert again["notice"] == (
+        "The access you can allow changed after this page opened. "
+        "Check your choice and save again."
+    )
+    assert (result["busy"], result["changing"]) == (False, "sid")
+
+
+@needs_node
+def test_a_session_that_is_gone_goes_back_to_the_list(stand_in):
+    gone = "<bdi>App $&amp;</bdi> is no longer signed in, so its access cannot be changed."
+    details = _change_details(_change_model(stand_in, current=CUSTOM))
+
+    result = _run_panel(
+        CHANGE + "await panel._onSave(); return shown;",
+        session=SESSION,
+        answers=[details, {"status": 404}],
+    )
+    assert result[-1] == {"tab": "sessions", "notice": gone}
+
+    # Gone already when the choice is opened
+    result = _run_panel(CHANGE + "return shown;", session=SESSION, answers=[{"status": 404}])
+    assert result == [{"tab": "sessions", "notice": gone}]
+
+    # Any other failure is an error
+    result = _run_panel(CHANGE + "return shown;", session=SESSION, answers=[{"status": 503}])
+    assert result == ["503 refused"]
+
+
+@needs_node
+def test_a_locked_choice_is_not_saved_and_cancel_saves_nothing(stand_in):
+    locked = {"locked_presets": ["admin"], "reason": "Not for you."}
+    details = _change_details(_change_model(stand_in, locked, current=CUSTOM))
+
+    result = _run_panel(
+        CHANGE + """
+        for (const [group, option] of Object.entries(admin)) {
+          panel._access.chooseOption(group, option);
+        }
+        await panel._onSave();
+        await panel._leaveChange();
+        return { requests, shown };
+        """,
+        session=SESSION,
+        answers=[details],
+        admin=ADMIN,
+    )
+
+    assert [request[0] for request in result["requests"]] == ["GET"]
+    assert result["shown"][-1] == {"tab": "sessions", "notice": ""}
+
+
+@needs_node
+def test_connected_applications_offer_change_access_where_the_resource_offers_it():
+    result = _run_panel(
+        """
+        const panel = new OidcLoginPanel();
+        panel._hass = { locale: { language: 'en' } };
+        panel._home = true;
+        panel._tab = 'sessions';
+        let card = '';
+        panel._renderCard = (html) => { card = html; };
+        panel.querySelectorAll = () => [];
+        panel._fetchJson = async () => ({ sessions, resources: {} });
+        await panel._renderSessions();
+        return card;
+        """,
+        sessions=[
+            {**SESSION, "access": None},
+            {**SESSION, "session_id": "other", "access": None, "access_offered_by": None},
+        ],
+    )
+
+    assert result.count('data-change="0"') == 1
+    assert "data-change" not in result.split('data-session="sid"')[1]
+    assert result.count(">Change access</ha-button>") == 1
+    assert result.count(">Sign out</ha-button>") == 2
+
+
+@needs_node
+def test_the_consent_screen_still_names_its_own_heading_and_buttons(stand_in):
+    result = _run_panel(
+        """
+        const panel = new OidcLoginPanel();
+        panel._details = details;
+        return { heading: panel._choiceHeading(), footer: panel._accessFooter() };
+        """,
+        details=_details(_access_model(stand_in)),
+    )
+
+    assert result["heading"] == '<h1 tabindex="-1">Approve access?</h1>'
+    assert 'id="oidc-approve"' in result["footer"]
+    assert "You can change what <bdi>App</bdi> can do, or sign it out" in result["footer"]

@@ -124,3 +124,5 @@ CLIENT_KIND_METADATA_DOCUMENT = "metadata_document"
 PANEL_URL_PATH = "oidc_login"
 # The same panel, opened on client management
 PANEL_CLIENTS_PATH = f"/{PANEL_URL_PATH}?tab=clients"
+# The same panel, opened on the signed-in user's connected applications
+PANEL_SESSIONS_PATH = f"/{PANEL_URL_PATH}"

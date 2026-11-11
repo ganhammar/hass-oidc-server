@@ -2,7 +2,7 @@
 
 Mockups for the design in [hass-mcp-server#135](https://github.com/ganhammar/hass-mcp-server/issues/135) and its follow-up on a detailed mode. The point is to react to the layout and, as much, to the words.
 
-The provider builds the consent screen and Connected applications from this design, with the text a resource supplies (see [Describing a resource](../../resource-descriptions.md)). Not built yet: the time limit ("Allow access for" and its hint), the end-of-access line, "What it can do" and "Sign-in only" on Connected applications, and changing access without signing out (question 14). Access lasts until the user signs the application out, for 30 days at most.
+The provider builds the consent screen and Connected applications from this design, with the text a resource supplies (see [Describing a resource](../../resource-descriptions.md)). Not built yet: the time limit ("Allow access for" and its hint), the end-of-access line, and "What it can do" and "Sign-in only" on Connected applications. Access lasts until the user signs the application out, for 30 days at most. Changing access without signing out (question 14) is built as "Change access" next to "Sign out" on Connected applications, which opens the same choice as the consent screen; the mockups do not show it, and its wording is under [Connected applications](#connected-applications) below.
 
 Open `index.html` in a browser. It shows each page in a phone-sized or wide frame, in light or dark, and lets you switch the situation (first connection, reconnecting, household member with limits). The pages also open on their own; each has a dashed "Mockup" box at the bottom with the same switches and the token scope the choice would produce. Nothing is fetched from the network, so Home Assistant's Roboto font is not loaded and the system font stands in.
 
@@ -101,7 +101,7 @@ Every string the mockups show, exactly. `{app}` is the client's name from its me
 | Hint, until signed out | Access lasts until you sign {app} out, for 30 days at most. |
 | Fine print | When you approve, you go back to **{redirect}**. {app} will also see your name and email address. |
 | Buttons (unchanged) | Approve · Deny |
-| After approving | **Access approved** / Sending you back to the application. / You can sign {app} out at any time under Connected applications. |
+| After approving | **Access approved** / Sending you back to the application. / You can change what {app} can do, or sign it out, at any time under Connected applications. |
 | After denying (unchanged) | **Access denied** / Sending you back to the application. |
 
 The fine print replaces today's "If you continue, you will be sent to … The application will be able to see:" list. The part after "will also see" is built from the requested OpenID scopes, as `SCOPE_DESCRIPTIONS` does today.
@@ -195,6 +195,18 @@ Unavailable and locked:
 | Meta (unchanged words, friendlier dates) | Signed in November 3, last used 2 minutes ago |
 | Disclosure | What it can do *(opens the thirteen areas, grouped, each with None, Read or Full)* |
 | Button (unchanged) | Sign out |
+| Button next to Sign out, when the app's resource describes its access | Change access |
+
+Change access shows the consent screen's simple and detailed views, on what the app has now, without the alert above the card and without the fine print:
+
+| Where | Text |
+|---|---|
+| Heading, simple view | Change access for {app} from {host} |
+| Under the heading | Signed in November 3, last used 2 minutes ago |
+| Buttons, in place of Approve and Deny | Save · Cancel |
+| Notice when what may be allowed changed after the page opened | The access you can allow changed after this page opened. Check your choice and save again. |
+| Notice on the list after saving | Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour. |
+| Notice on the list when the app was signed out meanwhile | {app} is no longer signed in, so its access cannot be changed. |
 
 ## Accessibility
 
@@ -238,8 +250,8 @@ Unavailable and locked:
 10. **Cameras and images covers two integration options** (camera image access and image file access). When only one is on, Read means only that one. The description would need two more variants ("can see what your cameras show right now" or "can see saved images such as snapshots"). Is that acceptable, or should the row split?
 11. **Should KNX be listed when KNX is not set up?** The KNX tools exist on every install and report that KNX is missing. My answer: hide the row when KNX is not set up, but keep showing areas turned off in the MCP Server options, because an administrator can turn those on.
 12. **How should a level that is partly over the ceiling look?** The mockup locks a level that adds nothing and offers a partly limited level clamped, silently. My answer: once ceilings exist, add one line to a clamped level, such as "Limited for your account: Diagnostics stays at Read."
-13. **How do people find Connected applications?** `/oidc_login` is hidden from the sidebar. The mockup adds "You can sign {app} out at any time under Connected applications" to the approved message, but that message shows only until the redirect. Is a link elsewhere possible, such as the README, the notification after a first sign-in, or a dashboard card?
-14. **Changing access without signing out.** Connected applications only signs out. Reducing a grant in place is safe and could come later; widening it should go through the consent screen again. Is that worth an issue?
+13. **How do people find Connected applications?** `/oidc_login` is hidden from the sidebar. The mockup adds "You can sign {app} out at any time under Connected applications" to the approved message, but that message shows only until the redirect. Is a link elsewhere possible, such as the README, the notification after a first sign-in, or a dashboard card? Built since: the Configure dialog on the integration's page links to it next to Manage clients, which reaches administrators only.
+14. **Changing access without signing out.** Connected applications only signs out. Reducing a grant in place is safe and could come later; widening it should go through the consent screen again. Is that worth an issue? Built since as Change access, which allows widening too: it is the consent screen's own choice, made by the signed-in person and checked as an approval is, and the app gets the new access only at its next refresh.
 15. **The selected-segment colours** depart from `ha-control-select` for contrast (see Accessibility). Keep the departure, or stay with Home Assistant's default and accept 3.3:1?
 16. **Read-only mode** in the MCP Server options is not mocked. I would lock Control devices, Edit the setup and Administer with "Not available: the MCP Server integration is in read-only mode." and lock every Full segment with the same reason.
 

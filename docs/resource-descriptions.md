@@ -32,17 +32,17 @@ Descriptions are collected once per Home Assistant run, the first time both inte
 - Your resource keeps matching sign-ins, so they keep asking your module (see below), and a module that fails then gives the plain screen.
 - Your scopes stay in the provider's discovery documents.
 - Sessions for your resource that began before your description keep being settled at their next refresh, as [Sessions from before your description](#sessions-from-before-your-description) describes.
-- A change to your `resource` takes effect only after a restart, and so does a change to the scopes listed in the provider's discovery documents. The rest of the description is asked for again at every consent screen and approval.
+- A change to your `resource` takes effect only after a restart, and so does a change to the scopes listed in the provider's discovery documents. The rest of the description is asked for again at every consent screen, approval and change of access.
 
 ## The module
 
 | Function | Required | Called | Returns |
 |---|---|---|---|
-| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; at every consent screen and on Connected applications, with the user's language; and when the user approves or a [session from before your description](#sessions-from-before-your-description) is refreshed, with Home Assistant's language | The description, with its text in `language` |
-| `async_get_availability(hass, language)` | No | At every consent screen, with the user's language, and when the user approves or a session from before your description is refreshed, with Home Assistant's language | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
-| `async_get_ceiling(hass, user, language)` | No | At every consent screen, with the user's language, and when the user approves or a session from before your description is refreshed, with Home Assistant's language | The most this user may grant, or `None` |
+| `async_describe_resource(hass, language)` | Yes | Once when collected, with Home Assistant's language; at every consent screen, on Connected applications and when the user opens a session's access to [change it](#changing-access), with the user's language; and when the user approves, saves a change of access or a [session from before your description](#sessions-from-before-your-description) is refreshed, with Home Assistant's language | The description, with its text in `language` |
+| `async_get_availability(hass, language)` | No | At every consent screen and when the user opens a session's access to change it, with the user's language, and when the user approves, saves a change of access or a session from before your description is refreshed, with Home Assistant's language | Which groups are unavailable right now and why: `{group_id: reason}`, or `None` |
+| `async_get_ceiling(hass, user, language)` | No | At every consent screen and when the user opens a session's access to change it, with the user's language, and when the user approves, saves a change of access or a session from before your description is refreshed, with Home Assistant's language | The most this user may grant, or `None` |
 
-When the user approves, all three are asked again and their answers must still be valid. The choice is checked against that description and ceiling; availability does not change what may be approved.
+When the user approves, or saves a change of a session's access, all three are asked again and their answers must still be valid. The choice is checked against that description and ceiling; availability does not change what may be approved.
 
 They may be coroutines or plain functions. Each call has 10 seconds to answer; a coroutine that takes longer is cancelled and treated as a failure (see [Validation](#validation)). A plain function runs on Home Assistant's event loop and cannot be cancelled, so it must not block: do any I/O in a coroutine. `user` is Home Assistant's `User` signing in. `language` is a language code Home Assistant knows, such as `en`, `sv` or `pt-BR`.
 
@@ -207,7 +207,7 @@ An access token for your resource has your resource in `aud` (as today) and the 
 
 - The scopes come from the user's choice, whatever the client asked for. The client learns them from the token response's `scope` (RFC 6749 §3.3).
 - A choice that is exactly a preset with its own `scopes` carries those; any other choice carries the scopes of each chosen option. Expect both forms.
-- Refreshed tokens carry the same scopes and the same audience.
+- Refreshed tokens carry the same audience, and the same scopes until the user changes the session's access; see [Changing access](#changing-access).
 - A token for your resource with none of your scopes grants nothing there. That is a token for which the user chose options that grant no scopes, such as the lowest everywhere, and an access token of a session from before your description, until that session's next refresh gives it access. The provider gives you no way to tell the two apart, and you need none: a resource that enforces its scopes refuses such a token at once.
 - Refuse a request whose token lacks the scopes it needs with `403` and a challenge that names them with `openid`, such as `WWW-Authenticate: Bearer error="insufficient_scope", scope="openid mcp:control"` (RFC 6750 §3.1). An MCP client then goes back through authorization, where the user chooses.
 - A token with none of your scopes may be refused either way, and each answer leads somewhere else:
@@ -241,6 +241,17 @@ A session that began before your integration described itself carries no choice 
 - When your module fails, does not answer within 10 seconds, or gives an answer that does not validate, the session is refreshed without your scopes and the provider logs a warning. The next refresh asks again.
 
 The access token such a session already holds, valid for up to an hour, carries none of your scopes until the client refreshes. How you refuse it decides whether the client refreshes first; see [What arrives in the token](#what-arrives-in-the-token).
+
+Until that refresh, the user can also give such a session access themselves on Connected applications, as described next.
+
+## Changing access
+
+On Connected applications, the user can change the access of every session whose `resource` matches your description, a session from before your description included. Apart from giving a session from before your description the access you name for it, the provider never changes a session's access on its own.
+
+- **Change access** asks your module for the description, availability and the user's ceiling, in the user's language, as the consent screen does, and shows the same choice. It opens on the session's current options. A session from before your description opens on the access `existing_sessions_preset` would give it at its next refresh, or, without one, where the consent screen would open.
+- **Save** asks for all three again, in Home Assistant's language, and checks the choice as an approval is checked. A choice that does not fit changes nothing. Neither does an answer that fails, does not validate or does not come within 10 seconds, and for that the provider logs a warning.
+- A choice that fits replaces the session's access. Your scopes in the session's `scope` become exactly those of the new choice, following the rule for any choice; the OpenID Connect scopes stay. It is remembered as the user's choice for that client, so their next consent screen for it opens on it.
+- Access tokens already issued keep their scopes until they expire, within the hour, as after a sign-out. The session's next refresh carries the new scopes, and so does every refresh after it. A token issued with the old scopes can therefore reach you for up to an hour after a change, so keep enforcing your scopes and the user's ceiling on every request.
 
 ## Scopes in your metadata and challenges
 
