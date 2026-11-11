@@ -187,6 +187,7 @@ DESCRIPTION: dict[str, Any] = {
         ),
     ],
     "default_preset": "read",
+    "existing_sessions_preset": "control",
     "sections": [
         {"id": "devices", "title": "Devices", "groups": [LIGHTS, CAMERAS]},
         {"id": "setup", "title": "Setup", "groups": [AUTOMATIONS, TEMPLATES]},

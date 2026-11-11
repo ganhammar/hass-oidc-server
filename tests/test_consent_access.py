@@ -524,12 +524,27 @@ async def test_the_chosen_access_is_in_the_token_and_survives_refresh(stand_in):
     assert _claims(body["access_token"])["scope"] == scope
 
 
-async def test_a_session_granted_before_its_resource_was_described_ends_at_refresh(
-    stand_in, caplog
-):
-    """Such a session carries no choice of access, so the client signs in
-    again and the user chooses."""
+CONTROL = {**LOOK_ONLY, "lights": "full"}
+
+
+def _without_existing_sessions_preset(stand_in):
+    stand_in.DESCRIPTION = {
+        key: value
+        for key, value in stand_in.DESCRIPTION.items()
+        if key != "existing_sessions_preset"
+    }
+
+
+async def _hass_with_session_from_before(stand_in, user=USER):
+    """Return hass state with a session for the stand-in's resource that has no access.
+
+    It began before the stand-in described itself. With it is a session for
+    a resource that has no description.
+    """
     hass = await _token_hass(stand_in)
+    hass.auth.async_get_user = AsyncMock(
+        return_value=SimpleNamespace(id=user, name="Someone") if user else None
+    )
     hass.data[DOMAIN]["refresh_tokens"] = {
         "fam.old": {
             "client_id": CLIENT,
@@ -537,6 +552,7 @@ async def test_a_session_granted_before_its_resource_was_described_ends_at_refre
             "scope": "openid profile",
             "resource": RESOURCE,
             "family": "fam",
+            "issued_at": 10,
             "expires_at": time.time() + 3600,
         },
         "other.token": {
@@ -548,6 +564,95 @@ async def test_a_session_granted_before_its_resource_was_described_ends_at_refre
             "expires_at": time.time() + 3600,
         },
     }
+    return hass
+
+
+def _session(hass, family="fam"):
+    [data] = [
+        data for data in hass.data[DOMAIN]["refresh_tokens"].values() if data["family"] == family
+    ]
+    return data
+
+
+async def test_a_session_from_before_gets_the_access_its_resource_names(stand_in, caplog):
+    """The session keeps the access it defaults to as if it had been chosen, but the
+    user's choice for the next sign-in is not written."""
+    hass = await _hass_with_session_from_before(stand_in)
+
+    with caplog.at_level(logging.INFO):
+        status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert status == 200, body
+    scope = "openid profile stand_in:control"
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+    assert _claims(body["access_token"])["aud"] == RESOURCE
+    assert _session(hass)["access"] == {
+        "resource": "oidc_stand_in",
+        "options": CONTROL,
+        "scopes": ["stand_in:control"],
+    }
+    assert _session(hass)["scope"] == scope
+    # Asked as an approval asks, in Home Assistant's language
+    assert {("describe", "en"), ("ceiling", "en")} <= set(stand_in.CALLS)
+    assert "the access it gives such sessions: stand_in:control" in caplog.text
+    # The refresh token was rotated as for any refresh, and the session is saved
+    assert body["refresh_token"] != "fam.old"
+    assert "fam.old" in _session(hass)["retired"]
+    hass.data[DOMAIN]["token_store"].async_save.assert_awaited()
+    # Not the user's choice
+    assert hass.data[DOMAIN]["access_choices"] == {}
+    hass.data[DOMAIN]["access_choices_store"].async_save.assert_not_awaited()
+
+    # Connected applications shows it like any access
+    [listed] = [session for session in (await _sessions(hass))["sessions"] if session["access"]]
+    assert listed["access"] == {"resource": "oidc_stand_in", "options": CONTROL}
+
+    # Later refreshes carry it without asking the resource again
+    stand_in.CALLS.clear()
+    status, body = await _token(
+        hass, grant_type="refresh_token", refresh_token=body["refresh_token"]
+    )
+    assert status == 200, body
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+    assert stand_in.CALLS == []
+
+    # A session for a resource without a description refreshes as before
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="other.token")
+    assert status == 200, body
+    assert body["scope"] == "openid"
+    assert _session(hass, "other").get("access") is None
+
+
+async def test_the_ceiling_lowers_the_access_of_a_session_from_before(stand_in):
+    """Held at the ceiling, the preset's choice is no longer the preset, so the token
+    carries the scope of each option."""
+    stand_in.CEILINGS[USER] = {
+        "groups": {"cameras": {"max": "none", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+    hass = await _hass_with_session_from_before(stand_in)
+
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert status == 200, body
+    scope = "openid profile stand_in:lights:full stand_in:automations:read stand_in:templates:read"
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+    assert _session(hass)["access"]["options"] == {**CONTROL, "cameras": "none"}
+
+
+@pytest.mark.parametrize("why", ["no preset named", "locked", "user gone"])
+async def test_a_session_from_before_ends_at_refresh_without_access_to_give_it(
+    stand_in, caplog, why
+):
+    """The client signs in again and the user chooses."""
+    if why == "no preset named":
+        _without_existing_sessions_preset(stand_in)
+    elif why == "locked":
+        stand_in.CEILINGS[USER] = {"locked_presets": ["control"], "reason": "Not for you."}
+    hass = await _hass_with_session_from_before(stand_in, user=None if why == "user gone" else USER)
 
     with caplog.at_level(logging.INFO):
         status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
@@ -557,12 +662,135 @@ async def test_a_session_granted_before_its_resource_was_described_ends_at_refre
     assert "sign in again" in body["error_description"]
     # The whole session is gone; others are untouched
     assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other.token"]
-    assert "granted before its resource described the access it offers" in caplog.text
+    assert "granted before its resource described the access it offers, since" in caplog.text
+    assert {
+        "no preset named": "integration oidc_stand_in (Stand-in) gives such sessions no access",
+        "locked": "the options are those of preset control, which is locked",
+        "user gone": "its user no longer exists",
+    }[why] in caplog.text
+    # The resource is asked only when it names access for such sessions
+    assert (("ceiling", "en") in stand_in.CALLS) is (why == "locked")
 
-    # A session for a resource without a description refreshes as before
-    status, body = await _token(hass, grant_type="refresh_token", refresh_token="other.token")
-    assert status == 200
-    assert body["scope"] == "openid"
+
+async def test_a_session_from_before_ends_when_the_resource_no_longer_names_its_access(
+    stand_in,
+):
+    """The access is taken from the description asked for at the refresh."""
+    hass = await _hass_with_session_from_before(stand_in)
+    _without_existing_sessions_preset(stand_in)
+
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other.token"]
+
+
+@pytest.mark.parametrize("breakage", ["raises", "hangs", "malformed"])
+async def test_a_session_from_before_is_kept_while_its_resource_cannot_answer(
+    stand_in, caplog, monkeypatch, breakage
+):
+    """It is refreshed without the resource's scopes, and the next refresh asks again."""
+    hass = await _hass_with_session_from_before(stand_in)
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def fail(hass, user, language):
+        if breakage == "hangs":
+            await asyncio.Event().wait()
+        if breakage == "raises":
+            raise RuntimeError("no ceiling today")
+        return {"groups": {"garden": {"max": "none", "reason": "No garden."}}, "reason": "No."}
+
+    with monkeypatch.context() as patched:
+        patched.setattr(stand_in, "async_get_ceiling", fail)
+        with caplog.at_level(logging.WARNING):
+            status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile"
+    assert _claims(body["access_token"])["scope"] == "openid profile"
+    assert "access" not in _session(hass)
+    assert _session(hass)["scope"] == "openid profile"
+    assert (
+        "Refreshing a session of client client123 without the scopes of integration "
+        "oidc_stand_in (Stand-in) until it gives the session its access for sessions from "
+        "before: "
+        + {
+            "raises": "asking it failed",
+            "hangs": "it did not answer within 0.01 seconds",
+            "malformed": "the ceiling names unknown group 'garden'",
+        }[breakage]
+    ) in caplog.text
+
+    status, body = await _token(
+        hass, grant_type="refresh_token", refresh_token=body["refresh_token"]
+    )
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile stand_in:control"
+    assert _session(hass)["access"]["options"] == CONTROL
+
+
+async def test_refreshes_racing_on_a_session_from_before_give_it_its_access_once(
+    stand_in, monkeypatch
+):
+    """A replaced refresh token presented while the resource is asked is answered with
+    the same session. The first answer to arrive settles its access, scope and all,
+    even when a later answer would have locked it."""
+    hass = await _hass_with_session_from_before(stand_in)
+    answer = asyncio.Event()
+    describe = stand_in.async_describe_resource
+    ceilings = iter([None, {"locked_presets": ["control"], "reason": "Not for you."}])
+
+    async def slow(hass, language):
+        await answer.wait()
+        return await describe(hass, language)
+
+    async def ceiling(hass, user, language):
+        return next(ceilings)
+
+    monkeypatch.setattr(stand_in, "async_describe_resource", slow)
+    monkeypatch.setattr(stand_in, "async_get_ceiling", ceiling)
+    first = asyncio.create_task(_token(hass, grant_type="refresh_token", refresh_token="fam.old"))
+    await asyncio.sleep(0)
+    # The first has replaced the refresh token and is waiting for the resource
+    [current] = [token for token in hass.data[DOMAIN]["refresh_tokens"] if token != "other.token"]
+    assert current != "fam.old"
+    second = asyncio.create_task(_token(hass, grant_type="refresh_token", refresh_token="fam.old"))
+    await asyncio.sleep(0)
+    answer.set()
+    results = await asyncio.gather(first, second)
+
+    scope = "openid profile stand_in:control"
+    for status, body in results:
+        assert status == 200, body
+        assert body["refresh_token"] == current
+        assert body["scope"] == scope
+        assert _claims(body["access_token"])["scope"] == scope
+    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {current, "other.token"}
+    assert _session(hass)["scope"] == scope
+    assert _session(hass)["access"]["options"] == CONTROL
+    # Both asked, the second while the first was still waiting
+    assert next(ceilings, None) is None
+
+    # The replaced token past its grace period still ends the session
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert list(hass.data[DOMAIN]["refresh_tokens"]) == ["other.token"]
+
+
+async def test_a_session_ended_while_its_resource_is_asked_gets_nothing(stand_in, monkeypatch):
+    hass = await _hass_with_session_from_before(stand_in)
+
+    async def ceiling_then_sign_out(hass_, user, language):
+        hass.data[DOMAIN]["refresh_tokens"].clear()
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", ceiling_then_sign_out)
+
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
 
 
 async def test_a_described_resource_named_only_at_the_token_endpoint_is_refused(stand_in):

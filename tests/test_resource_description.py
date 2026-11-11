@@ -8,6 +8,7 @@ from custom_components.oidc_provider.resource_description import (
     InvalidChoice,
     InvalidDescription,
     consent_model,
+    existing_sessions_options,
     granted_scopes,
     iter_groups,
     known_options,
@@ -44,6 +45,7 @@ def test_stand_in_description_is_valid_and_complete(description):
     """Defaults are filled in so every part can be read without checking for it."""
     assert description["resource"] == ["/api/stand_in", "/api/stand_in_http"]
     assert description["default_preset"] == "read"
+    assert description["existing_sessions_preset"] == "control"
     assert [group["id"] for group in iter_groups(description)] == [
         "lights",
         "cameras",
@@ -63,10 +65,12 @@ def test_stand_in_description_is_valid_and_complete(description):
 
 
 def test_single_resource_default_preset_and_unknown_keys(raw):
-    """A single resource becomes a list, the first preset is the default, and
-    keys this release does not know are dropped rather than refused."""
+    """A single resource becomes a list, the first preset is the default, sessions
+    from before get no preset unless one is named, and keys this release does not
+    know are dropped rather than refused."""
     raw["resource"] = "https://notes.example.com/api"
     del raw["default_preset"]
+    del raw["existing_sessions_preset"]
     raw["time_limits"] = ["1h"]
     raw["sections"][0]["groups"][0]["icon"] = "mdi:lightbulb"
 
@@ -74,6 +78,8 @@ def test_single_resource_default_preset_and_unknown_keys(raw):
 
     assert description["resource"] == ["https://notes.example.com/api"]
     assert description["default_preset"] == "read"
+    assert "existing_sessions_preset" not in description
+    assert existing_sessions_options(description, None) is None
     assert "time_limits" not in description
     assert "icon" not in description["sections"][0]["groups"][0]
 
@@ -254,6 +260,15 @@ MALFORMED = {
         lambda raw: _with(raw, raw.update(default_preset="everything")),
         "default_preset 'everything' is not one of the presets",
     ),
+    "unknown preset for existing sessions": (
+        lambda raw: _with(raw, raw.update(existing_sessions_preset="everything")),
+        "existing_sessions_preset 'everything' is not one of the presets",
+    ),
+    "malformed preset for existing sessions": (
+        lambda raw: _with(raw, raw.update(existing_sessions_preset=["control"])),
+        "expected an id of lower case letters and digits, joined by single - or _ at "
+        "existing_sessions_preset",
+    ),
     "note on an unknown group": (
         lambda raw: _with(raw, raw["sections"][2]["notes"][0]["when"][0].update(group="garden")),
         "a note of section 'system' names unknown group 'garden'",
@@ -380,6 +395,49 @@ def test_a_choice_that_is_exactly_a_locked_preset_is_refused(description):
     assert validate_choice(description, ceiling, {"options": near}) == near
     # So is the same choice without the lock
     assert validate_choice(description, None, {"options": ADMIN}) == ADMIN
+
+
+CONTROL = {
+    "lights": "full",
+    "cameras": "read",
+    "automations": "read",
+    "templates": "read",
+    "files": "none",
+}
+
+
+def test_existing_sessions_options_are_the_preset_held_at_the_ceiling(description):
+    assert existing_sessions_options(description, None) == CONTROL
+
+    ceiling = validate_ceiling(
+        description,
+        {
+            "groups": {
+                "lights": {"max": "read", "reason": "Limited."},
+                "cameras": {"max": "none", "reason": "Limited."},
+                # At or above the preset's option, so nothing changes there
+                "automations": {"max": "read", "reason": "Limited."},
+                "files": {"max": "read", "reason": "Limited."},
+            },
+            "reason": "No.",
+        },
+    )
+    options = existing_sessions_options(description, ceiling)
+
+    assert options == {**CONTROL, "lights": "read", "cameras": "none"}
+    assert validate_choice(description, ceiling, {"options": options}) == options
+    # The preset itself is left as it is
+    assert description["presets"][1]["options"] == CONTROL
+
+
+def test_existing_sessions_options_of_a_locked_preset_are_refused(description):
+    """They are a choice like any other, so locking the preset refuses them."""
+    ceiling = validate_ceiling(description, {"locked_presets": ["control"], "reason": "No."})
+    options = existing_sessions_options(description, ceiling)
+
+    assert options == CONTROL
+    with pytest.raises(InvalidChoice, match="those of preset control, which is locked"):
+        validate_choice(description, ceiling, {"options": options})
 
 
 def test_known_options_drop_what_the_description_no_longer_has(description):

@@ -2005,16 +2005,21 @@ async def test_resource_scopes_a_client_asks_for_are_not_granted_unless_chosen(
     )
 
 
+STAND_IN_CONTROL = {**STAND_IN_LOOK_ONLY, "lights": "full"}
+
+
 async def test_sessions_stored_before_resources_described_access_at_refresh(
     enable_custom_integrations: None,
     hass: HomeAssistant,
     hass_client: ClientSessionGenerator,
     hass_storage: dict,
+    hass_admin_user: MockUser,
     stand_in,
 ) -> None:
     """Sessions saved by a release without choices of access have no access key. Loaded
-    from storage, one for a resource that now describes its access ends at its next
-    refresh, and one for any other resource refreshes as before."""
+    from storage, one for a resource that now describes its access gets the access that
+    resource names for such sessions at its next refresh, one whose user is gone ends
+    there, and one for any other resource refreshes as before."""
     client_id = "stored-client"
     hass_storage[f"{DOMAIN}.clients"] = {
         "version": 1,
@@ -2034,9 +2039,9 @@ async def test_sessions_stored_before_resources_described_access_at_refresh(
         },
     }
 
-    def session(family: str, resource: str) -> dict:
+    def session(family: str, resource: str, user_id: str = hass_admin_user.id) -> dict:
         return {
-            "user_id": "someone",
+            "user_id": user_id,
             "client_id": client_id,
             "scope": "openid profile",
             "nonce": None,
@@ -2054,6 +2059,7 @@ async def test_sessions_stored_before_resources_described_access_at_refresh(
         "data": {
             "refresh_tokens": {
                 "described.token": session("described", STAND_IN_RESOURCE),
+                "gone.token": session("gone", STAND_IN_RESOURCE, user_id="someone-removed"),
                 "other.token": session("other", RESOURCE),
             }
         },
@@ -2066,9 +2072,22 @@ async def test_sessions_stored_before_resources_described_access_at_refresh(
     await _setup_stand_in(hass)
     client = await hass_client()
     registration = {"client_id": client_id, "client_secret": "stored-secret"}
-    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {"described.token", "other.token"}
+    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {
+        "described.token",
+        "gone.token",
+        "other.token",
+    }
 
     status, body = await _refresh(client, registration, "described.token")
+
+    assert status == 200, body
+    assert body["scope"] == "openid profile stand_in:control"
+    claims = validate_access_token(
+        hass, body["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile stand_in:control"
+
+    status, body = await _refresh(client, registration, "gone.token")
 
     assert status == 400
     assert body["error"] == "invalid_grant"
@@ -2079,15 +2098,29 @@ async def test_sessions_stored_before_resources_described_access_at_refresh(
     assert status == 200, body
     assert body["scope"] == "openid profile"
     assert jwt.decode(body["access_token"], options={"verify_signature": False})["aud"] == RESOURCE
-    assert [data["family"] for data in hass.data[DOMAIN]["refresh_tokens"].values()] == ["other"]
+    assert sorted(data["family"] for data in hass.data[DOMAIN]["refresh_tokens"].values()) == [
+        "described",
+        "other",
+    ]
+
+    # The session's access is saved with it
+    await hass.async_block_till_done()
+    saved = hass_storage[STORAGE_KEY_TOKENS]["data"]["refresh_tokens"]
+    [described] = [data for data in saved.values() if data["family"] == "described"]
+    assert described["access"] == {
+        "resource": "oidc_stand_in",
+        "options": STAND_IN_CONTROL,
+        "scopes": ["stand_in:control"],
+    }
 
 
-async def test_session_from_before_the_resource_described_itself_ends_at_refresh(
-    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
-) -> None:
-    """A session that began before its resource described the access it offers
-    carries no choice, so its next refresh sends the client back to sign in."""
-    client = await hass_client()
+async def _session_from_before(
+    client: ClientSessionGenerator, hass: HomeAssistant
+) -> tuple[dict, dict]:
+    """Sign in for the stand-in's resource before it describes itself, then set it up.
+
+    Returns the client's registration and the tokens of that sign-in.
+    """
     registration = await _register_client(client)
     verifier, challenge = _pkce_pair()
     code = await _authorize_and_get_code(
@@ -2107,11 +2140,168 @@ async def test_session_from_before_the_resource_described_itself_ends_at_refresh
     assert tokens["scope"] == "openid profile"
 
     await _setup_stand_in(hass)
+    return registration, tokens
+
+
+async def test_session_from_before_the_resource_described_itself_gets_its_access(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    stand_in,
+) -> None:
+    """A session that began before its resource described the access it offers carries
+    no choice. Its next refresh gives it the access the resource names for such sessions,
+    which it keeps as if chosen, without it becoming the user's choice for next time."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    scope = "openid profile stand_in:control"
+    assert refreshed["scope"] == scope
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == scope
+    # The access token the session held before carries none of the resource's scopes
+    claims = validate_access_token(
+        hass, tokens["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile"
+
+    # Connected applications shows it like any access
+    resp = await client.get("/oidc/sessions", params={"language": "en"})
+    [session] = (await resp.json())["sessions"]
+    assert session["access"] == {"resource": "oidc_stand_in", "options": STAND_IN_CONTROL}
+
+    # Later refreshes keep it, and rotation and reuse detection work as for any session
+    status, again = await _refresh(client, registration, refreshed["refresh_token"])
+    assert status == 200, again
+    assert again["scope"] == scope
+    assert again["refresh_token"] != refreshed["refresh_token"]
+    status, replayed = await _refresh(client, registration, refreshed["refresh_token"])
+    assert (status, replayed["refresh_token"], replayed["scope"]) == (
+        200,
+        again["refresh_token"],
+        scope,
+    )
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
+    assert (await _refresh(client, registration, again["refresh_token"]))[0] == 400
+
+    # The next sign-in starts from the resource's default, not from this access
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["remembered"] is None
+
+
+async def test_ceiling_lowers_the_access_of_a_session_from_before(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "groups": {"cameras": {"max": "none", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+
+    status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    assert refreshed["scope"] == (
+        "openid profile stand_in:lights:full stand_in:automations:read stand_in:templates:read"
+    )
+
+
+async def test_session_from_before_ends_when_its_access_is_locked(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    """The user may not have that access, so the client signs in again and the user
+    chooses."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "locked_presets": ["control"],
+        "reason": "Not available for your account.",
+    }
 
     status, body = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+async def test_session_from_before_ends_when_its_resource_names_no_access_for_it(
+    setup_provider: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
+) -> None:
+    stand_in.DESCRIPTION = {
+        key: value
+        for key, value in stand_in.DESCRIPTION.items()
+        if key != "existing_sessions_preset"
+    }
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    status, body = await _refresh(client, registration, tokens["refresh_token"])
+
     assert status == 400
     assert body["error"] == "invalid_grant"
+    assert "sign in again" in body["error_description"]
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+@pytest.mark.parametrize("breakage", ["raises", "hangs"])
+async def test_session_from_before_is_kept_while_its_resource_cannot_answer(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stand_in,
+    breakage: str,
+) -> None:
+    """The session is refreshed without the resource's scopes, and the next refresh,
+    with the resource answering again, gives it its access."""
+    client = await hass_client()
+    registration, tokens = await _session_from_before(client, hass)
+
+    async def fail(hass: HomeAssistant, user, language: str) -> None:
+        if breakage == "hangs":
+            await asyncio.Event().wait()
+        raise RuntimeError("no ceiling today")
+
+    with monkeypatch.context() as patched:
+        patched.setattr("custom_components.oidc_provider.resources.CALL_TIMEOUT", 0.01)
+        patched.setattr(stand_in, "async_get_ceiling", fail)
+        status, refreshed = await _refresh(client, registration, tokens["refresh_token"])
+
+    assert status == 200, refreshed
+    assert refreshed["scope"] == "openid profile"
+    claims = validate_access_token(
+        hass, refreshed["access_token"], ISSUER_BASE, expected_audience=STAND_IN_RESOURCE
+    )
+    assert claims["scope"] == "openid profile"
+    assert "until it gives the session its access for sessions from before" in caplog.text
+
+    status, again = await _refresh(client, registration, refreshed["refresh_token"])
+
+    assert status == 200, again
+    assert again["scope"] == "openid profile stand_in:control"
 
 
 async def test_described_resource_named_only_when_redeeming_the_code_is_refused(
