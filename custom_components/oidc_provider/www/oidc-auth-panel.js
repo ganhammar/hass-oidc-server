@@ -115,7 +115,6 @@ const STYLES = `
     color: var(--primary-text-color, #212121);
   }
   .oidc-content {
-    width: 100%;
     max-width: 400px;
     margin: 0 auto;
     padding: 0 16px;
