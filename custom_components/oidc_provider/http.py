@@ -2183,7 +2183,11 @@ class OIDCClientsView(HomeAssistantView):
 
     @staticmethod
     def _refusal(request: web.Request) -> web.Response | None:
-        """Return the response for a user who is not an administrator."""
+        """Return the response for a user who is not an administrator.
+
+        Callers compare the result with None: a response without headers of
+        its own is an empty mapping, and so false, on older aiohttp releases.
+        """
         if request["hass_user"].is_admin:
             return None
         return _client_error("forbidden", "Only administrators can manage clients", 403)
@@ -2205,13 +2209,13 @@ class OIDCClientsView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         """List every client with its settings and session count."""
-        if refusal := self._refusal(request):
+        if (refusal := self._refusal(request)) is not None:
             return refusal
         return _client_response({"clients": managed_clients(request.app["hass"])})
 
     async def post(self, request: web.Request) -> web.Response:
         """Register a client. The response is the only place its secret appears."""
-        if refusal := self._refusal(request):
+        if (refusal := self._refusal(request)) is not None:
             return refusal
         hass = request.app["hass"]
         try:
@@ -2248,7 +2252,7 @@ class OIDCClientsView(HomeAssistantView):
 
     async def patch(self, request: web.Request) -> web.Response:
         """Change a stored client's redirect URIs and consent setting."""
-        if refusal := self._refusal(request):
+        if (refusal := self._refusal(request)) is not None:
             return refusal
         hass = request.app["hass"]
         client_id = request.query.get("client_id", "")
@@ -2271,7 +2275,7 @@ class OIDCClientsView(HomeAssistantView):
 
     async def delete(self, request: web.Request) -> web.Response:
         """Revoke a client: remove it if it is stored and end its sessions."""
-        if refusal := self._refusal(request):
+        if (refusal := self._refusal(request)) is not None:
             return refusal
         client_id = request.query.get("client_id", "")
         removed, ended = await remove_client(request.app["hass"], client_id)
