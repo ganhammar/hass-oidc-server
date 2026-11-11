@@ -17,18 +17,20 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import voluptuous as vol
 
 from .const import SUPPORTED_SCOPES
 
 # Lower case letters and digits, joined by single hyphens or underscores
-_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:[_-][a-z0-9]+)*$")
+_ID_PATTERN = re.compile(r"[a-z0-9]+(?:[_-][a-z0-9]+)*")
 _ID_MAX_LENGTH = 64
 # An OAuth scope token (RFC 6749 §3.3): printable ASCII except space, " and \
-_SCOPE_PATTERN = re.compile(r"^[\x21\x23-\x5b\x5d-\x7e]+$")
+_SCOPE_PATTERN = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]+")
 _SCOPE_MAX_LENGTH = 128
+# Whitespace and control characters, which no resource indicator holds
+_UNPRINTABLE = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 CLAUSE_BELOW_HIGHEST = "below_highest"
 CLAUSE_AT_LOWEST = "at_lowest"
@@ -47,7 +49,11 @@ def _text(value: Any) -> str:
 
 def _identifier(value: Any) -> str:
     """Validate an id: lower case letters and digits joined by - or _."""
-    if not isinstance(value, str) or len(value) > _ID_MAX_LENGTH or not _ID_PATTERN.match(value):
+    if (
+        not isinstance(value, str)
+        or len(value) > _ID_MAX_LENGTH
+        or not _ID_PATTERN.fullmatch(value)
+    ):
         raise vol.Invalid(
             "expected an id of lower case letters and digits, joined by single - or _"
         )
@@ -59,7 +65,7 @@ def _scope(value: Any) -> str:
     if (
         not isinstance(value, str)
         or len(value) > _SCOPE_MAX_LENGTH
-        or not _SCOPE_PATTERN.match(value)
+        or not _SCOPE_PATTERN.fullmatch(value)
     ):
         raise vol.Invalid("expected a scope without spaces, quotes or backslashes")
     if value in SUPPORTED_SCOPES:
@@ -67,19 +73,33 @@ def _scope(value: Any) -> str:
     return value
 
 
+def _has_dot_segment(path: str) -> bool:
+    """Return whether a path has a . or .. segment, plain or percent-encoded."""
+    return any(unquote(segment) in (".", "..") for segment in path.split("/"))
+
+
 def _resource(value: Any) -> str:
     """Validate where a resource answers: a path on this Home Assistant or a URL.
 
-    A path starts with a single slash and is matched against resource
-    indicators on whichever address the authorization request reached Home
-    Assistant at. A URL is matched as it is written.
+    A path starts with a single slash, names more than the root and is
+    matched against resource indicators on whichever address the
+    authorization request reached Home Assistant at. A URL is matched as it is
+    written. Neither holds whitespace, control characters or . and ..
+    segments, which would make what is matched differ from where the resource
+    answers.
     """
     if not isinstance(value, str):
         raise vol.Invalid("expected a path or URL")
+    if _UNPRINTABLE.search(value):
+        raise vol.Invalid("a resource cannot contain whitespace or control characters")
     if value.startswith("/") and not value.startswith("//"):
         parts = urlsplit(value)
         if parts.query or parts.fragment or "?" in value or "#" in value:
             raise vol.Invalid("a resource path cannot have a query or fragment")
+        if value == "/":
+            raise vol.Invalid("a resource path must name more than /")
+        if _has_dot_segment(value):
+            raise vol.Invalid("a resource cannot have . or .. segments")
         return value
     parts = urlsplit(value)
     if (
@@ -92,6 +112,8 @@ def _resource(value: Any) -> str:
         raise vol.Invalid(
             "expected a path starting with / or an absolute http(s) URL without a fragment"
         )
+    if _has_dot_segment(parts.path):
+        raise vol.Invalid("a resource cannot have . or .. segments")
     return value
 
 

@@ -173,7 +173,7 @@ A description is checked when it is collected, and every answer is checked when 
 - Scopes are OAuth scope tokens (printable ASCII without spaces, `"` or `\`) and may not be one of the provider's own (`openid`, `profile`, `email`, `groups`). Every scope an option or preset grants is declared under `scopes`.
 - A group has at least two options; a preset chooses a known option for every group; no two presets choose the same; `default_preset` names a preset.
 - Conditions name groups and options that exist.
-- Resource paths start with a single `/` and have no query or fragment; URLs are `http` or `https`, without credentials or a fragment. No two integrations may describe the same resource.
+- Resource paths start with a single `/`, name more than `/` and have no query or fragment; URLs are `http` or `https`, without credentials or a fragment. Neither may hold whitespace, control characters, or `.` or `..` segments (also percent-encoded). No two integrations may describe the same resource.
 - Availability names known groups, each with a reason. A ceiling names known groups, each with a known `max` and a reason, and known presets in `locked_presets`, leaving at least one unlocked, plus a top-level reason.
 - Keys the provider does not know are ignored, so a description written for a later release still works.
 

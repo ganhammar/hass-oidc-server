@@ -78,6 +78,16 @@ def test_single_resource_default_preset_and_unknown_keys(raw):
     assert "icon" not in description["sections"][0]["groups"][0]
 
 
+@pytest.mark.parametrize(
+    "resource",
+    ["/api/stand_in/", "/api/v1.0/x", "/api/..x", "https://notes.example.com", "http://[::1]/api"],
+)
+def test_resources_that_only_look_unusual_are_accepted(raw, resource):
+    raw["resource"] = resource
+
+    assert validate_description(raw)["resource"] == [resource]
+
+
 def _with(raw, *_changes):
     """Return raw once the changes passed as arguments have been made to it."""
     return raw
@@ -107,11 +117,53 @@ MALFORMED = {
         ),
         "expected a scope without spaces, quotes or backslashes at scopes.bad scope",
     ),
+    "scope with a trailing newline": (
+        lambda raw: _with(
+            raw, raw["scopes"].update({"stand_in:evil\n": {"title": "t", "description": "d"}})
+        ),
+        "expected a scope without spaces, quotes or backslashes",
+    ),
     "openid as a resource scope": (
         lambda raw: _with(raw, raw["presets"][0].update(scopes=["openid"])),
         "openid is an OpenID Connect scope",
     ),
+    "id with a trailing newline": (
+        lambda raw: _with(raw, raw["sections"][0].update(id="devices\n")),
+        "expected an id of lower case letters",
+    ),
     "relative resource": (lambda raw: _with(raw, raw.update(resource="api/x")), "expected a path"),
+    "resource with a trailing newline": (
+        lambda raw: _with(raw, raw.update(resource="/api/stand_in\n")),
+        "a resource cannot contain whitespace or control characters",
+    ),
+    "resource with a space": (
+        lambda raw: _with(raw, raw.update(resource="/api/stand in")),
+        "a resource cannot contain whitespace or control characters",
+    ),
+    "resource with a control character": (
+        lambda raw: _with(raw, raw.update(resource="https://notes.example.com/api\x00")),
+        "a resource cannot contain whitespace or control characters",
+    ),
+    "root as a resource": (
+        lambda raw: _with(raw, raw.update(resource="/")),
+        "a resource path must name more than /",
+    ),
+    "resource path with a .. segment": (
+        lambda raw: _with(raw, raw.update(resource="/api/../auth/token")),
+        "a resource cannot have . or .. segments",
+    ),
+    "resource path with an encoded .. segment": (
+        lambda raw: _with(raw, raw.update(resource="/api/%2E%2e/auth/token")),
+        "a resource cannot have . or .. segments",
+    ),
+    "resource path with a . segment": (
+        lambda raw: _with(raw, raw.update(resource="/api/./stand_in")),
+        "a resource cannot have . or .. segments",
+    ),
+    "resource URL with a .. segment": (
+        lambda raw: _with(raw, raw.update(resource="https://notes.example.com/api/../admin")),
+        "a resource cannot have . or .. segments",
+    ),
     "network path resource": (
         lambda raw: _with(raw, raw.update(resource="//host/x")),
         "expected a path",
