@@ -20,6 +20,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.generated.languages import LANGUAGES
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.translation import async_get_translations
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
 from .client_manager import (
@@ -116,6 +117,25 @@ def _panel_language(hass: HomeAssistant, requested: str | None) -> str:
     Assistant knows it, and otherwise the server's.
     """
     return requested if requested in LANGUAGES else hass.config.language
+
+
+# The translation category holding the login panel's text. Home Assistant
+# accepts nested text under it for an integration's own panels.
+PANEL_STRINGS_CATEGORY = "config_panel"
+
+
+async def async_panel_strings(hass: HomeAssistant, language: str) -> dict[str, str]:
+    """Return the login panel's text in a language, keyed as in the translations.
+
+    Keys missing from that language's translations come in English.
+    """
+    prefix = f"component.{DOMAIN}.{PANEL_STRINGS_CATEGORY}."
+    translations = await async_get_translations(hass, language, PANEL_STRINGS_CATEGORY, [DOMAIN])
+    return {
+        key.removeprefix(prefix): value
+        for key, value in translations.items()
+        if key.startswith(prefix)
+    }
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -587,6 +607,7 @@ async def setup_http_endpoints(hass: HomeAssistant) -> None:
     hass.http.register_view(OIDCRevocationView())
     hass.http.register_view(OIDCSessionsView())
     hass.http.register_view(OIDCSessionView())
+    hass.http.register_view(OIDCStringsView())
 
 
 class OIDCContinueView(HomeAssistantView):
@@ -2142,3 +2163,19 @@ class OIDCSessionView(HomeAssistantView):
                 _LOGGER.info("User %s ended a session of client %s", user.id, data["client_id"])
                 return web.json_response({"revoked": True})
         return web.json_response({"error": "not_found"}, status=404)
+
+
+class OIDCStringsView(HomeAssistantView):
+    """The login panel's text, in the signed-in user's language."""
+
+    url = "/oidc/strings"
+    name = "api:oidc:strings"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the panel's text in the language the panel asks for."""
+        hass = request.app["hass"]
+        language = _panel_language(hass, request.query.get("language"))
+        return web.json_response(
+            {"language": language, "strings": await async_panel_strings(hass, language)}
+        )

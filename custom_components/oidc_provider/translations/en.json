@@ -34,5 +34,61 @@
         }
       }
     }
+  },
+  "config_panel": {
+    "panel": {
+      "loading_title": "One moment",
+      "loading_text": "Loading the authorization request.",
+      "error_title": "Something went wrong",
+      "error_hint": "The authorization could not be completed. Close this page and try again from the application.",
+      "sessions_error_hint": "Your connected applications could not be loaded or changed. Reload the page to try again.",
+      "request_gone": "That sign-in request is no longer valid. To sign in, start again from the application.",
+      "client_from_host": "{client} from {host}"
+    },
+    "consent": {
+      "heading": "Approve access?",
+      "alert": "You're about to give {client} access to your Home Assistant instance.",
+      "redirect": "If you continue, you will be sent to {host}. The application will be able to see:",
+      "scope_openid": "Confirm who you are",
+      "scope_profile": "Your name",
+      "scope_email": "Your email address",
+      "scope_groups": "Your group memberships",
+      "loopback": "This sends you back to an application on your own computer. Only approve if you started this sign-in yourself.",
+      "approve": "Approve",
+      "deny": "Deny",
+      "approved_title": "Access approved",
+      "denied_title": "Access denied",
+      "sending_back": "Sending you back to the application."
+    },
+    "access": {
+      "prompt": "Choose what {app} can do.",
+      "choose_in_detail": "Choose in detail",
+      "back": "Back to levels",
+      "detail_heading": "Choose in detail",
+      "start_from": "Start from a level",
+      "preset_locked": "{level} (not available)",
+      "custom": "Custom",
+      "custom_summary": "Like {level}, except:",
+      "custom_summary_many": "Your own choice for each area, closest to {level}.",
+      "custom_status": "Custom: like {level}, except {differences}.",
+      "custom_status_many": "Custom: your own choice for each area, closest to {level}.",
+      "difference": "{area}: {option}",
+      "last_choice": "Your choice last time",
+      "not_available": "Not available",
+      "fine_print": "When you approve, you go back to {host}.",
+      "fine_print_sees": "{app} will also see your {information}.",
+      "sees_profile": "name",
+      "sees_email": "email address",
+      "sees_groups": "group memberships",
+      "change_later": "You can sign {app} out at any time under Connected applications."
+    },
+    "sessions": {
+      "heading": "Connected applications",
+      "intro": "These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.",
+      "empty": "No applications are signed in with your Home Assistant account.",
+      "meta": "Signed in {signed_in}, last used {last_used}",
+      "never": "never",
+      "sign_out": "Sign out"
+    }
   }
 }

@@ -1700,3 +1700,18 @@ async def test_consent_shows_ceilings_and_unavailable_areas(
     status, text = await _choose(client, request_id, {**STAND_IN_LOOK_ONLY, "lights": "full"})
     assert status == 400
     assert "above the ceiling" in text
+
+
+async def test_panel_strings_are_served_in_the_users_language(
+    setup_provider: None, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+
+    resp = await client.get("/oidc/strings", params={"language": "de"})
+
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["language"] == "de"
+    # Only English ships, so it stands in for every language
+    assert data["strings"]["consent.heading"] == "Approve access?"
+    assert data["strings"]["access.back"] == "Back to levels"
