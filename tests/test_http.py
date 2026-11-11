@@ -22,6 +22,7 @@ from custom_components.oidc_provider.http import (
 )
 from custom_components.oidc_provider.token_validator import (
     _get_ha_external_url,
+    _get_ha_internal_url,
     get_issuer_from_request,
     validate_access_token,
 )
@@ -378,6 +379,36 @@ def test_get_ha_external_url_returns_none_on_exception(hass):
         side_effect=Exception("no external url configured"),
     ):
         assert _get_ha_external_url(request) is None
+
+
+def test_get_ha_internal_url_returns_none_when_hass_is_not_ha_instance():
+    request = Mock()
+    request.app.get.return_value = "not a HomeAssistant instance"
+
+    assert _get_ha_internal_url(request) is None
+
+
+def test_get_ha_internal_url_returns_the_url_without_a_trailing_slash(hass):
+    request = Mock()
+    request.app.get.return_value = hass
+
+    with patch(
+        "homeassistant.helpers.network.get_url", return_value="http://192.168.1.10:8123/"
+    ) as get_url:
+        assert _get_ha_internal_url(request) == "http://192.168.1.10:8123"
+
+    get_url.assert_called_once_with(hass, allow_external=False, allow_cloud=False)
+
+
+def test_get_ha_internal_url_returns_none_on_exception(hass):
+    request = Mock()
+    request.app.get.return_value = hass
+
+    with patch(
+        "homeassistant.helpers.network.get_url",
+        side_effect=Exception("no internal url configured"),
+    ):
+        assert _get_ha_internal_url(request) is None
 
 
 def _app_with_registration(enabled: bool) -> dict:
