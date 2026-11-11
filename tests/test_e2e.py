@@ -1556,3 +1556,147 @@ async def test_malformed_description_is_ignored_with_a_warning(
 
     assert _described_domains(hass) == []
     assert "Ignoring the resource description of integration oidc_stand_in" in caplog.text
+
+
+STAND_IN_RESOURCE = f"{ISSUER_BASE}/api/stand_in"
+STAND_IN_LOOK_ONLY = {
+    "lights": "read",
+    "cameras": "read",
+    "automations": "read",
+    "templates": "read",
+    "files": "none",
+}
+
+
+@pytest.fixture
+async def setup_stand_in(setup_provider: None, hass: HomeAssistant, stand_in) -> None:
+    """The provider and, after it, the stand-in resource server."""
+    await _setup_stand_in(hass)
+
+
+async def _consent_details(client: ClientSessionGenerator, request_id: str, **query) -> dict:
+    """Fetch what the consent screen shows for a pending request."""
+    resp = await client.get(
+        "/oidc/continue", params={"request_id": request_id, **query}, headers=FORWARDED
+    )
+    assert resp.status == 200, await resp.text()
+    return await resp.json()
+
+
+async def _choose(
+    client: ClientSessionGenerator, request_id: str, options: dict[str, str] | None
+) -> tuple[int, dict | str]:
+    """Approve a pending request with a choice of access."""
+    body = {"request_id": request_id, "approve": True}
+    if options is not None:
+        body["access"] = {"options": options}
+    resp = await client.post("/oidc/continue", json=body, headers=FORWARDED)
+    if resp.content_type == "application/json":
+        return resp.status, await resp.json()
+    return resp.status, await resp.text()
+
+
+async def test_consent_offers_the_access_a_resource_describes(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator, stand_in
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    details = await _consent_details(client, request_id, language="en")
+
+    access = details["access"]
+    assert details["consent_required"] is True
+    assert access["resource"] == "oidc_stand_in"
+    assert access["default_preset"] == "read"
+    assert [preset["title"] for preset in access["presets"]] == [
+        "Look only",
+        "Control devices",
+        "Edit the setup",
+        "Administer",
+    ]
+    assert access["remembered"] is None
+
+    choice = {**STAND_IN_LOOK_ONLY, "cameras": "none"}
+    status, body = await _choose(client, request_id, choice)
+    assert status == 200, body
+    assert "code=" in body["redirect_url"]
+
+    # The next sign-in of this client starts from the same choice
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    assert (await _consent_details(client, request_id))["access"]["remembered"] == choice
+
+
+async def test_consent_for_a_resource_without_a_description_is_unchanged(
+    setup_stand_in: None, hass: HomeAssistant, hass_client: ClientSessionGenerator
+) -> None:
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+
+    for resource in (RESOURCE, None):
+        request_id = await _start_authorization(
+            client,
+            client_id=registration["client_id"],
+            code_challenge=challenge,
+            resource=resource,
+        )
+        details = await _consent_details(client, request_id)
+        assert "access" not in details
+        assert details["consent_required"] is True
+
+        status, body = await _choose(client, request_id, None)
+        assert status == 200, body
+        assert "code=" in body["redirect_url"]
+
+
+async def test_consent_shows_ceilings_and_unavailable_areas(
+    setup_stand_in: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_admin_user: MockUser,
+    stand_in,
+) -> None:
+    stand_in.UNAVAILABLE["files"] = "Turned off in the stand-in's options."
+    stand_in.CEILINGS[hass_admin_user.id] = {
+        "groups": {"lights": {"max": "read", "reason": "Limited to Read for your account."}},
+        "reason": "Not available for your account.",
+    }
+    client = await hass_client()
+    registration = await _register_client(client)
+    _, challenge = _pkce_pair()
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+
+    access = (await _consent_details(client, request_id))["access"]
+
+    assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
+    assert access["ceiling"]["groups"]["lights"]["max"] == "read"
+
+    # An unavailable area can still be chosen; one above the ceiling cannot
+    status, _ = await _choose(client, request_id, {**STAND_IN_LOOK_ONLY, "files": "full"})
+    assert status == 200
+    request_id = await _start_authorization(
+        client,
+        client_id=registration["client_id"],
+        code_challenge=challenge,
+        resource=STAND_IN_RESOURCE,
+    )
+    status, text = await _choose(client, request_id, {**STAND_IN_LOOK_ONLY, "lights": "full"})
+    assert status == 400
+    assert "above the ceiling" in text

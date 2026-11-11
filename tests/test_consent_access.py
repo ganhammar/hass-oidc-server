@@ -1,0 +1,381 @@
+"""Tests for choosing access on the consent screen, for a resource that describes it."""
+
+import asyncio
+import copy
+import json
+import logging
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+from homeassistant.core import HomeAssistant
+
+from custom_components.oidc_provider.const import DOMAIN, STORAGE_KEY_ACCESS_CHOICES
+from custom_components.oidc_provider.http import OIDCContinueView, _panel_language
+from custom_components.oidc_provider.resources import (
+    DATA_RESOURCES,
+    DescribedResource,
+    _async_access_choices,
+    _async_collect,
+    async_remember_choice,
+    async_remembered_choice,
+)
+
+RESOURCE = "https://ha.example.com/api/stand_in"
+CLIENT = "client123"
+USER = "user123"
+
+LOOK_ONLY = {
+    "lights": "read",
+    "cameras": "read",
+    "automations": "read",
+    "templates": "read",
+    "files": "none",
+}
+CUSTOM = {**LOOK_ONLY, "cameras": "none", "files": "read"}
+
+
+async def _hass(stand_in, *, consent_required=True, choices=None):
+    """Return hass state with a pending request for the stand-in's resource."""
+    hass = Mock()
+    hass.config.language = "en"
+    hass.data = {
+        DATA_RESOURCES: {},
+        DOMAIN: {
+            "pending_auth_requests": {
+                "req": {
+                    "client_id": CLIENT,
+                    "redirect_uri": "https://app.example.com/cb",
+                    "scope": "openid profile",
+                    "state": "s",
+                    "code_challenge": "c",
+                    "code_challenge_method": "S256",
+                    "resource": RESOURCE,
+                    "expires_at": time.time() + 600,
+                }
+            },
+            "clients": {CLIENT: {"client_name": "App", "consent_required": consent_required}},
+            "authorization_codes": {},
+            "access_choices": choices if choices is not None else {},
+            "access_choices_store": Mock(async_save=AsyncMock()),
+        },
+    }
+    await _async_collect(hass, "oidc_stand_in", stand_in)
+    return hass
+
+
+def _request(hass, *, query=None, body=None):
+    request = MagicMock()
+    request.query = query or {}
+    request.headers = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "ha.example.com"}
+    request.app = {"hass": hass}
+    request.__getitem__.return_value = Mock(id=USER)
+    request.json = AsyncMock(return_value=body if body is not None else {})
+    return request
+
+
+async def _get(hass, **query):
+    response = await OIDCContinueView().get(_request(hass, query={"request_id": "req", **query}))
+    return response.status, json.loads(response.body)
+
+
+async def _post(hass, body):
+    response = await OIDCContinueView().post(_request(hass, body={"request_id": "req", **body}))
+    if response.content_type == "application/json":
+        return response.status, json.loads(response.body)
+    return response.status, response.text
+
+
+def _code(hass):
+    [code] = hass.data[DOMAIN]["authorization_codes"].values()
+    return code
+
+
+async def test_consent_describes_the_access_in_the_users_language(stand_in):
+    hass = await _hass(stand_in)
+    stand_in.UNAVAILABLE["files"] = "Turned off in the stand-in's options."
+
+    status, data = await _get(hass, language="sv")
+
+    assert status == 200
+    access = data["access"]
+    assert access["resource"] == "oidc_stand_in"
+    assert access["name"] == "Ersättaren"
+    assert access["default_preset"] == "read"
+    assert [preset["id"] for preset in access["presets"]] == [
+        "read",
+        "control",
+        "configure",
+        "admin",
+    ]
+    assert [section["id"] for section in access["sections"]] == ["devices", "setup", "system"]
+    assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
+    assert access["ceiling"] is None
+    assert access["remembered"] is None
+    # Scopes stay on the server
+    assert "scopes" not in json.dumps(access)
+    assert ("describe", "sv") in stand_in.CALLS
+    assert ("availability", "sv") in stand_in.CALLS
+    assert ("ceiling", "sv") in stand_in.CALLS
+    # Nothing is consumed by looking
+    assert "req" in hass.data[DOMAIN]["pending_auth_requests"]
+
+
+async def test_a_language_home_assistant_does_not_know_falls_back_to_the_servers(stand_in):
+    hass = await _hass(stand_in)
+    hass.config.language = "de"
+
+    await _get(hass, language="../../secrets")
+
+    assert ("describe", "de") in stand_in.CALLS
+    assert _panel_language(hass, "pt-BR") == "pt-BR"
+    assert _panel_language(hass, None) == "de"
+
+
+async def test_choosing_access_stops_on_the_screen_for_a_client_registered_without_consent(
+    stand_in,
+):
+    """The level is the user's to choose, whoever registered the client."""
+    hass = await _hass(stand_in, consent_required=False)
+
+    _, data = await _get(hass)
+
+    assert data["consent_required"] is True
+
+
+async def test_ceiling_and_remembered_choice_are_shown(stand_in):
+    ceiling = {
+        "groups": {"files": {"max": "read", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+    stand_in.CEILINGS[USER] = ceiling
+    choices = {
+        USER: {
+            CLIENT: {
+                "oidc_stand_in": {
+                    "options": {**CUSTOM, "garden": "full", "cameras": "full"},
+                    "chosen_at": 1,
+                }
+            }
+        }
+    }
+    hass = await _hass(stand_in, choices=choices)
+
+    _, data = await _get(hass)
+
+    assert data["access"]["ceiling"] == {**ceiling, "locked_presets": []}
+    # Only what the description still has is preselected
+    remembered = dict(CUSTOM)
+    del remembered["cameras"]
+    assert data["access"]["remembered"] == remembered
+
+
+@pytest.mark.parametrize(
+    "breakage",
+    [
+        "description",
+        "availability",
+        "ceiling",
+        "raises",
+    ],
+)
+async def test_a_resource_that_cannot_answer_gets_the_plain_screen(
+    stand_in, caplog, monkeypatch, breakage
+):
+    hass = await _hass(stand_in, consent_required=False)
+    if breakage == "description":
+        stand_in.DESCRIPTION = {**copy.deepcopy(stand_in.DESCRIPTION), "presets": []}
+    elif breakage == "availability":
+        stand_in.UNAVAILABLE["garden"] = "No garden."
+    elif breakage == "ceiling":
+        stand_in.CEILINGS[USER] = {"groups": {"files": {"max": "read", "reason": "r"}}}
+    else:
+
+        async def fail(hass, user, language):
+            raise RuntimeError("no ceiling today")
+
+        monkeypatch.setattr(stand_in, "async_get_ceiling", fail)
+
+    with caplog.at_level(logging.WARNING):
+        status, data = await _get(hass)
+
+    assert status == 200
+    assert "access" not in data
+    assert data["consent_required"] is False
+    assert (
+        "Ignoring the resource description of integration oidc_stand_in for this sign-in"
+        in caplog.text
+    )
+
+
+async def test_a_resource_without_the_optional_functions_offers_no_limits(stand_in):
+    hass = await _hass(stand_in)
+    collected = hass.data[DATA_RESOURCES]["oidc_stand_in"]
+    hass.data[DATA_RESOURCES]["oidc_stand_in"] = DescribedResource(
+        "oidc_stand_in",
+        SimpleNamespace(async_describe_resource=stand_in.async_describe_resource),
+        collected.description,
+    )
+
+    _, data = await _get(hass)
+
+    assert data["access"]["unavailable"] == {}
+    assert data["access"]["ceiling"] is None
+
+
+async def test_approving_records_the_choice_and_remembers_it(stand_in):
+    hass = await _hass(stand_in)
+
+    status, data = await _post(hass, {"approve": True, "access": {"options": CUSTOM}})
+
+    assert status == 200
+    assert "code=" in data["redirect_url"]
+    assert _code(hass)["access"] == {
+        "resource": "oidc_stand_in",
+        "options": CUSTOM,
+        "scopes": [
+            "stand_in:lights:read",
+            "stand_in:automations:read",
+            "stand_in:templates:read",
+            "stand_in:files:read",
+        ],
+    }
+    assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") == CUSTOM
+    hass.data[DOMAIN]["access_choices_store"].async_save.assert_awaited_once()
+
+
+async def test_a_preset_is_granted_as_its_own_scopes(stand_in):
+    hass = await _hass(stand_in)
+
+    await _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
+
+    assert _code(hass)["access"]["scopes"] == ["stand_in:read"]
+
+
+@pytest.mark.parametrize(
+    ("access", "message"),
+    [
+        (None, "Choose what the application may do"),
+        ({"options": {"lights": "read"}}, "Invalid access choice: expected one option"),
+        ({"options": {**LOOK_ONLY, "files": "full"}}, "above the ceiling"),
+    ],
+)
+async def test_an_approval_without_a_fitting_choice_is_refused(stand_in, access, message):
+    stand_in.CEILINGS[USER] = {
+        "groups": {"files": {"max": "read", "reason": "Limited."}},
+        "reason": "Not for you.",
+    }
+    hass = await _hass(stand_in)
+
+    status, text = await _post(hass, {"approve": True, "access": access})
+
+    assert status == 400
+    assert message in text
+    # The request is not used up, so the user can choose again
+    assert "req" in hass.data[DOMAIN]["pending_auth_requests"]
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
+
+
+async def test_a_denial_does_not_ask_the_resource(stand_in):
+    hass = await _hass(stand_in)
+
+    status, data = await _post(hass, {"approve": False})
+
+    assert status == 200
+    assert "error=access_denied" in data["redirect_url"]
+    assert stand_in.CALLS == [("describe", "en")]  # only when it was collected
+
+
+async def test_resource_failing_on_approval(stand_in):
+    """A resource that cannot answer when the user approves gets a plain
+    approval, unless the screen offered a choice, which can no longer be checked."""
+    hass = await _hass(stand_in)
+    stand_in.DESCRIPTION = None
+
+    status, text = await _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
+    assert status == 400
+    assert "can no longer be checked" in text
+
+    status, data = await _post(hass, {"approve": True})
+    assert status == 200
+    assert _code(hass)["access"] is None
+
+
+async def test_a_choice_for_a_resource_without_a_description_is_refused(stand_in):
+    hass = await _hass(stand_in)
+    hass.data[DATA_RESOURCES].clear()
+
+    status, text = await _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
+
+    assert status == 400
+    assert "can no longer be checked" in text
+
+
+async def test_two_decisions_at_once_issue_one_code(stand_in):
+    hass = await _hass(stand_in)
+    gate = asyncio.Event()
+    describe = stand_in.async_describe_resource
+
+    async def slow_describe(hass, language):
+        await gate.wait()
+        return await describe(hass, language)
+
+    stand_in.async_describe_resource = slow_describe
+    try:
+        approving = asyncio.create_task(
+            _post(hass, {"approve": True, "access": {"options": LOOK_ONLY}})
+        )
+        await asyncio.sleep(0)
+        denied = await _post(hass, {"approve": False})
+        gate.set()
+        approved = await approving
+    finally:
+        stand_in.async_describe_resource = describe
+
+    assert denied[0] == 200
+    assert approved == (400, "Invalid or expired request")
+    assert hass.data[DOMAIN]["authorization_codes"] == {}
+
+
+async def test_remembering_drops_choices_for_clients_that_are_gone(stand_in):
+    metadata_client = "https://app.example.com/client.json"
+    choices = {
+        "someone": {"revoked_client": {"oidc_stand_in": {"options": LOOK_ONLY}}},
+        USER: {metadata_client: {"oidc_stand_in": {"options": LOOK_ONLY}}},
+    }
+    hass = await _hass(stand_in, choices=choices)
+
+    await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", CUSTOM)
+
+    assert set(choices) == {USER}
+    assert set(choices[USER]) == {metadata_client, CLIENT}
+    assert choices[USER][CLIENT]["oidc_stand_in"]["options"] == CUSTOM
+    assert await async_remembered_choice(hass, "nobody", CLIENT, "oidc_stand_in") is None
+
+
+async def test_remembered_choices_are_stored(hass: HomeAssistant, hass_storage):
+    """The choices are loaded once from Home Assistant's storage and saved back to it."""
+    hass_storage[STORAGE_KEY_ACCESS_CHOICES] = {
+        "version": 1,
+        "key": STORAGE_KEY_ACCESS_CHOICES,
+        "data": {"choices": {USER: {CLIENT: {"oidc_stand_in": {"options": LOOK_ONLY}}}}},
+    }
+    hass.data[DOMAIN] = {"clients": {CLIENT: {}}}
+
+    assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") == LOOK_ONLY
+    assert await _async_access_choices(hass) is await _async_access_choices(hass)
+
+    with patch("custom_components.oidc_provider.resources.time.time", return_value=1000):
+        await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", CUSTOM)
+    await hass.async_block_till_done()
+
+    assert hass_storage[STORAGE_KEY_ACCESS_CHOICES]["data"] == {
+        "choices": {USER: {CLIENT: {"oidc_stand_in": {"options": CUSTOM, "chosen_at": 1000}}}}
+    }
+
+
+async def test_nothing_remembered_yet(hass: HomeAssistant, hass_storage):
+    hass.data[DOMAIN] = {}
+
+    assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") is None

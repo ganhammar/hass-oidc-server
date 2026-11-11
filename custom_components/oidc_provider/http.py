@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
+from homeassistant.generated.languages import LANGUAGES
 from homeassistant.helpers.storage import Store
 
 from .cimd import ClientMetadataError, async_resolve_client, client_id_host, is_client_id_url
@@ -70,6 +71,13 @@ from .const import (
     TOKEN_USE_ACCESS,
     TOKEN_USE_ID,
 )
+from .resource_description import InvalidChoice, granted_scopes, validate_choice
+from .resources import (
+    async_access_rules,
+    async_consent_access,
+    async_remember_choice,
+    find_resource,
+)
 from .security import verify_client_secret
 from .token_validator import decode_access_token, get_issuer_from_request
 
@@ -99,6 +107,15 @@ def _issuer_for(request: web.Request) -> str:
     the auth-server metadata, and that metadata lives under /oidc.
     """
     return f"{get_issuer_from_request(request)}/oidc"
+
+
+def _panel_language(hass: HomeAssistant, requested: str | None) -> str:
+    """Return the language the login panel is shown in.
+
+    That is the one the panel asks for, which is the user's own, when Home
+    Assistant knows it, and otherwise the server's.
+    """
+    return requested if requested in LANGUAGES else hass.config.language
 
 
 def _dynamic_registration_enabled(hass: HomeAssistant) -> bool:
@@ -630,25 +647,88 @@ class OIDCContinueView(HomeAssistantView):
         if port:
             redirect_host = f"{redirect_host}:{port}"
 
-        return web.json_response(
-            {
-                "client_name": client.get("client_name", stored_request["client_id"]),
-                "redirect_host": redirect_host,
-                "scopes": stored_request["scope"].split(),
-                # A client with no recorded setting predates the flag and may
-                # have come from dynamic registration, so it prompts until an
-                # operator clears the flag.
-                "consent_required": bool(client.get("consent_required", True)),
-                # A metadata document client is identified by the host serving
-                # its document, which the draft says to show (§8.5).
-                "client_host": (
-                    client_id_host(stored_request["client_id"])
-                    if client.get("metadata_document")
-                    else None
-                ),
-                "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
-            }
+        details: dict[str, Any] = {
+            "client_name": client.get("client_name", stored_request["client_id"]),
+            "redirect_host": redirect_host,
+            "scopes": stored_request["scope"].split(),
+            # A client with no recorded setting predates the flag and may
+            # have come from dynamic registration, so it prompts until an
+            # operator clears the flag.
+            "consent_required": bool(client.get("consent_required", True)),
+            # A metadata document client is identified by the host serving
+            # its document, which the draft says to show (§8.5).
+            "client_host": (
+                client_id_host(stored_request["client_id"])
+                if client.get("metadata_document")
+                else None
+            ),
+            "redirect_is_loopback": parsed.hostname in _LOOPBACK_HOSTS,
+        }
+
+        described = find_resource(
+            hass, stored_request.get("resource"), get_issuer_from_request(request)
         )
+        if described is not None:
+            access = await async_consent_access(
+                hass,
+                described,
+                request["hass_user"],
+                stored_request["client_id"],
+                _panel_language(hass, request.query.get("language")),
+            )
+            if access is not None:
+                details["access"] = access
+                # What the client may do at the resource is the user's choice,
+                # so the sign-in stops on the consent screen even for a client
+                # registered without consent.
+                details["consent_required"] = True
+
+        return web.json_response(details)
+
+    @staticmethod
+    async def _chosen_access(
+        hass: HomeAssistant,
+        request: web.Request,
+        stored_request: dict[str, Any],
+        choice: Any,
+    ) -> dict[str, Any] | None | web.Response:
+        """Check the access chosen on the consent screen and return what it grants.
+
+        For a resource that describes the access it offers, an approval must
+        carry a choice that fits the description and the user's ceiling, which
+        are asked again here rather than trusted from the screen. The result
+        names the resource's integration, the option chosen in every group and
+        the scopes that grants. None means the resource offers no choice, and
+        an approval that carries one anyway is refused, since the screen showed
+        something that no longer holds.
+        """
+        described = find_resource(
+            hass, stored_request.get("resource"), get_issuer_from_request(request)
+        )
+        rules = (
+            await async_access_rules(hass, described, request["hass_user"]) if described else None
+        )
+        if rules is None:
+            if choice is None:
+                return None
+            return web.Response(
+                text="The access you chose can no longer be checked. "
+                "Start the sign-in again from the application.",
+                status=400,
+            )
+
+        description, ceiling = rules
+        if choice is None:
+            return web.Response(text="Choose what the application may do", status=400)
+        try:
+            options = validate_choice(description, ceiling, choice)
+        except InvalidChoice as err:
+            return web.Response(text=f"Invalid access choice: {err}", status=400)
+        return {
+            "resource": described.domain,
+            "options": options,
+            "scopes": granted_scopes(description, options),
+        }
 
     async def post(self, request: web.Request) -> web.Response:
         """Record the user's decision on the pending request."""
@@ -667,6 +747,18 @@ class OIDCContinueView(HomeAssistantView):
             return result
         stored_request, client = result
         request_id = body["request_id"]
+        approve = body.get("approve") is True
+
+        access = None
+        if approve:
+            access = await self._chosen_access(hass, request, stored_request, body.get("access"))
+            if isinstance(access, web.Response):
+                return access
+
+        # A decision either way consumes the pending request. Another decision
+        # on it may have been made while the resource was asked above.
+        if hass.data[DOMAIN]["pending_auth_requests"].pop(request_id, None) is not stored_request:
+            return web.Response(text="Invalid or expired request", status=400)
 
         # Extract parameters
         client_id = stored_request["client_id"]
@@ -678,9 +770,6 @@ class OIDCContinueView(HomeAssistantView):
         code_challenge_method = stored_request.get("code_challenge_method")
         resource = stored_request.get("resource")
 
-        # A decision either way consumes the pending request
-        del hass.data[DOMAIN]["pending_auth_requests"][request_id]
-
         separator = "&" if "?" in redirect_uri else "?"
 
         def build_redirect(**params: str) -> str:
@@ -691,7 +780,7 @@ class OIDCContinueView(HomeAssistantView):
             params["iss"] = _issuer_for(request)
             return f"{redirect_uri}{separator}{urlencode(params)}"
 
-        if body.get("approve") is not True:
+        if not approve:
             _LOGGER.info("User %s denied authorization for client %s", user.id, client_id)
             return web.json_response({"redirect_url": build_redirect(error="access_denied")})
 
@@ -719,11 +808,18 @@ class OIDCContinueView(HomeAssistantView):
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "resource": resource,
+            # What the user chose the client may do at the resource, when the
+            # resource describes the access it offers
+            "access": access,
             # Kept with the session, so a client that is not stored, such as a
             # metadata document client, can still be named in session lists.
             "client_name": client.get("client_name"),
             "expires_at": time.time() + AUTHORIZATION_CODE_EXPIRY,
         }
+        if access is not None:
+            await async_remember_choice(
+                hass, user.id, client_id, access["resource"], access["options"]
+            )
 
         # Return JSON with redirect URL (since fetch can't follow external redirects)
         return web.json_response({"redirect_url": build_redirect(code=auth_code)})
