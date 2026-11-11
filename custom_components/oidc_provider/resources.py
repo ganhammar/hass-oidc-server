@@ -41,7 +41,6 @@ from .resource_description import (
     consent_model,
     existing_sessions_options,
     known_options,
-    reasons_not_allowed,
     resource_matches,
     resources_overlap,
     validate_availability,
@@ -292,12 +291,10 @@ async def async_session_access(
     such sessions, current is None and remembered holds the user's last
     choice for the client, so the choice opens as the consent screen would.
 
-    granted holds the session's own options, which the screen marks as what
-    it has now, and None without a choice. When the user may no longer make
-    that choice, adjusted holds why, from the ceiling (see
-    reasons_not_allowed), and the screen opens on a choice the user may make
-    and says so. Otherwise adjusted is None. None when the resource cannot
-    answer.
+    granted holds the session's own options, the entries the description
+    still has, as what the session has now, and is None without a choice at
+    this resource. The screen decides from it and the ceiling whether the
+    user may still allow it. None when the resource cannot answer.
     """
     answers = await _async_ask(
         hass,
@@ -310,11 +307,9 @@ async def async_session_access(
     if answers is None:
         return None
     description, availability, ceiling = answers
-    current = remembered = granted = adjusted = None
+    current = remembered = granted = None
     if access and access.get("resource") == described.domain:
         current = granted = known_options(description, access.get("options")) or None
-        if granted is not None:
-            adjusted = reasons_not_allowed(description, ceiling, granted) or None
     else:
         current = existing_sessions_options(description, ceiling)
         if current is None:
@@ -326,7 +321,6 @@ async def async_session_access(
         "remembered": remembered,
         "current": current,
         "granted": granted,
-        "adjusted": adjusted,
     }
 
 

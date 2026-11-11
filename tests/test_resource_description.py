@@ -13,7 +13,6 @@ from custom_components.oidc_provider.resource_description import (
     iter_groups,
     known_options,
     matching_preset,
-    reasons_not_allowed,
     resource_matches,
     resources_overlap,
     validate_availability,
@@ -440,49 +439,6 @@ def test_existing_sessions_options_of_a_locked_preset_are_refused(description):
     assert options == CONTROL
     with pytest.raises(InvalidChoice, match="those of preset control, which is locked"):
         validate_choice(description, ceiling, {"options": options})
-
-
-def test_reasons_a_choice_is_no_longer_allowed_come_from_the_ceiling(description):
-    """It is held at the ceiling group by group, and is then a locked preset or not."""
-    assert reasons_not_allowed(description, None, ADMIN) == []
-
-    ceiling = validate_ceiling(
-        description,
-        {
-            "groups": {
-                "lights": {"max": "read", "reason": "Read only."},
-                "automations": {"max": "read", "reason": "Read only."},
-                "files": {"max": "read", "reason": "Files are read only."},
-            },
-            "locked_presets": ["control"],
-            "reason": "Not for you.",
-        },
-    )
-    # Each reason once, in the order the groups are shown
-    assert reasons_not_allowed(description, ceiling, ADMIN) == [
-        "Read only.",
-        "Files are read only.",
-    ]
-    # Held at the ceiling, Control devices is Look only, which is not locked
-    assert reasons_not_allowed(description, ceiling, CONTROL) == ["Read only."]
-    # A choice the ceiling leaves as it is
-    assert reasons_not_allowed(description, ceiling, {**CONTROL, "lights": "read"}) == []
-
-    # Exactly a locked preset, or one once held at the ceiling
-    ceiling = validate_ceiling(
-        description,
-        {
-            "groups": {"lights": {"max": "read", "reason": "Read only."}},
-            "locked_presets": ["read"],
-            "reason": "Not for you.",
-        },
-    )
-    look_only = {**CONTROL, "lights": "read"}
-    assert reasons_not_allowed(description, ceiling, look_only) == ["Not for you."]
-    assert reasons_not_allowed(description, ceiling, CONTROL) == ["Read only.", "Not for you."]
-    # A choice missing a group the description gained is no preset
-    partial = {gid: oid for gid, oid in look_only.items() if gid != "files"}
-    assert reasons_not_allowed(description, ceiling, partial) == []
 
 
 def test_known_options_drop_what_the_description_no_longer_has(description):

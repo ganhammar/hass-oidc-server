@@ -79,7 +79,10 @@ const FALLBACK_STRINGS = {
   "change.gone": "{app} is no longer signed in, so its access cannot be changed.",
   "change.current": "What it has now",
   "change.current_detail": "What {app} has now: {level}",
-  "change.adjusted": "You can no longer allow the access {app} has now. {reason} Saving changes it to the choice below; Cancel leaves it as it is.",
+  "change.adjusted": "You can no longer allow the access {app} has now. {reason}",
+  "change.saving": "Saving changes {changes}; Cancel leaves it as it is.",
+  "change.saving_many": "Saving changes it to the choice below; Cancel leaves it as it is.",
+  "change.difference": "{area} to {option}",
   "change.cancel_keeps": "Cancel keeps the access {app} has now."
 };
 
@@ -798,41 +801,88 @@ class AccessChoice {
       previous = rows;
     }
 
+    // When changing a session's access, what the session has now, complete
+    // as the list of applications names it (see AccessChoice.named). None
+    // without a choice.
+    this.granted = model.granted ? AccessChoice.named(model, model.granted).rows : null;
+
     // The first time the default level, afterwards the user's last choice,
     // or the rows in start when they are given. A locked default gives way to
     // the nearest open level below it, or else above it, and the screen never
     // opens on a locked level's choice. A group the description gained since
-    // the choice was made starts as in that level. The last choice is marked
-    // as such only when the ceiling leaves it as it was.
+    // the choice was made starts as in that level, or, when changing a
+    // session's access, as in what the session has now. The last choice is
+    // marked as such only when the ceiling leaves it as it was.
     const opening = this.openingPreset(model.default_preset);
     const base = opening ? opening.options : this.lowestRows();
+    const opensOn = (choice) => {
+      const rows = choice && this.clamp(choice);
+      return rows && !this.lockedChoice(rows) ? rows : this.clamp(base);
+    };
     const remembered = model.remembered ? { ...base, ...model.remembered } : null;
-    const wanted = start ? { ...base, ...start } : remembered;
-    const rows = wanted && this.clamp(wanted);
-    this.rows = rows && !this.lockedChoice(rows) ? rows : this.clamp(base);
+    this.rows = opensOn(start ? { ...(this.granted || base), ...start } : remembered);
     const match = this.matching(this.rows);
     this.selected = match ? match.id : CUSTOM;
     this.customRows = match ? null : { ...this.rows };
     this.lastChoice = remembered && this.same(this.rows, remembered) ? this.selected : null;
 
-    // When changing a session's access, what the session has now: the level
-    // that stands for it as the ceiling holds the levels, else the level it
-    // is exactly, which may be locked, else Custom. None without a choice.
-    this.granted = model.granted ? { ...base, ...model.granted } : null;
-    const level =
-      this.granted &&
-      (this.matching(this.granted) || this.presets.find((preset) => this.same(preset.options, this.granted)));
-    this.current = this.granted ? (level ? level.id : CUSTOM) : null;
+    // When the choice cannot open on what the session has now, why, from the
+    // ceiling: the reason of each group above its limit, then the reason for
+    // locked levels when, held at the ceiling, it is a locked level's choice.
+    // Each reason comes once. Empty when it opens on what the session has,
+    // whatever the rows in start.
+    this.adjusted = [];
+    if (this.granted && !this.same(opensOn(this.granted), this.granted)) {
+      const held = this.clamp(this.granted);
+      const reasons = this.groups
+        .filter((group) => held[group.id] !== this.granted[group.id])
+        .map((group) => this.limits[group.id].reason);
+      if (this.lockedChoice(held)) {
+        reasons.push(model.ceiling.reason);
+      }
+      this.adjusted = [...new Set(reasons)];
+    }
+
+    // The level that shows what the session has now, as the ceiling holds the
+    // levels: the open level that does, else the first locked level that does.
+    // None when no level does (see isCurrent).
+    this.grantedLevel =
+      (this.granted &&
+        (this.matching(this.granted) ||
+          this.presets.find((preset) => this.same(this.presetRows(preset), this.granted)))) ||
+      null;
     this.view = 'simple';
   }
 
-  // Whether an option of the simple view is what the session has now: its
-  // level, or Custom while that shows the session's own choice
+  // A choice of access as the list of applications names it, without the
+  // user's ceiling: the entries of options the description still has, with a
+  // group it gained since, or whose option it dropped, as in the default
+  // level. Its rows are that choice, and selected its level or Custom.
+  static named(model, options) {
+    const groups = Object.fromEntries(
+      model.sections.flatMap((section) => section.groups).map((group) => [group.id, group])
+    );
+    const known = Object.fromEntries(
+      Object.entries(options).filter(
+        ([gid, oid]) => Object.hasOwn(groups, gid) && groups[gid].options.some((option) => option.id === oid)
+      )
+    );
+    return new AccessChoice({ ...model, ceiling: null, granted: null, remembered: known });
+  }
+
+  // Whether an option of the simple view shows what the session has now, as
+  // the ceiling holds the levels: the open level that does, else Custom
+  // while it does, else a locked level that does. At most one option does,
+  // and none when what the session has is above the ceiling.
   isCurrent(id) {
-    if (this.current !== id) {
-      return false;
+    const level = this.grantedLevel;
+    if (level && !this.locked.has(level.id)) {
+      return level.id === id;
     }
-    return id !== CUSTOM || (this.customRows !== null && this.same(this.customRows, this.granted));
+    if (this.granted && this.customRows !== null && this.same(this.customRows, this.granted)) {
+      return id === CUSTOM;
+    }
+    return level !== null && level.id === id;
   }
 
   // The level the screen opens on: the given one, or the nearest open level
@@ -1133,16 +1183,40 @@ class OidcLoginPanel extends HTMLElement {
 
   // When the person may no longer allow what a session has now, the choice
   // opens on one they may make, which this says, with the ceiling's reasons
+  // and what saving the choice on the screen changes
   _adjustedAlert() {
-    const reasons = this._access.model.adjusted;
-    if (!reasons) {
+    const reasons = this._access.adjusted;
+    if (!reasons.length) {
       return '';
     }
     const reason = markup(reasons.map((text) => this._res(text)).join(' '));
     return `
         <ha-alert alert-type="warning">
           ${this._t('change.adjusted', { app: markup(this._appName()), reason })}
+          <span id="oidc-saving">${this._savingHtml()}</span>
         </ha-alert>`;
+  }
+
+  // What saving the choice on the screen changes of what the session has
+  // now: each area it sets otherwise, with the option it sets, or past three
+  // areas, that it changes to the choice. Nothing when the choice is what the
+  // session has, which is then a locked level's and cannot be saved.
+  _savingHtml() {
+    const access = this._access;
+    const changed = access.groups.filter((group) => access.rows[group.id] !== access.granted[group.id]);
+    if (!changed.length) {
+      return '';
+    }
+    if (changed.length > 3) {
+      return this._t('change.saving_many');
+    }
+    const changes = changed.map((group) =>
+      this._t('change.difference', {
+        area: markup(this._res(group.title)),
+        option: markup(this._res(access.option(group.id, access.rows[group.id]).label)),
+      })
+    );
+    return this._t('change.saving', { changes: markup(this._list(changes, 'conjunction')) });
   }
 
   // previous is the choice on the screen before it was loaded again: its rows
@@ -1265,9 +1339,13 @@ class OidcLoginPanel extends HTMLElement {
 
   _accessFooter() {
     if (this._changing) {
-      const keep = this._access.model.adjusted
-        ? `<p class="hint">${this._t('change.cancel_keeps', { app: markup(this._appName()) })}</p>`
+      // When the choice opens on one other than what the session has, the line
+      // above Save says that Cancel keeps that, and describes Cancel
+      const adjusted = this._access.adjusted.length > 0;
+      const keep = adjusted
+        ? `<p class="hint" id="oidc-cancel-keeps">${this._t('change.cancel_keeps', { app: markup(this._appName()) })}</p>`
         : '';
+      const cancelDescribedBy = adjusted ? ' aria-describedby="oidc-cancel-keeps"' : '';
       return `
       ${keep}
       <div id="oidc-locked-choice" aria-live="polite"></div>
@@ -1275,7 +1353,7 @@ class OidcLoginPanel extends HTMLElement {
         <ha-button id="oidc-save">${this._t('change.save')}</ha-button>
       </div>
       <div class="action">
-        <ha-button id="oidc-cancel-change" appearance="plain" variant="neutral">${this._t('change.cancel')}</ha-button>
+        <ha-button id="oidc-cancel-change" appearance="plain" variant="neutral"${cancelDescribedBy}>${this._t('change.cancel')}</ha-button>
       </div>`;
     }
     const details = this._details;
@@ -1485,21 +1563,14 @@ class OidcLoginPanel extends HTMLElement {
 
   // When changing a session's access, the detailed view says under its
   // heading what the session has now, in the words of the list of
-  // applications: the level, or Custom with how it differs from the closest
+  // applications
   _currentHtml() {
     const access = this._access;
-    if (access.current === null) {
+    if (!access.granted) {
       return '';
     }
-    const custom = access.current === CUSTOM;
-    const title = custom
-      ? this._t('access.custom')
-      : this._res(access.presets.find((preset) => preset.id === access.current).title);
-    const line = this._t('change.current_detail', {
-      app: markup(this._appName()),
-      level: markup(`<span class="access-level">${title}</span>`),
-    });
-    const summary = custom ? `<div>${this._summaryHtml(access.granted)}</div>` : '';
+    const { level, summary } = this._grantedName(access.model, access.model.granted);
+    const line = this._t('change.current_detail', { app: markup(this._appName()), level });
     return `<div class="hint current-access">${line}${summary}</div>`;
   }
 
@@ -1580,9 +1651,14 @@ class OidcLoginPanel extends HTMLElement {
 
   // A choice that is exactly a level the ceiling locks cannot be approved or
   // saved. Approve or Save is turned off and the reason shown right above it,
-  // in either view.
+  // in either view. When changing a session's access opened on a choice
+  // other than what the session has, the notice above the card says what
+  // saving the choice changes, as it is now.
   _updateApproval() {
     const access = this._access;
+    if (this._changing && access.adjusted.length) {
+      this.querySelector('#oidc-saving').innerHTML = this._savingHtml();
+    }
     const locked = access.lockedChoice(access.rows);
     this.querySelector('#oidc-locked-choice').innerHTML = locked
       ? `<div class="limit-reason">${icon('lock')}<span>${this._t('access.locked_choice', {
@@ -1665,26 +1741,35 @@ class OidcLoginPanel extends HTMLElement {
 
   // ---- Connected applications ---------------------------------------------
 
-  // What a session was granted at its resource: the level's title, or Custom
-  // with how it differs from the closest level
+  // What a session was granted at its resource
   _sessionAccess(session, resources) {
     const model = session.access && resources[session.access.resource];
     if (!model) {
       return '';
     }
-    const access = new AccessChoice({ ...model, remembered: session.access.options });
-    const name = session.client_name;
-    if (access.selected !== CUSTOM) {
-      const preset = access.presets.find((candidate) => candidate.id === access.selected);
-      const level = markup(`<span class="access-level">${this._res(preset.title, name)}</span>`);
-      return `<div class="access">${this._t('sessions.access', { level })}</div>`;
-    }
-    const level = markup(`<span class="access-level">${this._t('access.custom')}</span>`);
+    const { level, summary } = this._grantedName(model, session.access.options, session.client_name);
     return `
       <div class="access">
         ${this._t('sessions.access', { level })}
-        <div>${this._summaryHtml(access.rows, access, name)}</div>
+        ${summary}
       </div>`;
+  }
+
+  // The name of what a session was granted at a resource, as the list of
+  // applications and the choice of its access both give it: the level's
+  // title as level, or Custom as level and how it differs from the closest
+  // level as summary. Both leave the user's ceiling out (see
+  // AccessChoice.named).
+  _grantedName(model, options, name = undefined) {
+    const access = AccessChoice.named(model, options);
+    if (access.selected !== CUSTOM) {
+      const preset = access.presets.find((candidate) => candidate.id === access.selected);
+      return { level: markup(`<span class="access-level">${this._res(preset.title, name)}</span>`), summary: '' };
+    }
+    return {
+      level: markup(`<span class="access-level">${this._t('access.custom')}</span>`),
+      summary: `<div>${this._summaryHtml(access.rows, access, name)}</div>`,
+    };
   }
 
   _sessionMeta(session) {

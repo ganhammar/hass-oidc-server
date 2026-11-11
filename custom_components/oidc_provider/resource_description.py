@@ -433,27 +433,6 @@ def validate_choice(
     return options
 
 
-def _held_at_ceiling(
-    description: dict[str, Any], ceiling: dict[str, Any] | None, options: dict[str, str]
-) -> tuple[dict[str, str], list[str]]:
-    """Return options with each held at the ceiling's max where it is above it.
-
-    With them come the reasons the ceiling gives for the groups held, in the
-    order the groups are shown. Options must name known groups and options;
-    a group they leave out stays out.
-    """
-    limits = (ceiling or {}).get("groups", {})
-    held = dict(options)
-    reasons = []
-    for gid, group in _group_map(description).items():
-        limit = limits.get(gid)
-        ids = _option_ids(group)
-        if gid in held and limit is not None and ids.index(held[gid]) > ids.index(limit["max"]):
-            held[gid] = limit["max"]
-            reasons.append(limit["reason"])
-    return held, reasons
-
-
 def existing_sessions_options(
     description: dict[str, Any], ceiling: dict[str, Any] | None
 ) -> dict[str, str] | None:
@@ -468,26 +447,14 @@ def existing_sessions_options(
     if preset_id is None:
         return None
     preset = next(preset for preset in description["presets"] if preset["id"] == preset_id)
-    return _held_at_ceiling(description, ceiling, preset["options"])[0]
-
-
-def reasons_not_allowed(
-    description: dict[str, Any], ceiling: dict[str, Any] | None, options: dict[str, str]
-) -> list[str]:
-    """Return why the user may no longer make a choice, from the ceiling; empty when they may.
-
-    Those are the reasons of the groups whose option is above the ceiling's
-    max, then the ceiling's reason for locked presets when the choice, held
-    at the ceiling, is exactly a preset it locks. Each reason comes once.
-    Options are entries known to the description (see known_options).
-    """
-    held, reasons = _held_at_ceiling(description, ceiling, options)
-    locked = (ceiling or {}).get("locked_presets", [])
-    if any(
-        preset["id"] in locked and preset["options"] == held for preset in description["presets"]
-    ):
-        reasons.append(ceiling["reason"])
-    return list(dict.fromkeys(reasons))
+    limits = (ceiling or {}).get("groups", {})
+    options = dict(preset["options"])
+    for gid, group in _group_map(description).items():
+        limit = limits.get(gid)
+        ids = _option_ids(group)
+        if limit is not None and ids.index(options[gid]) > ids.index(limit["max"]):
+            options[gid] = limit["max"]
+    return options
 
 
 def known_options(description: dict[str, Any], options: Any) -> dict[str, str]:

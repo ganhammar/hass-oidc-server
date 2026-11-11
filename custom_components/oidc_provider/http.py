@@ -2559,8 +2559,7 @@ class OIDCSessionAccessView(HomeAssistantView):
 
         It is what the consent screen shows of the resource, with the user's
         ceiling and availability as they are now, the options the choice
-        opens on, what the session has now and whether the user may still
-        allow it (see async_session_access).
+        opens on and what the session has now (see async_session_access).
         """
         hass = request.app["hass"]
         user = request["hass_user"]
