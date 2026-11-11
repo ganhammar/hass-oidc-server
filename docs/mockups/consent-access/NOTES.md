@@ -204,10 +204,11 @@ Change access shows the consent screen's simple and detailed views, on what the 
 | Heading, simple view | Change access for {app} from {host} |
 | Under the heading | Signed in November 3, last used 2 minutes ago |
 | Buttons, in place of Approve and Deny | Save · Cancel |
-| Badge on what the app has now, simple view | What it has now |
+| Badge on what the app has now, simple view | What it has now *(on the level, as the ceiling holds it, or Custom that is exactly what the app has; on none when part of it is above the ceiling)* |
 | Under the heading, detailed view | What {app} has now: **Control devices** *(or **Custom** with how it differs, as on the list)* |
-| Notice when the person may no longer allow what the app has, and the choice opens on another | You can no longer allow the access {app} has now. {reason} Saving changes it to the choice below; Cancel leaves it as it is. |
-| Above Save, in that case | Cancel keeps the access {app} has now. |
+| Notice when the person may no longer allow what the app has, and the choice opens on another | You can no longer allow the access {app} has now. {reason} Saving changes {changes}; Cancel leaves it as it is. *({changes} is each area the choice on the screen sets otherwise, as "Config files to Read", in a list; it follows the choice)* |
+| The same notice, when the choice sets more than three areas otherwise | You can no longer allow the access {app} has now. {reason} Saving changes it to the choice below; Cancel leaves it as it is. |
+| Above Save, in that case, and describing Cancel | Cancel keeps the access {app} has now. |
 | Notice when what may be allowed changed after the page opened | The access you can allow changed after this page opened. Check your choice and save again. |
 | Notice on the list after saving | Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour. |
 | Notice on the list when the app was signed out meanwhile | {app} is no longer signed in, so its access cannot be changed. |
