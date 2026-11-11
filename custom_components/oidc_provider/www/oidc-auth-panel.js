@@ -965,14 +965,17 @@ class OidcLoginPanel extends HTMLElement {
     return `<bdi>${escapeHtml(name)}</bdi>`;
   }
 
-  // Text from the resource as markup, with {app} as the application's name
+  // Text from the resource as markup, with {app} as the application's name.
+  // The name goes in through a function, so $ patterns in it stay as written.
   _res(text, name = this._details?.client_name) {
-    return escapeHtml(text).replaceAll('{app}', this._appName(name));
+    const app = this._appName(name);
+    return escapeHtml(text).replaceAll('{app}', () => app);
   }
 
   // The same, for places that only take text, such as a select's options
   _resText(text) {
-    return escapeHtml(text.replaceAll('{app}', this._details.client_name));
+    const app = this._details.client_name;
+    return escapeHtml(text.replaceAll('{app}', () => app));
   }
 
   _notesHtml(notes) {

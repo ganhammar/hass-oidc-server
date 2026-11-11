@@ -250,3 +250,29 @@ def test_the_bundled_english_stands_in_when_the_text_cannot_be_loaded():
     assert result["failed"] == ["Approve access?", "Connected applications"]
     # Loaded text wins, and English fills in what it lacks
     assert result["loaded"] == ["Godkänn åtkomst?", "Deny"]
+
+
+@needs_node
+def test_names_are_spliced_into_text_as_written():
+    """A $ pattern in a client's name is not a replacement pattern."""
+    result = _run_panel(
+        """
+        const panel = new OidcLoginPanel();
+        panel._details = { client_name: name };
+        return [
+          panel._res('{app} can see {app}.'),
+          panel._resText('Ask {app}'),
+          panel._t('access.prompt', { app: name }),
+          panel._t('access.prompt', { app: markup(panel._appName()) }),
+        ];
+        """,
+        name="Bot $& $' $1 <b>",
+    )
+
+    escaped = "Bot $&amp; $&#39; $1 &lt;b&gt;"
+    assert result == [
+        f"<bdi>{escaped}</bdi> can see <bdi>{escaped}</bdi>.",
+        f"Ask {escaped}",
+        f"Choose what {escaped} can do.",
+        f"Choose what <bdi>{escaped}</bdi> can do.",
+    ]
