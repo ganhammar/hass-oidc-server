@@ -76,7 +76,11 @@ const FALLBACK_STRINGS = {
   "change.cancel": "Cancel",
   "change.changed": "The access you can allow changed after this page opened. Check your choice and save again.",
   "change.saved": "Saved. The access you chose applies the next time {app} gets new access; access it already has runs out within the hour.",
-  "change.gone": "{app} is no longer signed in, so its access cannot be changed."
+  "change.gone": "{app} is no longer signed in, so its access cannot be changed.",
+  "change.current": "What it has now",
+  "change.current_detail": "What {app} has now: {level}",
+  "change.adjusted": "You can no longer allow the access {app} has now. {reason} Saving changes it to the choice below; Cancel leaves it as it is.",
+  "change.cancel_keeps": "Cancel keeps the access {app} has now."
 };
 
 // The value of the level choice that stands for a custom choice. Preset ids
@@ -209,7 +213,8 @@ const STYLES = `
     color: var(--primary-text-color);
     font-weight: var(--ha-font-weight-medium, 500);
   }
-  .oidc-session .access ul {
+  .oidc-session .access ul,
+  .current-access ul {
     margin: 2px 0 0;
     padding-left: 18px;
   }
@@ -809,7 +814,25 @@ class AccessChoice {
     this.selected = match ? match.id : CUSTOM;
     this.customRows = match ? null : { ...this.rows };
     this.lastChoice = remembered && this.same(this.rows, remembered) ? this.selected : null;
+
+    // When changing a session's access, what the session has now: the level
+    // that stands for it as the ceiling holds the levels, else the level it
+    // is exactly, which may be locked, else Custom. None without a choice.
+    this.granted = model.granted ? { ...base, ...model.granted } : null;
+    const level =
+      this.granted &&
+      (this.matching(this.granted) || this.presets.find((preset) => this.same(preset.options, this.granted)));
+    this.current = this.granted ? (level ? level.id : CUSTOM) : null;
     this.view = 'simple';
+  }
+
+  // Whether an option of the simple view is what the session has now: its
+  // level, or Custom while that shows the session's own choice
+  isCurrent(id) {
+    if (this.current !== id) {
+      return false;
+    }
+    return id !== CUSTOM || (this.customRows !== null && this.same(this.customRows, this.granted));
   }
 
   // The level the screen opens on: the given one, or the nearest open level
@@ -1103,9 +1126,23 @@ class OidcLoginPanel extends HTMLElement {
   }
 
   // What is above the card of a choice of access: on the consent screen, who
-  // is asking; when changing a session's access, only a notice, if any
+  // is asking; when changing a session's access, notices, if any
   _choiceAlert() {
-    return this._changing ? this._noticeHtml() : this._consentAlert(this._details);
+    return this._changing ? `${this._adjustedAlert()}${this._noticeHtml()}` : this._consentAlert(this._details);
+  }
+
+  // When the person may no longer allow what a session has now, the choice
+  // opens on one they may make, which this says, with the ceiling's reasons
+  _adjustedAlert() {
+    const reasons = this._access.model.adjusted;
+    if (!reasons) {
+      return '';
+    }
+    const reason = markup(reasons.map((text) => this._res(text)).join(' '));
+    return `
+        <ha-alert alert-type="warning">
+          ${this._t('change.adjusted', { app: markup(this._appName()), reason })}
+        </ha-alert>`;
   }
 
   // previous is the choice on the screen before it was loaded again: its rows
@@ -1184,8 +1221,14 @@ class OidcLoginPanel extends HTMLElement {
       .join('');
   }
 
-  _badge() {
-    return `<span class="badge">${this._t('access.last_choice')}</span>`;
+  // The badge on the option chosen last time, on the consent screen, or on
+  // what the session has now, when changing a session's access
+  _badge(id) {
+    const access = this._access;
+    if (access.lastChoice === id) {
+      return `<span class="badge">${this._t('access.last_choice')}</span>`;
+    }
+    return access.isCurrent(id) ? `<span class="badge">${this._t('change.current')}</span>` : '';
   }
 
   _difference(group, rows, access = this._access, name = undefined) {
@@ -1222,7 +1265,11 @@ class OidcLoginPanel extends HTMLElement {
 
   _accessFooter() {
     if (this._changing) {
+      const keep = this._access.model.adjusted
+        ? `<p class="hint">${this._t('change.cancel_keeps', { app: markup(this._appName()) })}</p>`
+        : '';
       return `
+      ${keep}
       <div id="oidc-locked-choice" aria-live="polite"></div>
       <div class="action">
         <ha-button id="oidc-save">${this._t('change.save')}</ha-button>
@@ -1280,7 +1327,7 @@ class OidcLoginPanel extends HTMLElement {
           aria-labelledby="${id}-label" aria-describedby="${describedBy}">
         <span class="radio" aria-hidden="true"></span>
         <span class="level-text">
-          <span class="level-label" id="${id}-label">${this._res(preset.title)}${access.lastChoice === preset.id ? this._badge() : ''}</span>
+          <span class="level-label" id="${id}-label">${this._res(preset.title)}${this._badge(preset.id)}</span>
           <span class="level-description" id="${id}-desc">${this._res(preset.description)}</span>
           <span class="level-notes" id="${id}-notes" data-preset="${escapeHtml(preset.id)}"></span>
           ${reason}
@@ -1299,7 +1346,7 @@ class OidcLoginPanel extends HTMLElement {
           aria-labelledby="oidc-level-custom-label" aria-describedby="oidc-level-custom-desc">
         <span class="radio" aria-hidden="true"></span>
         <span class="level-text">
-          <span class="level-label" id="oidc-level-custom-label">${this._t('access.custom')}${access.lastChoice === CUSTOM ? this._badge() : ''}</span>
+          <span class="level-label" id="oidc-level-custom-label">${this._t('access.custom')}${this._badge(CUSTOM)}</span>
           <span class="level-description" id="oidc-level-custom-desc">${this._summaryHtml(access.customRows)}</span>
         </span>
       </label>`;
@@ -1436,6 +1483,26 @@ class OidcLoginPanel extends HTMLElement {
       </div>`;
   }
 
+  // When changing a session's access, the detailed view says under its
+  // heading what the session has now, in the words of the list of
+  // applications: the level, or Custom with how it differs from the closest
+  _currentHtml() {
+    const access = this._access;
+    if (access.current === null) {
+      return '';
+    }
+    const custom = access.current === CUSTOM;
+    const title = custom
+      ? this._t('access.custom')
+      : this._res(access.presets.find((preset) => preset.id === access.current).title);
+    const line = this._t('change.current_detail', {
+      app: markup(this._appName()),
+      level: markup(`<span class="access-level">${title}</span>`),
+    });
+    const summary = custom ? `<div>${this._summaryHtml(access.granted)}</div>` : '';
+    return `<div class="hint current-access">${line}${summary}</div>`;
+  }
+
   _renderDetailed() {
     const access = this._access;
     const sections = access.model.sections
@@ -1454,6 +1521,7 @@ class OidcLoginPanel extends HTMLElement {
       `
         <button type="button" class="text-button neutral back-action" id="oidc-back">${icon('arrowLeft')}${this._t('access.back')}</button>
         <h1 tabindex="-1">${this._t('access.detail_heading')}</h1>
+        ${this._currentHtml()}
         ${intro}
         ${this._presetSelect()}
         <div class="areas">${sections}</div>
