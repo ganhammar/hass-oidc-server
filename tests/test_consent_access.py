@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -952,3 +952,490 @@ async def test_connected_applications_when_the_resource_does_not_answer_in_time(
         "Not showing the access granted at the resource of integration oidc_stand_in "
         "(Stand-in): it did not answer within 0.01 seconds"
     ) in caplog.text
+
+
+# --- Changing a session's access ----------------------------------------------
+
+OTHER_USER = "user456"
+ADMIN = {**CONTROL, "automations": "full", "files": "full"}
+CUSTOM_SCOPES = [
+    "stand_in:lights:read",
+    "stand_in:automations:read",
+    "stand_in:templates:read",
+    "stand_in:files:read",
+]
+CUSTOM_SCOPE = "openid profile " + " ".join(CUSTOM_SCOPES)
+
+
+async def _change_hass(stand_in):
+    """Return hass state with sessions of the user and of another user.
+
+    The user's session "fam" chose CUSTOM at the stand-in. Its retired token
+    is still within the grace period. "before" began before the stand-in
+    described itself, and "other" is for a resource without a description.
+    The other user's session "theirs" chose CUSTOM too.
+    """
+    hass = await _token_hass(stand_in)
+    hass.auth.async_get_user = AsyncMock(
+        side_effect=lambda user_id: SimpleNamespace(id=user_id, name="Someone")
+    )
+    custom = {"resource": "oidc_stand_in", "options": CUSTOM, "scopes": CUSTOM_SCOPES}
+    hass.data[DOMAIN]["refresh_tokens"] = {
+        "fam.cur": _session_token(
+            "fam",
+            scope=CUSTOM_SCOPE,
+            resource=RESOURCE,
+            access=custom,
+            retired={"fam.old": time.time()},
+            auth_time=5,
+        ),
+        "before.1": _session_token("before", scope="openid email", resource=RESOURCE),
+        "other.1": _session_token("other", resource=None),
+        "theirs.1": _session_token(
+            "theirs", user_id=OTHER_USER, scope=CUSTOM_SCOPE, resource=RESOURCE, access=custom
+        ),
+    }
+    return hass
+
+
+def _sid(family):
+    from custom_components.oidc_provider.http import _session_id
+
+    return _session_id(family)
+
+
+async def _change(hass, family, method="get", body=None, *, user=USER, language="en"):
+    """Ask the session access view about a session, as the given user."""
+    from custom_components.oidc_provider.http import OIDCSessionAccessView
+
+    request = MagicMock()
+    request.app = {"hass": hass}
+    request.query = {"language": language}
+    request.__getitem__.return_value = Mock(id=user)
+    if isinstance(body, Exception):
+        request.json = AsyncMock(side_effect=body)
+    else:
+        request.json = AsyncMock(return_value=body)
+    response = await getattr(OIDCSessionAccessView(), method)(request, _sid(family))
+    return response.status, json.loads(response.body)
+
+
+def _stored(hass, family):
+    return copy.deepcopy(_session(hass, family))
+
+
+async def test_changing_access_opens_on_the_sessions_own_choice(stand_in):
+    hass = await _change_hass(stand_in)
+    stand_in.UNAVAILABLE["files"] = "Turned off in the stand-in's options."
+    ceiling = {
+        "groups": {"files": {"max": "read", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+    stand_in.CEILINGS[USER] = ceiling
+    await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", LOOK_ONLY)
+
+    status, data = await _change(hass, "fam", language="sv")
+
+    assert status == 200, data
+    assert data["client_name"] == "client123"
+    assert data["client_host"] is None
+    access = data["access"]
+    assert access["resource"] == "oidc_stand_in"
+    assert access["name"] == "Ersättaren"
+    assert access["current"] == CUSTOM
+    # The session's own choice, not the user's last choice for the client
+    assert access["remembered"] is None
+    # Availability and the ceiling as they are now
+    assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
+    assert access["ceiling"] == {**ceiling, "locked_presets": []}
+    assert "scopes" not in json.dumps(access)
+    assert {("describe", "sv"), ("availability", "sv"), ("ceiling", "sv")} <= set(stand_in.CALLS)
+
+
+async def test_a_session_without_a_choice_opens_on_the_access_it_would_get(stand_in):
+    """That is the access its next refresh would give it, held at the ceiling."""
+    hass = await _change_hass(stand_in)
+    stand_in.CEILINGS[USER] = {
+        "groups": {"cameras": {"max": "none", "reason": "Limited for your account."}},
+        "reason": "Not available for your account.",
+    }
+
+    status, data = await _change(hass, "before")
+
+    assert status == 200, data
+    assert data["access"]["current"] == {**CONTROL, "cameras": "none"}
+    assert data["access"]["remembered"] is None
+
+
+async def test_without_access_for_sessions_from_before_the_choice_opens_as_on_consent(stand_in):
+    """The session would end at its next refresh, so the choice opens where the
+    consent screen would: on the user's last choice for the client, or the default."""
+    _without_existing_sessions_preset(stand_in)
+    hass = await _change_hass(stand_in)
+
+    _, data = await _change(hass, "before")
+    assert (data["access"]["current"], data["access"]["remembered"]) == (None, None)
+
+    await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", CUSTOM)
+    _, data = await _change(hass, "before")
+    assert (data["access"]["current"], data["access"]["remembered"]) == (None, CUSTOM)
+
+
+async def test_a_choice_at_another_resource_counts_as_none(stand_in):
+    """A session's access names the integration it was chosen at, which may no longer
+    be the one describing its resource."""
+    hass = await _change_hass(stand_in)
+    _session(hass, "fam")["access"] = {**_session(hass, "fam")["access"], "resource": "gone"}
+
+    _, data = await _change(hass, "fam")
+
+    assert data["access"]["current"] == CONTROL
+
+
+async def test_saving_replaces_the_access_and_exactly_its_scopes(stand_in, caplog):
+    hass = await _change_hass(stand_in)
+    stand_in.CALLS.clear()
+
+    with caplog.at_level(logging.INFO):
+        status, data = await _change(hass, "fam", "put", {"options": CONTROL})
+
+    assert status == 200, data
+    assert data == {"access": {"resource": "oidc_stand_in", "options": CONTROL}}
+    session = _session(hass, "fam")
+    assert session["access"] == {
+        "resource": "oidc_stand_in",
+        "options": CONTROL,
+        "scopes": ["stand_in:control"],
+    }
+    # The OpenID Connect scopes stay; every scope of the old choice is gone
+    assert session["scope"] == "openid profile stand_in:control"
+    # The session is otherwise as it was, its rotation state included
+    assert set(session["retired"]) == {"fam.old"}
+    assert session["family"] == "fam"
+    assert "fam.cur" in hass.data[DOMAIN]["refresh_tokens"]
+    hass.data[DOMAIN]["token_store"].async_save.assert_awaited()
+    # It is the user's choice for the client next time
+    assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") == CONTROL
+    # Checked as an approval is, in Home Assistant's language
+    assert {("describe", "en"), ("ceiling", "en")} <= set(stand_in.CALLS)
+    assert "changed the access of a session of client client123" in caplog.text
+    # Other sessions are untouched
+    assert _session(hass, "theirs")["scope"] == CUSTOM_SCOPE
+    assert "access" not in _session(hass, "before")
+
+    # A choice that grants nothing leaves only the OpenID Connect scopes
+    nothing = dict.fromkeys(CONTROL, "none")
+    status, _ = await _change(hass, "fam", "put", {"options": nothing})
+    assert status == 200
+    assert _session(hass, "fam")["scope"] == "openid profile"
+    assert _session(hass, "fam")["access"]["scopes"] == []
+
+    # Areas one by one grant the scope of each area, and nothing else
+    status, _ = await _change(hass, "fam", "put", {"options": {**nothing, "files": "full"}})
+    assert status == 200
+    assert _session(hass, "fam")["scope"] == "openid profile stand_in:files:full"
+
+
+async def test_only_the_sessions_own_user_finds_it(stand_in):
+    hass = await _change_hass(stand_in)
+    before = _stored(hass, "theirs")
+
+    assert await _change(hass, "theirs") == (404, {"error": "not_found", "message": ANY})
+    status, data = await _change(hass, "theirs", "put", {"options": CONTROL})
+    assert (status, data["error"]) == (404, "not_found")
+    status, data = await _change(hass, "nobody", "put", {"options": CONTROL})
+    assert (status, data["error"]) == (404, "not_found")
+
+    assert _session(hass, "theirs") == before
+    assert hass.data[DOMAIN]["access_choices"] == {}
+    # The resource is not even asked
+    assert not any(call[0] == "ceiling" for call in stand_in.CALLS)
+
+    # Its own user finds it
+    status, _ = await _change(hass, "theirs", "put", {"options": CONTROL}, user=OTHER_USER)
+    assert status == 200
+    assert _session(hass, "theirs")["scope"] == "openid profile stand_in:control"
+
+
+@pytest.mark.parametrize(
+    ("options", "ceiling", "message"),
+    [
+        ({**CONTROL, "garden": "full"}, None, "expected one option for every group"),
+        ({**CONTROL, "lights": "everything"}, None, "unknown option for group lights"),
+        (
+            ADMIN,
+            {"groups": {"files": {"max": "read", "reason": "Limited."}}, "reason": "No."},
+            "the option for group files is above the ceiling",
+        ),
+        (
+            ADMIN,
+            {"locked_presets": ["admin"], "reason": "Not for you."},
+            "the options are those of preset admin, which is locked",
+        ),
+    ],
+)
+async def test_a_choice_that_does_not_fit_is_refused(stand_in, options, ceiling, message):
+    hass = await _change_hass(stand_in)
+    if ceiling:
+        stand_in.CEILINGS[USER] = ceiling
+    before = _stored(hass, "fam")
+
+    status, data = await _change(hass, "fam", "put", {"options": options})
+
+    assert status == 400
+    assert data == {"error": "invalid_choice", "message": f"Invalid access choice: {message}"}
+    assert _session(hass, "fam") == before
+    hass.data[DOMAIN]["token_store"].async_save.assert_not_awaited()
+    assert hass.data[DOMAIN]["access_choices"] == {}
+
+
+@pytest.mark.parametrize("body", [None, ["options"], ValueError("not JSON")])
+async def test_a_malformed_change_is_refused(stand_in, body):
+    hass = await _change_hass(stand_in)
+    before = _stored(hass, "fam")
+
+    status, data = await _change(hass, "fam", "put", body)
+
+    assert (status, data["error"]) == (400, "invalid_request")
+    assert _session(hass, "fam") == before
+
+
+async def test_a_session_whose_resource_offers_no_choice_cannot_be_changed(stand_in):
+    hass = await _change_hass(stand_in)
+    before = _stored(hass, "other")
+
+    assert (await _change(hass, "other"))[1]["error"] == "not_offered"
+    status, data = await _change(hass, "other", "put", {"options": CONTROL})
+
+    assert (status, data["error"]) == (409, "not_offered")
+    assert _session(hass, "other") == before
+
+
+@pytest.mark.parametrize("breakage", ["raises", "hangs", "malformed"])
+async def test_a_resource_that_cannot_answer_changes_nothing(
+    stand_in, caplog, monkeypatch, breakage
+):
+    hass = await _change_hass(stand_in)
+    monkeypatch.setattr(resources, "CALL_TIMEOUT", 0.01)
+
+    async def fail(hass, user, language):
+        if breakage == "hangs":
+            await asyncio.Event().wait()
+        if breakage == "raises":
+            raise RuntimeError("no ceiling today")
+        return {"groups": {"garden": {"max": "none", "reason": "No garden."}}, "reason": "No."}
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", fail)
+    before = _stored(hass, "fam")
+
+    with caplog.at_level(logging.WARNING):
+        get_status, _ = await _change(hass, "fam")
+        status, data = await _change(hass, "fam", "put", {"options": CONTROL})
+
+    assert get_status == 503
+    assert (status, data["error"]) == (503, "unavailable")
+    assert _session(hass, "fam") == before
+    assert hass.data[DOMAIN]["access_choices"] == {}
+    reason = {
+        "raises": "asking it failed",
+        "hangs": "it did not answer within 0.01 seconds",
+        "malformed": "the ceiling names unknown group 'garden'",
+    }[breakage]
+    for what in ("Not offering to change", "Not changing"):
+        assert (
+            f"{what} the access of a session of client client123 at integration "
+            f"oidc_stand_in (Stand-in): {reason}"
+        ) in caplog.text
+
+
+async def test_saving_gives_a_session_without_a_choice_its_access(stand_in):
+    """Its next refresh carries that access, and the resource is not asked again."""
+    hass = await _change_hass(stand_in)
+
+    status, _ = await _change(hass, "before", "put", {"options": LOOK_ONLY})
+
+    assert status == 200
+    assert _session(hass, "before")["scope"] == "openid email stand_in:read"
+    assert await async_remembered_choice(hass, USER, CLIENT, "oidc_stand_in") == LOOK_ONLY
+    stand_in.CALLS.clear()
+
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="before.1")
+
+    assert status == 200, body
+    assert body["scope"] == "openid email stand_in:read"
+    assert _claims(body["access_token"])["scope"] == "openid email stand_in:read"
+    assert stand_in.CALLS == []
+
+
+async def test_the_next_refresh_carries_the_new_scopes_and_rotates_as_before(stand_in, monkeypatch):
+    hass = await _change_hass(stand_in)
+    await _change(hass, "fam", "put", {"options": LOOK_ONLY})
+    scope = "openid profile stand_in:read"
+
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.cur")
+
+    assert status == 200, body
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+    assert _claims(body["access_token"])["aud"] == RESOURCE
+    # Rotated, with the replaced token answered within its grace period
+    assert body["refresh_token"] != "fam.cur"
+    status, again = await _token(hass, grant_type="refresh_token", refresh_token="fam.cur")
+    assert (status, again["refresh_token"], again["scope"]) == (200, body["refresh_token"], scope)
+
+    # and the session revoked when one is presented after it
+    monkeypatch.setattr("custom_components.oidc_provider.http.REFRESH_TOKEN_REUSE_GRACE", -1)
+    status, body = await _token(hass, grant_type="refresh_token", refresh_token="fam.old")
+    assert (status, body["error"]) == (400, "invalid_grant")
+    assert not [
+        data for data in hass.data[DOMAIN]["refresh_tokens"].values() if data["family"] == "fam"
+    ]
+
+
+async def test_a_refresh_issuing_tokens_while_access_changes_issues_the_new_scopes(
+    stand_in, monkeypatch
+):
+    """Tokens issued from the old scope after the change was saved are not handed out."""
+    from custom_components.oidc_provider.http import OIDCTokenView
+
+    hass = await _change_hass(stand_in)
+    issuing, release = asyncio.Event(), asyncio.Event()
+    generate = OIDCTokenView._generate_access_token
+    scopes_issued = []
+
+    async def slow(self, request, hass_, user_id, scope, client_id, audience=None):
+        scopes_issued.append(scope)
+        if len(scopes_issued) == 1:
+            issuing.set()
+            await release.wait()
+        return await generate(self, request, hass_, user_id, scope, client_id, audience)
+
+    monkeypatch.setattr(OIDCTokenView, "_generate_access_token", slow)
+    refresh = asyncio.create_task(_token(hass, grant_type="refresh_token", refresh_token="fam.cur"))
+    await issuing.wait()
+
+    status, _ = await _change(hass, "fam", "put", {"options": CONTROL})
+    assert status == 200
+    release.set()
+    status, body = await refresh
+
+    scope = "openid profile stand_in:control"
+    assert status == 200, body
+    assert scopes_issued == [CUSTOM_SCOPE, scope]
+    assert body["scope"] == scope
+    assert _claims(body["access_token"])["scope"] == scope
+    assert _session(hass, "fam")["scope"] == scope
+
+
+async def test_a_change_lands_on_the_token_a_refresh_rotated_while_the_resource_was_asked(
+    stand_in, monkeypatch
+):
+    hass = await _change_hass(stand_in)
+    asked, answer = asyncio.Event(), asyncio.Event()
+    ceiling = stand_in.async_get_ceiling
+
+    async def slow(hass_, user, language):
+        asked.set()
+        await answer.wait()
+        return await ceiling(hass_, user, language)
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", slow)
+    change = asyncio.create_task(_change(hass, "fam", "put", {"options": CONTROL}))
+    await asked.wait()
+
+    status, refreshed = await _token(hass, grant_type="refresh_token", refresh_token="fam.cur")
+    assert status == 200, refreshed
+    assert refreshed["scope"] == CUSTOM_SCOPE
+    answer.set()
+    status, _ = await change
+
+    scope = "openid profile stand_in:control"
+    assert status == 200
+    # The old token did not come back; the current one has the new access
+    assert set(hass.data[DOMAIN]["refresh_tokens"]) == {
+        refreshed["refresh_token"],
+        "before.1",
+        "other.1",
+        "theirs.1",
+    }
+    assert _session(hass, "fam")["scope"] == scope
+    assert _session(hass, "fam")["access"]["options"] == CONTROL
+    # The replaced token, presented again within its grace period, gets the new scope too
+    status, again = await _token(hass, grant_type="refresh_token", refresh_token="fam.cur")
+    assert (status, again["scope"]) == (200, scope)
+    status, again = await _token(
+        hass, grant_type="refresh_token", refresh_token=refreshed["refresh_token"]
+    )
+    assert (status, again["scope"]) == (200, scope)
+
+
+async def test_a_change_while_a_session_from_before_is_settled_keeps_the_users_choice(
+    stand_in, monkeypatch
+):
+    """The refresh finds the session with the access the user chose and gives it no
+    other, whatever the resource answered it."""
+    hass = await _change_hass(stand_in)
+    asked, answer = asyncio.Event(), asyncio.Event()
+    ceiling = stand_in.async_get_ceiling
+    calls = 0
+
+    async def first_slow(hass_, user, language):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            asked.set()
+            await answer.wait()
+        return await ceiling(hass_, user, language)
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", first_slow)
+    refresh = asyncio.create_task(
+        _token(hass, grant_type="refresh_token", refresh_token="before.1")
+    )
+    await asked.wait()
+
+    status, _ = await _change(hass, "before", "put", {"options": LOOK_ONLY})
+    assert status == 200
+    answer.set()
+    status, body = await refresh
+
+    assert status == 200, body
+    assert body["scope"] == "openid email stand_in:read"
+    assert _session(hass, "before")["access"]["options"] == LOOK_ONLY
+    assert _session(hass, "before")["scope"] == "openid email stand_in:read"
+
+
+async def test_a_session_ended_while_its_resource_is_asked_is_not_changed(stand_in, monkeypatch):
+    hass = await _change_hass(stand_in)
+    ceiling = stand_in.async_get_ceiling
+
+    async def ceiling_then_sign_out(hass_, user, language):
+        del hass.data[DOMAIN]["refresh_tokens"]["fam.cur"]
+        return await ceiling(hass_, user, language)
+
+    monkeypatch.setattr(stand_in, "async_get_ceiling", ceiling_then_sign_out)
+
+    status, data = await _change(hass, "fam", "put", {"options": CONTROL})
+
+    assert (status, data["error"]) == (404, "not_found")
+    assert hass.data[DOMAIN]["access_choices"] == {}
+    assert "fam.cur" not in hass.data[DOMAIN]["refresh_tokens"]
+
+
+async def test_connected_applications_say_where_access_can_be_changed(stand_in, monkeypatch):
+    """Every session whose resource describes its access, also one without a choice yet."""
+    hass = await _change_hass(stand_in)
+
+    data = await _sessions(hass)
+
+    offered = {session["session_id"]: session["access_offered_by"] for session in data["sessions"]}
+    assert offered == {
+        _sid("fam"): "oidc_stand_in",
+        _sid("before"): "oidc_stand_in",
+        _sid("other"): None,
+    }
+    assert set(data["resources"]) == {"oidc_stand_in"}
+
+    # Not while the resource cannot describe itself
+    stand_in.DESCRIPTION = None
+    data = await _sessions(hass)
+    assert [session["access_offered_by"] for session in data["sessions"]] == [None] * 3
