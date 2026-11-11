@@ -184,11 +184,19 @@ Revoking a client also ends every session it holds, so its refresh tokens stop w
 
 ### Connected Applications
 
-Each user can see the applications signed in with their Home Assistant account at `https://your-ha-instance/oidc_login`, with when each signed in and was last used, change what each may do, and sign any of them out. Administrators also find the page under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**, through the **Connected applications** link. For an application that was given a choice of access, the list shows what was chosen: the level's name, or Custom with how it differs from the closest level. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
+Each user can see the applications signed in with their Home Assistant account on the **Connected applications** page, with when each signed in and was last used, change what each may do, and sign any of them out. The page has no entry in the sidebar, so it is found in these places:
+
+- At `/oidc_login` on your Home Assistant address, such as `https://your-ha-instance/oidc_login`.
+- Through the **Connected applications** link in the integration's **Configure** dialog, under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**, which only administrators can open.
+- By name on the consent screen of an application that signs in for an integration that [describes its access](#choosing-what-an-application-may-do): a line under the choice says that what the application can do can be changed, and the application signed out, at any time under Connected applications.
+
+For an application that was given a choice of access, the list shows what was chosen: the level's name, or Custom with how it differs from the closest level. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
 
 **Change access**, next to **Sign out**, is there for every application signed in for an integration that [describes its access](#choosing-what-an-application-may-do), also one that signed in before the integration did and has no choice yet. It opens the same choice as the consent screen, the levels and **Choose in detail**, with **Save** and **Cancel** in place of Approve and Deny:
 
-- It opens on what the application has now. For one without a choice yet, it opens on the access its next refresh would give it, or where the consent screen would open when that refresh would end the session instead; saving gives it the access chosen.
+- It opens on what the application has now, marked "What it has now" on its level, or on Custom, and named under the heading of **Choose in detail**.
+- When the person may no longer allow what the application has, for example while the integration holds everything at a lower level, it opens on a choice they may make instead and says so above the choice, with the integration's reason. What the application has is still marked on its level and named in **Choose in detail**. Saving changes the access to the choice on the screen; **Cancel** keeps it as it is, as the screen also says above **Save**.
+- For an application without a choice yet, nothing is marked. It opens on the access its next refresh would give it. When that refresh would end the session instead, it opens on the integration's default level, or, when the integration names no access for such sessions, on the person's last choice for that application, as the consent screen does. Saving gives it the access chosen.
 - What the person may allow, and what is unavailable, are as they are when the page opens, and saving checks the choice with the integration again, as an approval does. When what the person may allow changed in between, the choice is shown again with a notice.
 - The saved choice replaces the application's access and its scopes, and is the person's choice for that application at its next sign-in.
 - It applies from the application's next token refresh. An access token it already holds keeps its scopes until it expires, within the hour, as after signing it out, and the page says so after saving.
