@@ -1,355 +1,70 @@
-# Home Assistant OIDC Server
+# OIDC Provider for Home Assistant
 
-A Home Assistant custom component that turns your Home Assistant instance into a fully functional OpenID Connect (OIDC) server, allowing external applications like Claude Connectors to authenticate against your Home Assistant users.
+Let other applications sign people in with their Home Assistant account. This custom integration makes Home Assistant an OAuth 2.1 and OpenID Connect provider, the kind of service behind a "Sign in with Google" button: an application sends you to Home Assistant's own login page, and gets back who you are and, when it needs one, a token to act for you. It is how Claude signs in to an MCP server running in Home Assistant, and it works for self-hosted applications such as Grafana too.
 
-## Features
+What you can do with it:
 
-- **Standards-compliant OIDC server** with discovery endpoint
-- **Integrates with Home Assistant's native authentication** including TOTP/2FA
-- **JWT access tokens** (RFC 9068) with RSA signing and key rotation
-- **Support for authorization code flow** with refresh tokens
-- **Claude and other MCP clients connect without registration** through Client ID Metadata Documents
-- **Client management page** for administrators to register, edit and revoke clients, with the same operations available as actions
-- **Consent screen** for clients you did not register yourself, styled like the Home Assistant login
-- **Choose what an application may do**: an integration that accepts these tokens can describe the access it offers, and the consent screen lets each person choose it, as a level or area by area; the choice goes into the access token as scopes
-- **No external dependencies** - runs entirely within Home Assistant
+- Connect Claude, Claude Code or another MCP client to an MCP server in Home Assistant, such as [hass-mcp-server](https://github.com/ganhammar/hass-mcp-server), without registering anything.
+- Sign in to Grafana, or another application that supports OpenID Connect, with your Home Assistant account.
+- Choose what an application may do in Home Assistant when it asks, such as look only, if the integration it connects to describes its access.
+- See every application signed in with your account, change what it may do, and sign it out.
 
-This integration acts as an OIDC abstraction layer on top of Home Assistant's built-in authentication system. It does not create new user accounts or add additional login methods—users authenticate with their existing Home Assistant credentials through the standard login interface.
+## Why this one
 
-## Installation
+- **The accounts you already have, and nothing else to run.** People sign in on Home Assistant's own login page, two-factor authentication included. A separate identity provider such as Authentik or Keycloak is another service to run, with accounts of its own. Other OpenID Connect integrations for Home Assistant, such as hass-oidc-auth, work the other way round: they let you sign in to Home Assistant with an outside provider.
+- **Standard OpenID Connect.** Home Assistant's built-in sign-in for applications is OAuth without OpenID Connect: no ID tokens, no user info, no published signing keys, and tokens that only Home Assistant can check, carrying every right of the user. This provider adds all of that, so ordinary applications can use it and other integrations can verify its tokens. See [how the two differ](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/faq.md#how-is-this-different-from-home-assistants-built-in-sign-in).
+- **Each person decides.** A consent screen names the application, where it sends you and what it will see. For an integration that describes its access, each person chooses what the application may do there, and can change it later.
+- **Made for MCP clients.** Client ID Metadata Documents, PKCE, tokens bound to the server they are for, and rotating refresh tokens, as the MCP authorization specification asks.
 
-### HACS (Recommended)
+## Quick start
 
-1. Open HACS in Home Assistant
-1. Search for "OIDC Provider"
-1. Click "Download"
-1. Restart Home Assistant
-1. Configure the integration (see Configuration section below)
+**You need:** Home Assistant with HACS, an administrator account, and an HTTPS address for Home Assistant that the application can reach. For Claude, that address has to work from the internet.
 
-### Manual
+1. **Install.** In HACS, search for "OIDC Provider", download it, and restart Home Assistant. Without HACS, see [Configuration](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/configuration.md).
+2. **Add the integration.** Under Settings > Devices & services > Add integration, choose **OIDC Provider** and submit the form as it is.
+3. **Connect an application.**
+   - **Claude:** set up an MCP server that signs in through this provider, such as [hass-mcp-server](https://github.com/ganhammar/hass-mcp-server), and add its address, such as `https://your-home-assistant/api/mcp_http`, as a custom connector in Claude. Claude sends you to Home Assistant to sign in and approve.
+   - **An OpenID Connect application:** open `https://your-home-assistant/oidc_login?tab=clients`, register a client with the application's redirect URI, and give the application the client ID, the client secret and the issuer `https://your-home-assistant/oidc`.
 
-1. Copy the `custom_components/oidc_provider` folder to your Home Assistant `config/custom_components/` directory
-1. Restart Home Assistant
-1. Configure the integration (see Configuration section below)
+[Connecting an application](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/connecting.md) walks through both, with a worked example for Grafana.
 
-## Configuration
+## What it can do
 
-1. Go to **Settings** → **Devices & Services**
-1. Click **Add Integration**
-1. Search for "OIDC Provider"
-1. Choose whether to **Allow client metadata documents** and **Allow dynamic client registration** (see below), then click **Submit**
+| Area | What it offers |
+|---|---|
+| Sign-in | The authorization code flow with PKCE, on Home Assistant's own login page |
+| Clients | Clients you register with a secret, MCP clients identified by a metadata document, and, if you allow it, clients that register themselves |
+| Tokens | Signed access tokens bound to the server they are for, ID tokens, rotating refresh tokens, revocation |
+| OpenID Connect | Discovery, user info, published signing keys, and the `profile`, `email` and `groups` scopes |
+| Consent | A consent screen for clients you did not register, and a choice of access for integrations that describe theirs |
+| Management | A Clients page and actions for administrators, and Connected applications for everyone |
 
-### Options
+## Staying in control
 
-Change these later under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**. Changes apply immediately, without a restart.
+- **A consent screen** stops every sign-in through a client you did not register yourself, and you can require it for the ones you did.
+- **Access per application.** An integration that describes its access, such as an MCP server, has each person choose what an application may do there.
+- **Connected applications** shows each person the applications signed in with their account, to change what they may do or sign them out.
+- **Clients that register themselves** are off for new installs, and limited and cleaned up when on.
+- **Revoke a client** to end all its sessions at once, and **rotate the signing key** if it may have leaked.
 
-- **Require PKCE** (default: on): authorization requests must carry an S256 PKCE code challenge, as OAuth 2.1 requires. Public clients, which have no secret, always need it.
-- **Allow client metadata documents** (default: on for new installs): accepts clients whose client ID is an HTTPS URL serving their metadata, as described in [Client ID Metadata Documents](#client-id-metadata-documents). This is how Claude connects. Turning it off ends those clients' sessions at their next token refresh.
-- **Allow dynamic client registration** (default: off for new installs): lets clients register themselves at `/oidc/register` (RFC 7591). Only needed for clients that support neither client metadata documents nor a client you register for them. Every sign-in through a dynamically registered client stops on the [consent screen](#consent-screen).
+See [The consent screen and Connected applications](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/consent.md) and [Security](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/security.md).
 
-Clients that use dynamic registration, such as Claude when client metadata documents are off, register a new client on every fresh connection, so abandoned registrations are cleaned up automatically. A dynamically registered client that has not had a token issued within a day of registering is removed. Once a user has approved one, it is kept even after its sessions end, since many clients reuse their client ID for the next sign-in. The cleanup runs when the integration starts and before each new registration. Clients you registered with `register_client`, and clients registered by earlier releases, are never removed automatically.
+## Documentation
 
-While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself on the [Clients tab](#managing-clients) or with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
+- [Connecting an application](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/connecting.md): Claude and other MCP clients, a client you register, an OpenID Connect application such as Grafana
+- [Managing clients](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/clients.md): the Clients page and the actions
+- [The consent screen and Connected applications](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/consent.md): approving, choosing what an application may do, changing it, signing out
+- [Configuration](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/configuration.md): every option, and upgrading from older releases
+- [Security](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/security.md): what the provider protects against, what it leaves to you, rotating the signing key
+- [Reference](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/reference.md): endpoints, discovery, tokens and lifetimes, scopes and claims, limits, what is stored where
+- [FAQ](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/faq.md) and [Troubleshooting](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/troubleshooting.md)
+- [Describing a resource to the OIDC Provider](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/resource-descriptions.md): for authors of integrations that accept this provider's tokens
+- [Working on this integration](https://github.com/ganhammar/hass-oidc-server/blob/main/docs/development.md): tests, formatting and linting
 
-Installs set up before version 1.7.0 keep dynamic client registration on, since it was always on before, so clients that register themselves keep connecting after the upgrade. Turn it off in the options if you do not need it.
+**Updating and removing.** HACS shows updates as they are released. To remove the integration, delete it under Settings > Devices & services, remove it in HACS and restart. Its clients, sessions and signing key stay in Home Assistant's `.storage` folder as the `oidc_provider.*` files until you delete them.
 
-Installs set up before version 1.8.0 start with client metadata documents matching their dynamic client registration setting, so an install that admitted only clients you registered keeps doing so. Turn it on in the options to let Claude connect without registration.
-
-If you switch from a fork of this integration that stores the same setting, a value you saved there is kept. An entry where it was never saved looks the same as an install from before 1.7.0, so registration is turned on; check the setting after switching.
-
-## Usage
-
-### Managing Clients
-
-Administrators manage clients on a page inside Home Assistant. Open **Settings** → **Devices & Services** → **OIDC Provider** → **Configure** and follow the **Manage clients** link, or go to `https://your-ha-instance/oidc_login?tab=clients`.
-
-The **Clients** tab lists every registered client with its client ID, redirect URIs, whether it shows the [consent screen](#consent-screen), its number of active sessions and whether it registered itself through dynamic registration. A client identified by a [metadata document](#client-id-metadata-documents) is not stored, so it is listed while it holds a session. A client that registered itself before version 1.8.0 is listed as registered, like the ones you created, because those releases did not record the difference. From there you can:
-
-- **Register a client**: enter a name and its redirect URIs, one per line. The client ID and client secret are shown once, each with a copy button. The secret is stored only as a hash and cannot be shown again
-- **Edit** a client's redirect URIs and whether it requires consent
-- **Revoke** a client, which removes it and ends every session it holds at once. A metadata document client is not stored, so for it the button reads **End sessions**
-
-The tab is shown to administrators only. Other users see just their own [connected applications](#connected-applications) on the same page.
-
-The same operations are available as actions, described below, for automations and scripts.
-
-### Registering a Client with an Action
-
-To register a new OIDC client (e.g., for Claude Connectors) from **Developer Tools**, an automation or a script:
-
-1. Go to **Developer Tools** → **Actions**
-2. In the action dropdown, select **"Register OIDC Client"** (or type `oidc_provider.register_client`)
-3. Fill in the fields:
-   - **Client Name**: A friendly name (e.g., "Claude Connector")
-   - **Redirect URIs**: Comma-separated list of allowed redirect URIs
-   - **Require consent** (optional): Ask the user to approve each authorization. Off by default, since a client you register yourself is trusted
-4. Click **"Perform Action"**
-5. Copy the generated **Client ID** and **Client Secret** from the action's response
-
-Example action call:
-
-```yaml
-action: oidc_provider.register_client
-data:
-  client_name: "Claude Connector"
-  redirect_uris: "https://claude.ai/callback,https://app.claude.com/callback,https://claude.ai/api/mcp/auth_callback"
-```
-
-The response holds the credentials:
-
-```yaml
-client_id: client_xxxxxxxxxxxxx
-client_secret: yyyyyyyyyyyyyyyyyyyyyyyy
-client_name: Claude Connector
-redirect_uris:
-  - https://claude.ai/callback
-  - https://app.claude.com/callback
-  - https://claude.ai/api/mcp/auth_callback
-consent_required: false
-```
-
-Called from an automation or script without a response variable, the action posts the credentials in a notification instead. Every Home Assistant user can read notifications, so dismiss it once you have saved the secret.
-
-**Important**: Save these credentials securely. The client secret cannot be retrieved later.
-
-### Client ID Metadata Documents
-
-A client can identify itself with an HTTPS URL as its client ID instead of registering ([draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), used by the MCP authorization specification). When a sign-in starts, Home Assistant fetches the client's name and allowed redirect URIs from that URL. Claude, Claude Code and other MCP clients prefer this over dynamic client registration, so with this option on you can leave dynamic client registration off and register nothing.
-
-These clients are public: they have no secret and prove their sign-ins with PKCE. Every sign-in through one stops on the [consent screen](#consent-screen), which shows the host that serves the document, such as `claude.ai`, next to the client's name.
-
-The fetch is limited to keep the endpoint from being used against your network:
-
-- Only `https` URLs in normalized form with a host name and a path, without a query or fragment, are accepted. IP addresses in any notation are refused, and international host names must be given in punycode, so a look-alike cannot pass for another domain on the consent screen
-- Host names that resolve only to private, loopback or other special-use addresses are refused, checked when the connection is made. IPv6 addresses that embed an IPv4 address, such as NAT64, count as that IPv4 address
-- Redirects are not followed, documents larger than 5 KB are refused, and the request times out after 5 seconds. A failed fetch is answered with the same message whatever the cause, so it reveals nothing about your network
-- Documents are cached for their `Cache-Control` lifetime, between 1 minute and 1 day, and not at all when marked `no-store` or `no-cache`. At most 30 uncached fetches run per minute, and at most 5 for any one address
-- A document must not contain a client secret, must use `none` as its token endpoint authentication method, and must list its redirect URIs
-
-### Consent Screen
-
-Clients that registered themselves through `/oidc/register` (when [enabled](#options)) and clients identified by a [metadata document](#client-id-metadata-documents) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the host serving its metadata document if it has one, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. When that site is on the user's own computer, as with Claude Code, the screen says so. Denying sends the client an `access_denied` error.
-
-Clients you register yourself, on the [Clients tab](#managing-clients) or with the `register_client` action, skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Edit the ones you registered yourself on the Clients tab, or use the `update_client` action with `consent_required: false`.
-
-#### Choosing what an application may do
-
-An integration that accepts this provider's tokens, such as an MCP server, can describe the access it offers. When an application signs in for such an integration (the `resource` it names is one of that integration's addresses), the consent screen asks what the application may do there:
-
-- It opens on the integration's levels, such as "Look only" or "Control devices", each with one sentence on what it allows. A note appears under the selected level when there is something its name does not say.
-- **Choose in detail** shows one setting per area, such as None, Read or Full, with what the current setting means and notes where an area reaches past another. A choice that matches no level is called Custom, with how it differs from the closest level.
-- The first time, the integration's default level is selected; after that, the person's last choice for that application. It is marked "Your choice last time".
-- An area that is unavailable right now, for example because it is turned off in that integration's options, can still be chosen and says why. Settings above what an administrator allows for the person are locked, with the reason, as is a level that would add nothing they may allow.
-- The screen says that what the application can do can be changed, and the application signed out, at any time under [Connected applications](#connected-applications).
-
-The choice goes into the access token as scopes (see [Tokens](#tokens)), and the integration decides what each scope allows. This provider enforces none of it. A sign-in for such an integration stops on the screen even for a client registered without **Require consent**, since the choice is each person's to make; the last choice is preselected, so approving is one tap. Sign-ins for anything else work as described above, and an integration that has not described itself gets the approve or deny screen as before.
-
-Integration authors: see [Describing a resource to the OIDC Provider](docs/resource-descriptions.md).
-
-### Updating a Client with an Action
-
-To update redirect URIs for an existing client:
-
-1. Use **"List OIDC Clients"** to find the client ID
-2. Go to **Developer Tools** → **Actions**
-3. Select **"Update OIDC Client"**
-4. Enter the client ID and new redirect URIs, and optionally whether consent is required
-
-```yaml
-action: oidc_provider.update_client
-data:
-  client_id: "client_xxxxxxxxxxxxx"
-  redirect_uris: "https://new-app.example.com/callback,http://localhost:8080/auth"
-  consent_required: false
-```
-
-### Revoking a Client with an Action
-
-To revoke an existing client:
-
-1. Use **"List OIDC Clients"** to find the client ID
-2. Go to **Developer Tools** → **Actions**
-3. Select **"Revoke OIDC Client"**
-4. Enter the client ID
-
-```yaml
-action: oidc_provider.revoke_client
-data:
-  client_id: "client_xxxxxxxxxxxxx"
-```
-
-Revoking a client also ends every session it holds, so its refresh tokens stop working at once; access tokens it already has expire within the hour. A client that signed in with a [metadata document](#client-id-metadata-documents) is not stored, so revoking its URL client ID ends its sessions, and it can ask the user again on its next sign-in unless you turn metadata documents off.
-
-**"List OIDC Clients"** shows the number of active sessions for each client, including clients that signed in with a metadata document, and returns the same list as a response when called from a script or **Developer Tools**.
-
-### Connected Applications
-
-Each user can see the applications signed in with their Home Assistant account on the **Connected applications** page, with when each signed in and was last used, change what each may do, and sign any of them out. The page has no entry in the sidebar, so it is found in these places:
-
-- At `/oidc_login` on your Home Assistant address, such as `https://your-ha-instance/oidc_login`.
-- Through the **Connected applications** link in the integration's **Configure** dialog, under **Settings** → **Devices & Services** → **OIDC Provider** → **Configure**, which only administrators can open.
-- By name on the consent screen of an application that signs in for an integration that [describes its access](#choosing-what-an-application-may-do): a line under the choice says that what the application can do can be changed, and the application signed out, at any time under Connected applications.
-
-For an application that was given a choice of access, the list shows what was chosen: the level's name, or Custom with how it differs from the closest level. Signing out ends that session, so the application gets no new access tokens and has to ask again; an access token it already holds keeps working until it expires, within the hour.
-
-**Change access**, next to **Sign out**, is there for every application signed in for an integration that [describes its access](#choosing-what-an-application-may-do), also one that signed in before the integration did and has no choice yet. It opens the same choice as the consent screen, the levels and **Choose in detail**, with **Save** and **Cancel** in place of Approve and Deny:
-
-- It opens on what the application has now, named under the heading of **Choose in detail** as the list names it. The option that shows exactly that, a level as the integration holds the levels for the person or Custom, is marked "What it has now".
-- When the person may no longer allow what the application has, for example while the integration holds an area or everything at a lower level, it opens on a choice they may make instead. Above the choice it says so, with the integration's reason, and what saving changes: each area the choice on the screen sets otherwise and what to, or, past three areas, only that saving changes it to that choice. That part follows the choice as the person changes it. A level is then marked only when it is exactly what the application has and the person may not choose it. When part of what the application has is above what the person may allow, no option shows it, so none is marked, and **Choose in detail** still names it. Saving changes the access to the choice on the screen; **Cancel** keeps it as it is, as the screen also says above **Save**.
-- For an application without a choice yet, nothing is marked. It opens on the access its next refresh would give it. When that refresh would end the session instead, it opens where the consent screen would: on the integration's default level or, when the integration names no access for such sessions, on the person's last choice for that application. A locked default level gives way to the nearest unlocked level below it, or else above it. Saving gives it the access chosen.
-- What the person may allow, and what is unavailable, are as they are when the page opens, and saving checks the choice with the integration again, as an approval does. When what the person may allow changed in between, the choice is shown again with a notice.
-- The saved choice replaces the application's access and its scopes, and is the person's choice for that application at its next sign-in.
-- It applies from the application's next token refresh. An access token it already holds keeps its scopes until it expires, within the hour, as after signing it out, and the page says so after saving.
-
-### Rotating the Signing Key
-
-Access and ID tokens are signed with an RSA key that is generated on first start and kept in Home Assistant's storage. To replace it, an administrator runs **"Rotate Signing Key"** (`oidc_provider.rotate_signing_key`):
-
-```yaml
-action: oidc_provider.rotate_signing_key
-data:
-  keep_previous_key: true
-```
-
-- **`keep_previous_key: true`** (default): the old key stays published and keeps verifying the tokens it signed until the next rotation, so clients keep working until those tokens expire (within an hour). Use this for routine rotation.
-- **`keep_previous_key: false`**: the old key is dropped at once and every outstanding access and ID token stops working. Use this if the key may have leaked.
-
-Refresh tokens are not signed with this key, so clients holding one get new tokens without signing in again.
-
-### OIDC Endpoints
-
-Once installed, your Home Assistant instance exposes the following OIDC endpoints:
-
-- **Discovery**: `https://your-ha-instance/oidc/.well-known/openid-configuration`
-- **OAuth Authorization Server Metadata**: `https://your-ha-instance/.well-known/oauth-authorization-server/oidc`
-- **Authorization**: `https://your-ha-instance/oidc/authorize`
-- **Token**: `https://your-ha-instance/oidc/token`
-- **UserInfo**: `https://your-ha-instance/oidc/userinfo`
-- **JWKS**: `https://your-ha-instance/oidc/jwks` (the current signing key, and the previous one after a rotation that kept it)
-- **Token Revocation**: `https://your-ha-instance/oidc/revoke` (RFC 7009). Revoking a refresh token ends its whole session; only the client it was issued to may revoke it. Access tokens cannot be revoked and are answered with `unsupported_token_type`; they expire within the hour
-- **Dynamic Client Registration**: `https://your-ha-instance/oidc/register` (only while [dynamic client registration](#options) is on)
-
-Both redirects back to the client, with `code` on approval or `error=access_denied` on denial, carry an `iss` parameter with the issuer (RFC 9207), and the discovery documents advertise `authorization_response_iss_parameter_supported`.
-
-### Tokens
-
-Access tokens are JWTs in the RFC 9068 profile. The header has `typ: at+jwt` and the `kid` of the signing key, and the claims include `iss`, `sub`, `aud`, `client_id`, `scope`, `jti`, `iat`, `exp` and `token_use: access`. `/oidc/userinfo` and the validator hass-mcp-server uses accept only access tokens, so an ID token is refused there.
-
-`scope` holds the OpenID Connect scopes granted and, for a token bound to an integration that describes its access, the scopes of the access the person chose, whatever the application asked for. The token response's `scope` says the same, so the application learns what it was granted. Refreshed tokens keep the same `aud`, and the same scopes until the person changes the application's access on [Connected applications](#connected-applications); from then on they carry the new ones.
-
-A token bound to such an integration with none of its scopes grants nothing there, whether the person chose nothing or the token was issued before the integration described its access; the integration cannot tell the two apart. An integration that enforces its scopes refuses such a token at once, and depending on how it refuses, the application refreshes first or authorizes again straight away, where the person chooses.
-
-A session that began before the integration described its access carries no choice. At its next refresh it gets the access the integration names for such sessions, held at what the person may allow, and keeps it from then on as if the person had chosen it, so [Connected applications](#connected-applications) shows it too. It is not remembered as the person's choice for their next sign-in. Until that refresh, the access token the session already holds, valid for up to an hour, carries none of the integration's scopes. When the integration names no access for such sessions, or the person may not have it, the session ends at that refresh instead and the application signs in again, where the person chooses. When the integration cannot answer at that refresh, the session is refreshed without its scopes and the next refresh tries again. Before that refresh, the person can give the session the access they choose with **Change access** on [Connected applications](#connected-applications).
-
-An application must name such an integration when it authorizes. Naming it only when redeeming the code is refused with `invalid_target`.
-
-### Using with Claude Connectors
-
-With [client metadata documents](#client-id-metadata-documents) on (the default), there is nothing to register:
-
-1. In Claude, add a custom connector with your MCP server's URL and leave the client ID and secret empty
-2. When prompted, log in with your Home Assistant credentials (TOTP/2FA supported)
-3. Approve Claude on the consent screen
-
-Claude Code works the same way, returning to a port on your computer that the consent screen points out.
-
-To use a client you registered yourself instead, register one as described above and enter its client ID and secret in the connector settings.
-
-## Security Considerations
-
-- **HTTPS Required**: Your Home Assistant instance must be accessible via HTTPS with a valid certificate for OIDC to work with external services
-- **Client Secrets**: Store client secrets securely and never commit them to version control
-- **Refresh Tokens**: Persisted across restarts and valid for 30 days from sign-in. Every refresh replaces the refresh token with a new one. A replaced token keeps working for one minute after it was replaced, so a retried request, or one sent from another worker of the same client, does not end the session; presented after that, it revokes every token of that session, since only a leaked token is used that way (RFC 9700). Token responses are never cached (`Cache-Control: no-store`)
-- **Access Tokens**: Valid for 1 hour by default
-- **Client Actions**: Registering, updating, revoking and listing clients, and rotating the signing key, require a Home Assistant administrator. Automations, which run without a user, can still call them. A script runs as the user who started it, so it can call them only when an administrator starts it
-- **Signing Key**: Kept until you [rotate it](#rotating-the-signing-key). Rotate with `keep_previous_key: false` if it may have leaked
-- **Issuer Identification**: Authorization responses name the issuer (`iss`, RFC 9207) so clients that talk to several authorization servers can detect a mix-up
-- **Authorization Codes**: Valid for 10 minutes and good for one redemption attempt. A code presented again after it issued tokens revokes every refresh token of that session
-- **Dynamic Registration**: Off for new installs. While it is on, anyone who can reach your instance can register a client. Those clients always go through the consent screen, so a user has to approve them explicitly
-- **Client Metadata Documents**: Anyone who can reach your instance can start a sign-in that makes Home Assistant fetch a URL. The fetch only reaches public addresses over HTTPS and is size, time and rate limited, as [described above](#client-id-metadata-documents). Sign-ins through these clients always go through the consent screen
-- **Public Clients**: Clients without a secret, from metadata documents or registered with `token_endpoint_auth_method: none`, must use PKCE whatever the PKCE option says. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) match on any port, as RFC 8252 requires for native apps
-- **Registration limits**: `/oidc/register` accepts at most 20 registrations per hour in total, at most 5 of them from one address, and at most 200 dynamically registered clients that have not had a token issued yet. Beyond that it answers `429` with `temporarily_unavailable` (and a `Retry-After` header for the hourly limits) and creates nothing. Clients a user has approved do not count toward the 200.
-- **Limits Behind a Reverse Proxy**: The per-address limits on registrations, pending sign-ins and metadata document fetches count by the client address Home Assistant sees. Behind a reverse proxy, turn on [`use_x_forwarded_for`](https://www.home-assistant.io/integrations/http/#use_x_forwarded_for) and list the proxy in `trusted_proxies` so Home Assistant sees each client's own address. Otherwise every request appears to come from the proxy, and those limits apply to all clients together
-- **Access Chosen at a Resource**: The scopes in a token are what the person chose on the consent screen, checked against what the integration describes and the person's ceiling when they approve. Scopes the application asks for never widen that. The integration that receives the token enforces the scopes; this provider only records and passes them on
-- **Resource Binding**: A resource server that validates tokens with an expected audience (for example hass-mcp-server) only accepts tokens whose `aud` is that resource. Clients must send the `resource` parameter (RFC 8707) when authorizing; a token minted for a client without it is rejected there
-
-## Supported Scopes
-
-- `openid` - Required for OIDC
-- `profile` - User profile information
-- `email` - User email (uses HA user ID as fallback)
-- `groups` - The user's Home Assistant groups
-
-The discovery documents also list every scope an integration describes (see [Choosing what an application may do](#choosing-what-an-application-may-do)). Those are granted as the person chooses on the consent screen, not from the authorization request.
-
-## Troubleshooting
-
-### Client registration not appearing in logs
-
-Check that you have the log level set appropriately in your `configuration.yaml`:
-
-```yaml
-logger:
-  default: info
-  logs:
-    custom_components.oidc_provider: debug
-```
-
-### Authentication not working
-
-1. Verify your Home Assistant instance is accessible via HTTPS
-2. Check that the redirect URI matches exactly what the client is sending
-3. Ensure the user has valid permissions in Home Assistant
-
-### Tokens not being issued
-
-Check the Home Assistant logs for detailed error messages. Common issues:
-- Invalid client credentials
-- Expired authorization codes (10 minute timeout)
-- Mismatched redirect URIs
-
-## Development
-
-### Setup
-
-```bash
-poetry install
-```
-
-### Running Tests
-
-```bash
-poetry run pytest tests/ -v
-```
-
-### Running Tests with Coverage
-
-```bash
-poetry run pytest tests/ --cov=custom_components/oidc_provider --cov-report=term-missing
-```
-
-### Code Formatting
-
-```bash
-poetry run black custom_components/ tests/
-```
-
-### Linting
-
-```bash
-poetry run ruff check custom_components/ tests/
-```
-
-To auto-fix issues:
-
-```bash
-poetry run ruff check custom_components/ tests/ --fix
-```
+**Help.** Questions and bugs go to the [issue tracker](https://github.com/ganhammar/hass-oidc-server/issues).
 
 ## License
 
-MIT
-
-## Contributing
-
-Contributions are welcome! Please open an issue or pull request on GitHub.
+[MIT](https://github.com/ganhammar/hass-oidc-server/blob/main/LICENSE)

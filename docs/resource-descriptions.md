@@ -1,5 +1,7 @@
 # Describing a resource to the OIDC Provider
 
+[Back to the README](../README.md)
+
 This page is for authors of integrations that accept this provider's access tokens, such as an MCP server running inside Home Assistant. It explains how such an integration, a *resource server*, describes the access it offers so that the person signing in can choose it on the consent screen.
 
 The provider stays generic. It knows nothing about what your scopes mean:
