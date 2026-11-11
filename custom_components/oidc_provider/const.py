@@ -110,5 +110,13 @@ REGISTRATION_RATE_LIMIT_PER_ADDRESS = 5  # The same, for one remote address
 REGISTRATION_RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
 MAX_UNUSED_DYNAMIC_CLIENTS = 200
 
+# How a client came to be known, as the client management page names it. A
+# metadata document client is not stored and is known through its sessions.
+CLIENT_KIND_REGISTERED = "registered"
+CLIENT_KIND_DYNAMIC = "dynamic"
+CLIENT_KIND_METADATA_DOCUMENT = "metadata_document"
+
 # Frontend panel serving the login flow (hidden from the sidebar)
 PANEL_URL_PATH = "oidc_login"
+# The same panel, opened on client management
+PANEL_CLIENTS_PATH = f"/{PANEL_URL_PATH}?tab=clients"

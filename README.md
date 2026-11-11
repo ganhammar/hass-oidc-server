@@ -9,7 +9,7 @@ A Home Assistant custom component that turns your Home Assistant instance into a
 - **JWT access tokens** (RFC 9068) with RSA signing and key rotation
 - **Support for authorization code flow** with refresh tokens
 - **Claude and other MCP clients connect without registration** through Client ID Metadata Documents
-- **Easy client registration** via Home Assistant services
+- **Client management page** for administrators to register, edit and revoke clients, with the same operations available as actions
 - **Consent screen** for clients you did not register yourself, styled like the Home Assistant login
 - **No external dependencies** - runs entirely within Home Assistant
 
@@ -48,7 +48,7 @@ Change these later under **Settings** → **Devices & Services** → **OIDC Prov
 
 Clients that use dynamic registration, such as Claude when client metadata documents are off, register a new client on every fresh connection, so abandoned registrations are cleaned up automatically. A dynamically registered client that has not had a token issued within a day of registering is removed. Once a user has approved one, it is kept even after its sessions end, since many clients reuse their client ID for the next sign-in. The cleanup runs when the integration starts and before each new registration. Clients you registered with `register_client`, and clients registered by earlier releases, are never removed automatically.
 
-While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
+While dynamic client registration is off, `/oidc/register` answers `403` with `access_denied`, and the discovery documents leave out `registration_endpoint` so clients do not try to use it. Register clients yourself on the [Clients tab](#managing-clients) or with the `register_client` action instead. Clients that registered while it was on keep working until you revoke them.
 
 Installs set up before version 1.7.0 keep dynamic client registration on, since it was always on before, so clients that register themselves keep connecting after the upgrade. Turn it off in the options if you do not need it.
 
@@ -58,9 +58,23 @@ If you switch from a fork of this integration that stores the same setting, a va
 
 ## Usage
 
-### Registering a Client
+### Managing Clients
 
-To register a new OIDC client (e.g., for Claude Connectors):
+Administrators manage clients on a page inside Home Assistant. Open **Settings** → **Devices & Services** → **OIDC Provider** → **Configure** and follow the **Manage clients** link, or go to `https://your-ha-instance/oidc_login?tab=clients`.
+
+The **Clients** tab lists every client with its client ID, redirect URIs, whether it shows the [consent screen](#consent-screen), its number of active sessions and how it identifies itself: registered by an administrator, registered by itself through dynamic registration, or identified by a [metadata document](#client-id-metadata-documents). From there you can:
+
+- **Register a client**: enter a name and its redirect URIs, one per line. The client ID and client secret are shown once, each with a copy button. The secret is stored only as a hash and cannot be shown again
+- **Edit** a client's redirect URIs and whether it requires consent
+- **Revoke** a client, which removes it and ends every session it holds at once. A metadata document client is not stored, so for it the button reads **End sessions**
+
+The tab is shown to administrators only. Other users see just their own [connected applications](#connected-applications) on the same page.
+
+The same operations are available as actions, described below, for automations and scripts.
+
+### Registering a Client with an Action
+
+To register a new OIDC client (e.g., for Claude Connectors) from **Developer Tools**, an automation or a script:
 
 1. Go to **Developer Tools** → **Actions**
 2. In the action dropdown, select **"Register OIDC Client"** (or type `oidc_provider.register_client`)
@@ -115,9 +129,9 @@ The fetch is limited to keep the endpoint from being used against your network:
 
 Clients that registered themselves through `/oidc/register` (when [enabled](#options)) and clients identified by a [metadata document](#client-id-metadata-documents) are not vetted by you, so every authorization for them stops on a consent screen inside Home Assistant. It names the client, the host serving its metadata document if it has one, the site the user will be sent to, and the information the client will receive, with Approve and Deny buttons. When that site is on the user's own computer, as with Claude Code, the screen says so. Denying sends the client an `access_denied` error.
 
-Clients you register with the `register_client` action skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Use the `update_client` action with `consent_required: false` for the ones you registered yourself.
+Clients you register yourself, on the [Clients tab](#managing-clients) or with the `register_client` action, skip the screen unless you set **Require consent**. Clients registered before version 1.6.0 have no consent setting and prompt until you turn it off, because there is no way to tell which of them came from dynamic registration. Edit the ones you registered yourself on the Clients tab, or use the `update_client` action with `consent_required: false`.
 
-### Updating a Client
+### Updating a Client with an Action
 
 To update redirect URIs for an existing client:
 
@@ -134,7 +148,7 @@ data:
   consent_required: false
 ```
 
-### Revoking a Client
+### Revoking a Client with an Action
 
 To revoke an existing client:
 

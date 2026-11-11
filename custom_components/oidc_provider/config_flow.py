@@ -12,6 +12,7 @@ from .const import (
     DEFAULT_ALLOW_DYNAMIC_REGISTRATION,
     DEFAULT_REQUIRE_PKCE,
     DOMAIN,
+    PANEL_CLIENTS_PATH,
 )
 
 
@@ -80,6 +81,7 @@ class OIDCProviderOptionsFlow(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
+            description_placeholders={"clients_url": PANEL_CLIENTS_PATH},
             data_schema=vol.Schema(
                 {
                     vol.Optional(

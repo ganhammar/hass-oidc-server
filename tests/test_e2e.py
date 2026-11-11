@@ -1279,17 +1279,19 @@ async def test_user_lists_and_ends_their_sessions(
     client = await hass_client()
     registration, tokens = await _signed_in(client)
 
-    resp = await client.get("/oidc/sessions")
+    resp = await client.get("/api/oidc_provider/sessions")
     [session] = (await resp.json())["sessions"]
     assert session["client_name"] == "Test MCP Client"
     assert session["client_id"] == registration["client_id"]
     assert session["scopes"] == ["openid", "profile"]
+    # The same list is served without the /api prefix
+    assert (await (await client.get("/oidc/sessions")).json())["sessions"] == [session]
 
-    resp = await client.delete(f"/oidc/sessions/{session['session_id']}")
+    resp = await client.delete(f"/api/oidc_provider/sessions/{session['session_id']}")
     assert resp.status == 200
 
     assert (await _refresh(client, registration, tokens["refresh_token"]))[0] == 400
-    resp = await client.get("/oidc/sessions")
+    resp = await client.get("/api/oidc_provider/sessions")
     assert (await resp.json())["sessions"] == []
 
 
@@ -1341,6 +1343,121 @@ async def test_client_services_show_and_end_sessions(
 
     assert registration["client_id"] not in hass.data[DOMAIN]["clients"]
     assert hass.data[DOMAIN]["refresh_tokens"] == {}
+
+
+CLIENTS_URL = "/api/oidc_provider/clients"
+SESSIONS_URL = "/api/oidc_provider/sessions"
+
+
+async def test_admin_manages_clients_from_the_page(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    metadata_document: list[str],
+) -> None:
+    """The Clients tab registers, edits and revokes over /oidc/clients, as the actions do."""
+    client = await hass_client()
+
+    resp = await client.post(
+        CLIENTS_URL, json={"client_name": "Grafana", "redirect_uris": [REDIRECT_URI]}
+    )
+    assert resp.status == 201, await resp.text()
+    registered = await resp.json()
+
+    # The secret from the page signs a user in
+    code, verifier = await _issue_code(client, registered)
+    status, tokens = await _exchange_code(
+        client,
+        code=code,
+        client_id=registered["client_id"],
+        client_secret=registered["client_secret"],
+        code_verifier=verifier,
+    )
+    assert status == 200, tokens
+
+    # A metadata document client appears once it holds a session
+    verifier, challenge = _pkce_pair()
+    code = await _authorize_and_get_code(
+        client,
+        client_id=CIMD_CLIENT_ID,
+        code_challenge=challenge,
+        resource=RESOURCE,
+        redirect_uri=LOOPBACK_REDIRECT_URI,
+    )
+    status, _ = await _exchange_code(
+        client,
+        code=code,
+        client_id=CIMD_CLIENT_ID,
+        client_secret="",
+        code_verifier=verifier,
+        redirect_uri=LOOPBACK_REDIRECT_URI,
+    )
+    assert status == 200
+
+    resp = await client.get(CLIENTS_URL)
+    listed = {entry["client_id"]: entry for entry in (await resp.json())["clients"]}
+    assert listed[registered["client_id"]]["registration"] == "registered"
+    assert listed[registered["client_id"]]["active_sessions"] == 1
+    assert listed[CIMD_CLIENT_ID]["registration"] == "metadata_document"
+    assert listed[CIMD_CLIENT_ID]["client_host"] == "claude.ai"
+
+    resp = await client.patch(
+        CLIENTS_URL,
+        params={"client_id": registered["client_id"]},
+        json={"redirect_uris": ["https://grafana.example.com/login"], "consent_required": True},
+    )
+    assert resp.status == 200, await resp.text()
+    stored = hass.data[DOMAIN]["clients"][registered["client_id"]]
+    assert stored["redirect_uris"] == ["https://grafana.example.com/login"]
+    assert stored["consent_required"] is True
+
+    # A URL client ID travels in the query string
+    for client_id in (registered["client_id"], CIMD_CLIENT_ID):
+        resp = await client.delete(CLIENTS_URL, params={"client_id": client_id})
+        assert resp.status == 200, await resp.text()
+
+    assert registered["client_id"] not in hass.data[DOMAIN]["clients"]
+    assert hass.data[DOMAIN]["refresh_tokens"] == {}
+    assert (await _refresh(client, registered, tokens["refresh_token"]))[0] in (400, 401)
+    resp = await client.get(CLIENTS_URL)
+    assert (await resp.json())["clients"] == []
+
+
+async def test_client_management_page_requires_an_admin(
+    setup_provider: None,
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+    hass_read_only_access_token: str,
+) -> None:
+    """Other users keep their connected applications but cannot see or change clients."""
+    admin = await hass_client()
+    registration = await _register_client(admin)
+    client = await hass_client(hass_read_only_access_token)
+    query = {"client_id": registration["client_id"]}
+    body = {"client_name": "X", "redirect_uris": [REDIRECT_URI]}
+
+    for resp in (
+        await client.get(CLIENTS_URL),
+        await client.post(CLIENTS_URL, json=body),
+        await client.patch(CLIENTS_URL, params=query, json=body),
+        await client.delete(CLIENTS_URL, params=query),
+    ):
+        assert resp.status == 403, await resp.text()
+    assert list(hass.data[DOMAIN]["clients"]) == [registration["client_id"]]
+
+    assert (await client.get(SESSIONS_URL)).status == 200
+    assert (await (await hass_client_no_auth()).get(CLIENTS_URL)).status == 401
+
+
+async def test_options_dialog_links_to_client_management(
+    setup_provider: None, hass: HomeAssistant
+) -> None:
+    """The Configure dialog points administrators at the Clients tab of the panel."""
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert result["description_placeholders"] == {"clients_url": "/oidc_login?tab=clients"}
 
 
 @pytest.mark.parametrize(
