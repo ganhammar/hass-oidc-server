@@ -1045,6 +1045,8 @@ async def test_changing_access_opens_on_the_sessions_own_choice(stand_in):
     assert access["current"] == CUSTOM
     # The session's own choice, not the user's last choice for the client
     assert access["remembered"] is None
+    # It is what the session has, and the ceiling still allows it
+    assert (access["granted"], access["adjusted"]) == (CUSTOM, None)
     # Availability and the ceiling as they are now
     assert access["unavailable"] == {"files": "Turned off in the stand-in's options."}
     assert access["ceiling"] == {**ceiling, "locked_presets": []}
@@ -1065,6 +1067,8 @@ async def test_a_session_without_a_choice_opens_on_the_access_it_would_get(stand
     assert status == 200, data
     assert data["access"]["current"] == {**CONTROL, "cameras": "none"}
     assert data["access"]["remembered"] is None
+    # It has no choice, so nothing is marked as what it has
+    assert (data["access"]["granted"], data["access"]["adjusted"]) == (None, None)
 
 
 async def test_without_access_for_sessions_from_before_the_choice_opens_as_on_consent(stand_in):
@@ -1075,10 +1079,61 @@ async def test_without_access_for_sessions_from_before_the_choice_opens_as_on_co
 
     _, data = await _change(hass, "before")
     assert (data["access"]["current"], data["access"]["remembered"]) == (None, None)
+    assert (data["access"]["granted"], data["access"]["adjusted"]) == (None, None)
 
     await async_remember_choice(hass, USER, CLIENT, "oidc_stand_in", CUSTOM)
     _, data = await _change(hass, "before")
     assert (data["access"]["current"], data["access"]["remembered"]) == (None, CUSTOM)
+
+
+async def test_a_choice_the_ceiling_now_lowers_says_why(stand_in):
+    """The choice still opens from the session's own options, as the panel on main
+    reads them, with what the session has and why the user may no longer allow it."""
+    hass = await _change_hass(stand_in)
+    stand_in.CEILINGS[USER] = {
+        "groups": {
+            "cameras": {"max": "none", "reason": "Cameras are off for your account."},
+            "files": {"max": "none", "reason": "Files are off for your account."},
+        },
+        "reason": "Not available for your account.",
+    }
+
+    status, data = await _change(hass, "fam")
+
+    assert status == 200, data
+    access = data["access"]
+    assert access["current"] == access["granted"] == CUSTOM
+    # Cameras are at None already, so only the files are lowered
+    assert access["adjusted"] == ["Files are off for your account."]
+
+
+async def test_a_choice_that_is_now_a_locked_level_says_why(stand_in):
+    """Exactly a level the ceiling locks, as it is or once held at the ceiling."""
+    hass = await _change_hass(stand_in)
+    _session(hass, "fam")["access"] = {**_session(hass, "fam")["access"], "options": CONTROL}
+    stand_in.CEILINGS[USER] = {
+        "locked_presets": ["control"],
+        "reason": "The stand-in is in read-only mode.",
+    }
+
+    _, data = await _change(hass, "fam")
+
+    assert data["access"]["granted"] == CONTROL
+    assert data["access"]["adjusted"] == ["The stand-in is in read-only mode."]
+
+    stand_in.CEILINGS[USER] = {
+        "groups": {"lights": {"max": "read", "reason": "Lights are read only."}},
+        "locked_presets": ["read"],
+        "reason": "The stand-in is in read-only mode.",
+    }
+
+    _, data = await _change(hass, "fam")
+
+    assert data["access"]["granted"] == CONTROL
+    assert data["access"]["adjusted"] == [
+        "Lights are read only.",
+        "The stand-in is in read-only mode.",
+    ]
 
 
 async def test_a_choice_at_another_resource_counts_as_none(stand_in):

@@ -16,6 +16,7 @@ from custom_components.oidc_provider.http import OIDCStringsView, async_panel_st
 from custom_components.oidc_provider.resource_description import (
     InvalidChoice,
     consent_model,
+    reasons_not_allowed,
     validate_ceiling,
     validate_choice,
     validate_description,
@@ -594,6 +595,189 @@ def test_connected_applications_offer_change_access_where_the_resource_offers_it
     assert "data-change" not in result.split('data-session="sid"')[1]
     assert result.count(">Change access</ha-button>") == 1
     assert result.count(">Sign out</ha-button>") == 2
+
+
+RENDER = """
+globalThis.CSS = { escape: (value) => value };
+const views = {};
+// An attribute turned on or off, such as Save's disabled, is kept with its view
+// as "selector attribute"
+const element = (selector) => ({
+  innerHTML: '',
+  addEventListener() {},
+  toggleAttribute(name, on) {
+    views[panel._access.view][`${selector} ${name}`] = on;
+  },
+  focus() {},
+  querySelector: () => element(),
+});
+const panel = new OidcLoginPanel();
+panel._hass = { locale: { language: 'en' } };
+panel.querySelector = (selector) => element(selector);
+panel.querySelectorAll = () => [];
+panel._renderCard = (card, before = '') => {
+  views[panel._access.view] = { card, before };
+};
+"""
+
+# Both views of the choice, as rendered
+SHOW_BOTH_VIEWS = """
+panel._access.view = 'detailed';
+panel._renderAccess();
+return views;
+"""
+
+
+def _render_change(stand_in, ceiling=None, *, granted, current=None) -> dict[str, Any]:
+    """Render both views of changing a session's access, as the server describes a
+    session that has granted, or none, under the ceiling."""
+    model = _change_model(stand_in, ceiling, current=current or granted)
+    description = validate_description(copy.deepcopy(stand_in.DESCRIPTION))
+    model["granted"] = granted
+    model["adjusted"] = (
+        reasons_not_allowed(description, model["ceiling"], granted) or None if granted else None
+    )
+    return _run_panel(
+        RENDER + "panel._renderChange(session, details);" + SHOW_BOTH_VIEWS,
+        session=SESSION,
+        details=_change_details(model),
+    )
+
+
+CURRENT_BADGE = '<span class="badge">What it has now</span>'
+
+
+def _label(card: str, level: str) -> str:
+    """Return the label of a level, or of Custom, in the simple view."""
+    return re.search(rf'id="oidc-level-{level}-label">(.*?)</span>\s*<span', card, re.S).group(1)
+
+
+def _current_line(card: str) -> str | None:
+    """Return the text of the detailed view's line on what the session has now."""
+    match = re.search(r'<div class="hint current-access">(.*?)</div>\s*<p>', card, re.S)
+    return re.sub(r"<[^>]+>", "", match.group(1)) if match else None
+
+
+@needs_node
+def test_changing_access_marks_what_the_session_has_now(stand_in):
+    views = _render_change(stand_in, granted=CONTROL)
+    simple, detailed = views["simple"]["card"], views["detailed"]["card"]
+
+    # The level it has, in the place of the consent screen's last choice
+    assert _label(simple, "control") == f"Control devices{CURRENT_BADGE}"
+    assert simple.count(CURRENT_BADGE) == 1
+    assert "Your choice last time" not in simple
+    assert _current_line(detailed) == "What App $&amp; has now: Control devices"
+    # It can have it, so nothing more is said
+    assert "<ha-alert" not in views["simple"]["before"] + views["detailed"]["before"]
+    assert "Cancel keeps" not in simple + detailed
+
+    # A choice that is no level is on Custom, and named as on the list of applications
+    views = _render_change(stand_in, granted=CUSTOM)
+    assert _label(views["simple"]["card"], "custom") == f"Custom{CURRENT_BADGE}"
+    assert _current_line(views["detailed"]["card"]) == (
+        "What App $&amp; has now: CustomLike Look only, except:Cameras: NoneConfig files: Read"
+    )
+
+    # A session without a choice opens on what its next refresh gives it, unmarked
+    views = _render_change(stand_in, granted=None, current=CONTROL)
+    assert 'value="control" checked' in views["simple"]["card"]
+    assert "What it has now" not in views["simple"]["card"]
+    assert _current_line(views["detailed"]["card"]) is None
+
+
+@needs_node
+def test_custom_is_marked_only_while_it_shows_what_the_session_has(stand_in):
+    result = _run_panel(
+        """
+        const access = new AccessChoice(model, model.current);
+        const before = access.isCurrent(CUSTOM);
+        access.chooseOption('templates', 'none');
+        const other = access.isCurrent(CUSTOM);
+        access.chooseOption('templates', 'read');
+        return { before, other, back: access.isCurrent(CUSTOM), current: access.current };
+        """,
+        model={**_change_model(stand_in, current=CUSTOM), "granted": CUSTOM},
+    )
+
+    assert result == {"before": True, "other": False, "back": True, "current": "_custom"}
+
+
+ADJUSTED = (
+    "You can no longer allow the access <bdi>App $&amp;</bdi> has now. {reason} "
+    "Saving changes it to the choice below; Cancel leaves it as it is."
+)
+CANCEL_KEEPS = '<p class="hint">Cancel keeps the access <bdi>App $&amp;</bdi> has now.</p>'
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("ceiling", "reason", "opens_on"),
+    [
+        # Lowered: held at the ceiling, Administer is Edit the setup's choice
+        (
+            {"groups": {"files": {"max": "none", "reason": "Files are off."}}, "reason": "No."},
+            "Files are off.",
+            "configure",
+        ),
+        # Moved: a locked level's choice gives way to the default level
+        ({"locked_presets": ["admin"], "reason": "Read-only mode."}, "Read-only mode.", "read"),
+    ],
+)
+def test_changing_access_says_when_it_cannot_open_on_what_the_session_has(
+    stand_in, ceiling, reason, opens_on
+):
+    views = _render_change(stand_in, ceiling, granted=ADMIN)
+
+    for view in ("simple", "detailed"):
+        before, card = views[view]["before"], views[view]["card"]
+        assert '<ha-alert alert-type="warning">' in before
+        assert ADJUSTED.format(reason=reason) in before
+        # Said again right above Save, which stays on
+        assert CANCEL_KEEPS in card
+        assert views[view]["#oidc-save disabled"] is False
+    simple = views["simple"]["card"]
+    assert f'value="{opens_on}" checked' in simple
+    # What it has stays marked, on its level, which is locked now
+    assert _label(simple, "admin") == f"Administer{CURRENT_BADGE}"
+    assert re.search(r'value="admin"\s+disabled', simple)
+    assert _current_line(views["detailed"]["card"]) == "What App $&amp; has now: Administer"
+
+
+@needs_node
+def test_a_lowered_custom_choice_is_named_but_not_marked_on_custom(stand_in):
+    """Custom shows the lowered choice, which is not what the session has."""
+    ceiling = {"groups": {"files": {"max": "none", "reason": "Files are off."}}, "reason": "No."}
+
+    views = _render_change(stand_in, ceiling, granted=CUSTOM)
+
+    simple = views["simple"]["card"]
+    assert "Files are off." in views["simple"]["before"]
+    assert 'value="_custom" checked' in simple
+    assert "What it has now" not in simple
+    assert _current_line(views["detailed"]["card"]) == (
+        "What App $&amp; has now: CustomLike Look only, except:Cameras: NoneConfig files: Read"
+    )
+
+
+@needs_node
+def test_the_consent_screen_marks_only_the_last_choice(stand_in):
+    result = _run_panel(
+        RENDER + "panel._renderConsent(details);" + SHOW_BOTH_VIEWS,
+        details=_details(_access_model(stand_in, remembered=CONTROL)),
+    )
+
+    simple = result["simple"]["card"]
+    assert (
+        _label(simple, "control")
+        == 'Control devices<span class="badge">Your choice last time</span>'
+    )
+    assert "What it has now" not in simple
+    assert _current_line(result["detailed"]["card"]) is None
+    for view in result.values():
+        assert view["before"].count("<ha-alert") == 1
+        assert "about to give <b><bdi>App</bdi></b> access" in view["before"]
+        assert "Cancel keeps" not in view["card"]
 
 
 @needs_node
