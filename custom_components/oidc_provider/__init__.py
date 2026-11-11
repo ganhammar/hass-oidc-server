@@ -17,7 +17,12 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
 
-from .client_manager import create_client, prune_dynamic_clients, validate_redirect_uris
+from .client_manager import (
+    client_name_in_use,
+    create_client,
+    prune_dynamic_clients,
+    update_client,
+)
 from .const import (
     CONF_ALLOW_CLIENT_METADATA_DOCUMENTS,
     CONF_ALLOW_DYNAMIC_REGISTRATION,
@@ -32,7 +37,7 @@ from .const import (
 from .http import (
     async_rotate_signing_key,
     client_sessions,
-    revoke_client_sessions,
+    remove_client,
     setup_http_endpoints,
 )
 from .resources import async_setup_resources
@@ -254,16 +259,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             consent_required = bool(call.data.get("consent_required", False))
 
             # Check if client with same name already exists
-            existing_clients = hass.data[DOMAIN].get("clients", {})
-            for existing_client in existing_clients.values():
-                if existing_client["client_name"] == client_name:
-                    error_msg = f"Client with name '{client_name}' already exists"
-                    _LOGGER.error(error_msg)
-                    await fail(
-                        f"{error_msg}. Please choose a different client name.",
-                        f"oidc_client_error_{client_name}",
-                    )
-                    return None
+            if client_name_in_use(hass, client_name):
+                error_msg = f"Client with name '{client_name}' already exists"
+                _LOGGER.error(error_msg)
+                await fail(
+                    f"{error_msg}. Please choose a different client name.",
+                    f"oidc_client_error_{client_name}",
+                )
+                return None
 
             # Create client using shared client_manager
             client_info = await create_client(
@@ -329,15 +332,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         its sessions; it can sign in again unless metadata documents are off.
         """
         client_id = call.data.get("client_id")
-        ended = await revoke_client_sessions(hass, client_id)
+        removed, ended = await remove_client(hass, client_id)
 
-        if client_id in hass.data[DOMAIN]["clients"]:
-            del hass.data[DOMAIN]["clients"][client_id]
-
-            # Save to storage
-            store = hass.data[DOMAIN]["store"]
-            await store.async_save({"clients": hass.data[DOMAIN]["clients"]})
-
+        if removed:
             _LOGGER.info("Revoked OIDC client %s and ended %d sessions", client_id, ended)
         elif ended:
             _LOGGER.info("Ended %d sessions of OIDC client %s", ended, client_id)
@@ -367,26 +364,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await fail(f"Client ID '{client_id}' not found")
             return
 
-        # The redirect host is shown on the consent screen, so updated URIs
-        # get the same validation as registration.
         try:
-            validate_redirect_uris(redirect_uris)
+            client = await update_client(hass, client_id, redirect_uris, consent_required)
         except ValueError as e:
             await fail(str(e))
             return
 
-        # Update redirect URIs and, when given, the consent setting
-        client = hass.data[DOMAIN]["clients"][client_id]
-        client["redirect_uris"] = redirect_uris
-        if consent_required is not None:
-            client["consent_required"] = bool(consent_required)
         consent_label = "yes" if client.get("consent_required", True) else "no"
 
-        # Save to storage
-        store = hass.data[DOMAIN]["store"]
-        await store.async_save({"clients": hass.data[DOMAIN]["clients"]})
-
-        client_name = hass.data[DOMAIN]["clients"][client_id]["client_name"]
+        client_name = client["client_name"]
 
         await hass.services.async_call(
             "persistent_notification",
