@@ -2106,7 +2106,7 @@ class OidcLoginPanel extends HTMLElement {
         <h1 tabindex="-1">${this._t('panel.error_title')}</h1>
         <p>${Object.hasOwn(this._strings, hint) ? this._t(hint) : escapeHtml(hint)}</p>
       `,
-      `<ha-alert alert-type="error">${escapeHtml(error.message)}</ha-alert>`
+      `<ha-alert alert-type="error">${escapeHtml(error.detail || error.message)}</ha-alert>`
     );
   }
 

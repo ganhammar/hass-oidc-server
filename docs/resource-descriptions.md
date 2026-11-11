@@ -246,10 +246,10 @@ Until that refresh, the user can also give such a session access themselves on C
 
 ## Changing access
 
-On Connected applications, the user can change the access of every session whose `resource` matches your description, a session from before your description included. The provider never changes a session's access on its own.
+On Connected applications, the user can change the access of every session whose `resource` matches your description, a session from before your description included. Apart from giving a session from before your description the access you name for it, the provider never changes a session's access on its own.
 
 - **Change access** asks your module for the description, availability and the user's ceiling, in the user's language, as the consent screen does, and shows the same choice. It opens on the session's current options. A session from before your description opens on the access `existing_sessions_preset` would give it at its next refresh, or, without one, where the consent screen would open.
-- **Save** asks for all three again, in Home Assistant's language, and checks the choice as an approval is checked. A choice that does not fit, or an answer that fails, does not validate or does not come within 10 seconds, changes nothing and the provider logs a warning.
+- **Save** asks for all three again, in Home Assistant's language, and checks the choice as an approval is checked. A choice that does not fit changes nothing. Neither does an answer that fails, does not validate or does not come within 10 seconds, and for that the provider logs a warning.
 - A choice that fits replaces the session's access. Your scopes in the session's `scope` become exactly those of the new choice, following the rule for any choice; the OpenID Connect scopes stay. It is remembered as the user's choice for that client, so their next consent screen for it opens on it.
 - Access tokens already issued keep their scopes until they expire, within the hour, as after a sign-out. The session's next refresh carries the new scopes, and so does every refresh after it. A token issued with the old scopes can therefore reach you for up to an hour after a change, so keep enforcing your scopes and the user's ceiling on every request.
 
