@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,7 +21,8 @@ from custom_components.oidc_provider.resource_description import (
     validate_description,
 )
 
-PANEL = Path(__file__).parent.parent / "custom_components/oidc_provider/www/oidc-auth-panel.js"
+COMPONENT = Path(__file__).parent.parent / "custom_components" / "oidc_provider"
+PANEL = COMPONENT / "www" / "oidc-auth-panel.js"
 HARNESS = Path(__file__).parent / "panel_harness.js"
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="running the panel's script needs Node.js")
@@ -72,6 +74,19 @@ async def test_strings_view_answers_in_the_language_asked_for(
     request.query = {"language": "klingon"}
     response = await OIDCStringsView().get(request)
     assert json.loads(response.body)["language"] == hass.config.language
+
+
+def test_the_panel_bundles_the_english_of_the_translations():
+    """The panel falls back to its own English when its text cannot be loaded, so
+    it carries every string of translations/en.json, and the same words."""
+    bundled = re.search(r"const FALLBACK_STRINGS = (\{.*?\n\});", PANEL.read_text(), re.S)
+    english = json.loads((COMPONENT / "translations" / "en.json").read_text())["config_panel"]
+
+    assert json.loads(bundled.group(1)) == {
+        f"{section}.{key}": text
+        for section, strings in english.items()
+        for key, text in strings.items()
+    }
 
 
 def test_strings_view_needs_a_signed_in_user():
@@ -216,3 +231,22 @@ def test_a_level_held_at_a_locked_levels_choice_is_locked_too(stand_in):
             validate_ceiling(description, ceiling),
             {"options": {**ADMIN, "files": "none"}},
         )
+
+
+@needs_node
+def test_the_bundled_english_stands_in_when_the_text_cannot_be_loaded():
+    result = _run_panel("""
+        const panel = new OidcLoginPanel();
+        panel._fetchJson = async () => {
+          throw Object.assign(new Error('500 Internal Server Error'), { status: 500 });
+        };
+        await panel._loadStrings();
+        const failed = [panel._t('consent.heading'), panel._t('sessions.heading')];
+        panel._fetchJson = async () => ({ strings: { 'consent.heading': 'Godkänn åtkomst?' } });
+        await panel._loadStrings();
+        return { failed, loaded: [panel._t('consent.heading'), panel._t('consent.deny')] };
+        """)
+
+    assert result["failed"] == ["Approve access?", "Connected applications"]
+    # Loaded text wins, and English fills in what it lacks
+    assert result["loaded"] == ["Godkänn åtkomst?", "Deny"]

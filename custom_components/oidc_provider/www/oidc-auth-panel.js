@@ -11,17 +11,61 @@
 // the consent screen lets the user choose that access: one of the resource's
 // levels, or one setting per area in a detailed view. The resource supplies
 // that text in the user's language. The panel's own text comes from the
-// integration's translations, through /oidc/strings.
+// integration's translations, through /oidc/strings, with the English bundled
+// for when they cannot be loaded.
 
-// Shown before the translations have loaded, or when they cannot be
+// The panel's text in English, the same as in translations/en.json, which a
+// test keeps it in step with. It is shown until the translations have
+// loaded, and in their place when they cannot be.
 const FALLBACK_STRINGS = {
-  'panel.loading_title': 'One moment',
-  'panel.loading_text': 'Loading the authorization request.',
-  'panel.error_title': 'Something went wrong',
-  'panel.error_hint':
-    'The authorization could not be completed. Close this page and try again from the application.',
-  'panel.sessions_error_hint':
-    'Your connected applications could not be loaded or changed. Reload the page to try again.',
+  "panel.loading_title": "One moment",
+  "panel.loading_text": "Loading the authorization request.",
+  "panel.error_title": "Something went wrong",
+  "panel.error_hint": "The authorization could not be completed. Close this page and try again from the application.",
+  "panel.sessions_error_hint": "Your connected applications could not be loaded or changed. Reload the page to try again.",
+  "panel.request_gone": "That sign-in request is no longer valid. To sign in, start again from the application.",
+  "panel.client_from_host": "{client} from {host}",
+  "consent.heading": "Approve access?",
+  "consent.alert": "You're about to give {client} access to your Home Assistant instance.",
+  "consent.redirect": "If you continue, you will be sent to {host}. The application will be able to see:",
+  "consent.scope_openid": "Confirm who you are",
+  "consent.scope_profile": "Your name",
+  "consent.scope_email": "Your email address",
+  "consent.scope_groups": "Your group memberships",
+  "consent.loopback": "This sends you back to an application on your own computer. Only approve if you started this sign-in yourself.",
+  "consent.approve": "Approve",
+  "consent.deny": "Deny",
+  "consent.approved_title": "Access approved",
+  "consent.denied_title": "Access denied",
+  "consent.sending_back": "Sending you back to the application.",
+  "access.prompt": "Choose what {app} can do.",
+  "access.choose_in_detail": "Choose in detail",
+  "access.back": "Back to levels",
+  "access.detail_heading": "Choose in detail",
+  "access.start_from": "Start from a level",
+  "access.preset_locked": "{level} (not available)",
+  "access.custom": "Custom",
+  "access.custom_summary": "Like {level}, except:",
+  "access.custom_summary_many": "Your own choice for each area, closest to {level}.",
+  "access.custom_status": "Custom: like {level}, except {differences}.",
+  "access.custom_status_many": "Custom: your own choice for each area, closest to {level}.",
+  "access.difference": "{area}: {option}",
+  "access.last_choice": "Your choice last time",
+  "access.not_available": "Not available",
+  "access.locked_choice": "These settings are the same as {level}. {reason}",
+  "access.fine_print": "When you approve, you go back to {host}.",
+  "access.fine_print_sees": "{app} will also see your {information}.",
+  "access.sees_profile": "name",
+  "access.sees_email": "email address",
+  "access.sees_groups": "group memberships",
+  "access.change_later": "You can sign {app} out at any time under Connected applications.",
+  "sessions.heading": "Connected applications",
+  "sessions.intro": "These applications can use your Home Assistant account. Signing one out stops it from getting new access; access it already has runs out within the hour. To get access back, it has to ask you again.",
+  "sessions.empty": "No applications are signed in with your Home Assistant account.",
+  "sessions.access": "Access: {level}",
+  "sessions.meta": "Signed in {signed_in}, last used {last_used}",
+  "sessions.never": "never",
+  "sessions.sign_out": "Sign out"
 };
 
 // The value of the level choice that stands for a custom choice. Preset ids
@@ -818,9 +862,16 @@ class OidcLoginPanel extends HTMLElement {
     return this._hass?.locale?.language || this._hass?.language || 'en';
   }
 
+  // The panel's text in the user's language. When it cannot be loaded, the
+  // bundled English stands in, so signing in does not depend on it.
   async _loadStrings() {
-    const { strings } = await this._fetchJson(`/oidc/strings?language=${encodeURIComponent(this._language())}`);
-    this._strings = { ...FALLBACK_STRINGS, ...strings };
+    try {
+      const { strings } = await this._fetchJson(`/oidc/strings?language=${encodeURIComponent(this._language())}`);
+      this._strings = { ...FALLBACK_STRINGS, ...strings };
+    } catch (error) {
+      console.warn('OIDC login panel: showing the bundled English text', error);
+      this._strings = { ...FALLBACK_STRINGS };
+    }
   }
 
   // A translated string as markup. Its text is escaped, then each {name} is
