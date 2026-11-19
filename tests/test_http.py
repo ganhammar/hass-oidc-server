@@ -1699,6 +1699,7 @@ async def test_oidc_token_view_issues_jwt_access_token_profile():
     }
     mock_user = Mock()
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.groups = []
     hass.auth = Mock()
     hass.auth.async_get_user = AsyncMock(return_value=mock_user)
@@ -2187,6 +2188,7 @@ async def test_oidc_token_view_valid_pkce():
 
     mock_user = Mock()
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     mock_user.groups = []
     hass.auth = Mock()
@@ -2255,6 +2257,7 @@ async def test_oidc_token_view_includes_groups_in_access_token():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = True
     admin_group = Mock()
     admin_group.id = "system-admin"
@@ -2381,6 +2384,7 @@ async def test_oidc_token_view_excludes_groups_without_scope():
 
     mock_user = Mock()
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     mock_user.groups = []
     hass.auth = Mock()
@@ -2460,6 +2464,7 @@ async def test_oidc_token_view_refresh_token():
 
     mock_user = Mock()
     mock_user.name = "user@example.com"
+    mock_user.credentials = []
     mock_user.is_owner = False
     mock_user.groups = []
     hass.auth = Mock()
@@ -3018,6 +3023,7 @@ async def test_oidc_userinfo_endpoint():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     admin_group = Mock()
     admin_group.id = "system-admin"
@@ -3092,6 +3098,7 @@ async def test_oidc_userinfo_accepts_resource_bound_token():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_auth = Mock()
     mock_auth.async_get_user = AsyncMock(return_value=mock_user)
 
@@ -3216,6 +3223,7 @@ async def test_oidc_userinfo_includes_groups_when_scope_requested():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     admin_group = Mock()
     admin_group.id = "system-admin"
@@ -3285,6 +3293,7 @@ async def test_oidc_userinfo_groups_for_owner():
     mock_user = Mock()
     mock_user.id = "owner123"
     mock_user.name = "Owner User"
+    mock_user.credentials = []
     mock_user.is_owner = True
     admin_group = Mock()
     admin_group.id = "system-admin"
@@ -3353,6 +3362,7 @@ async def test_oidc_userinfo_groups_for_regular_user():
     mock_user = Mock()
     mock_user.id = "regular123"
     mock_user.name = "Regular User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     user_group = Mock()
     user_group.id = "system-users"
@@ -3421,6 +3431,7 @@ async def test_oidc_userinfo_groups_for_read_only_user():
     mock_user = Mock()
     mock_user.id = "readonly123"
     mock_user.name = "Read Only User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     ro_group = Mock()
     ro_group.id = "system-read-only"
@@ -3489,6 +3500,7 @@ async def test_oidc_userinfo_only_returns_sub_without_scopes():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "Test User"
+    mock_user.credentials = []
     mock_user.is_owner = False
     admin_group = Mock()
     admin_group.id = "system-admin"
@@ -3529,8 +3541,8 @@ async def test_oidc_userinfo_only_returns_sub_without_scopes():
 
 
 @pytest.mark.asyncio
-async def test_oidc_userinfo_returns_email_when_username_is_email():
-    """Test UserInfo endpoint returns email when username looks like an email address."""
+async def test_oidc_userinfo_returns_email_when_name_is_email():
+    """Test UserInfo endpoint returns email when the name looks like an email address."""
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -3560,6 +3572,7 @@ async def test_oidc_userinfo_returns_email_when_username_is_email():
     mock_user = Mock()
     mock_user.id = "user123"
     mock_user.name = "john@example.com"
+    mock_user.credentials = []
     mock_user.is_owner = False
     mock_user.groups = []
 
@@ -3593,6 +3606,76 @@ async def test_oidc_userinfo_returns_email_when_username_is_email():
     data = json.loads(response.body.decode("utf-8"))
     assert data["email"] == "john@example.com"
     assert data["email_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_oidc_userinfo_takes_email_from_username_without_verification_status():
+    """A username that looks like an email address goes as the email, with no email_verified."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048, backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    payload = {
+        "sub": "user123",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+        "iss": "http://localhost/oidc",
+        "aud": "test_client",
+        "scope": "openid email",
+    }
+
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    token = jwt.encode(payload, private_key_pem, algorithm="RS256", headers={"typ": "at+jwt"})
+
+    mock_user = Mock()
+    mock_user.id = "user123"
+    mock_user.name = "John"
+    mock_user.credentials = [
+        Mock(auth_provider_type="homeassistant", data={"username": "john@example.com"})
+    ]
+    mock_user.is_owner = False
+    mock_user.groups = []
+
+    mock_auth = Mock()
+    mock_auth.async_get_user = AsyncMock(return_value=mock_user)
+
+    hass = Mock()
+    hass.auth = mock_auth
+    hass.data = {
+        DOMAIN: {
+            "jwt_public_key": public_key,
+            "jwt_kid": "test-kid-1",
+            "clients": {"test_client": {}},
+        }
+    }
+
+    mock_url = Mock()
+    mock_url.origin.return_value = "http://localhost"
+
+    request = Mock()
+    request.app = {"hass": hass}
+    request.headers = {"Authorization": f"Bearer {token}"}
+    request.url = mock_url
+
+    from custom_components.oidc_provider.http import OIDCUserInfoView
+
+    view = OIDCUserInfoView()
+    response = await view.get(request)
+
+    assert response.status == 200
+    data = json.loads(response.body.decode("utf-8"))
+    assert data["email"] == "john@example.com"
+    assert "email_verified" not in data
 
 
 @pytest.mark.asyncio

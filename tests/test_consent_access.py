@@ -556,7 +556,7 @@ async def _hass_with_session_from_before(stand_in, user=USER):
     """
     hass = await _token_hass(stand_in)
     hass.auth.async_get_user = AsyncMock(
-        return_value=SimpleNamespace(id=user, name="Someone") if user else None
+        return_value=SimpleNamespace(id=user, name="Someone", credentials=[]) if user else None
     )
     hass.data[DOMAIN]["refresh_tokens"] = {
         "fam.old": {
@@ -977,7 +977,7 @@ async def _change_hass(stand_in):
     """
     hass = await _token_hass(stand_in)
     hass.auth.async_get_user = AsyncMock(
-        side_effect=lambda user_id: SimpleNamespace(id=user_id, name="Someone")
+        side_effect=lambda user_id: SimpleNamespace(id=user_id, name="Someone", credentials=[])
     )
     custom = {"resource": "oidc_stand_in", "options": CUSTOM, "scopes": CUSTOM_SCOPES}
     hass.data[DOMAIN]["refresh_tokens"] = {
