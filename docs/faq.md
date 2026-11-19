@@ -31,7 +31,7 @@ A separate identity provider is another service to run and keep up to date, with
 
 ### Which applications can use it?
 
-Any application that supports OAuth 2 or OpenID Connect with the authorization code flow: MCP clients such as Claude and Claude Code, and self-hosted applications with a "Generic OAuth" or "OpenID Connect" login, such as Grafana. Some applications need an email address for every person, which this provider only sends when the person's Home Assistant name is an email address; see [Does the application get my email address?](#does-the-application-get-my-email-address)
+Any application that supports OAuth 2 or OpenID Connect with the authorization code flow: MCP clients such as Claude and Claude Code, and self-hosted applications with a "Generic OAuth" or "OpenID Connect" login, such as Grafana. Some applications need an email address for every person, which this provider only sends when the person's Home Assistant username or name is an email address; see [Does the application get my email address?](#does-the-application-get-my-email-address)
 
 ### Does it work with Home Assistant Cloud?
 
@@ -65,7 +65,7 @@ Yes, when the integration it connects to describes its access, as an MCP server 
 
 ### Does the application get my email address?
 
-Only when your name in Home Assistant is an email address, since Home Assistant keeps no email address for you otherwise. It is then marked as not verified. The application gets your Home Assistant user ID as `sub` in any case, and your name and groups when it asks for them. See [Scopes and claims](reference.md#scopes-and-claims).
+Only when your username or your name in Home Assistant is an email address, since Home Assistant keeps no email address for you otherwise. A username goes without saying whether the address is verified, as only an administrator sets it, and the application decides; a name goes marked as not verified, as you set it yourself. Some applications, such as Vaultwarden, refuse an address marked as not verified. The application gets your Home Assistant user ID as `sub` in any case, and your name and groups when it asks for them. See [Scopes and claims](reference.md#scopes-and-claims).
 
 ### Can a mobile app with its own address scheme sign in?
 

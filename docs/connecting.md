@@ -80,7 +80,7 @@ Applications such as Grafana can let people sign in with Home Assistant through 
 | PKCE | On, with the S256 method. It is required unless you turn off [Require PKCE](configuration.md#require-pkce) |
 | Client authentication | Either: in the `Authorization` header (basic) or in the request body (post) |
 
-The application learns who signed in from the ID token or from the user info endpoint: the person's Home Assistant user ID as `sub`, their name, their groups (`owner`, `admin`, `user` or `read-only`) and, only when their name in Home Assistant is an email address, that address. [Scopes and claims](reference.md#scopes-and-claims) has the details.
+The application learns who signed in from the ID token or from the user info endpoint: the person's Home Assistant user ID as `sub`, their name, their groups (`owner`, `admin`, `user` or `read-only`) and, only when their username or name in Home Assistant is an email address, that address. [Scopes and claims](reference.md#scopes-and-claims) has the details.
 
 Every Home Assistant user can sign in to every client. To limit an application to some people, or give them different roles, use the `groups` claim in the application, as the Grafana example below does for roles.
 
@@ -109,7 +109,7 @@ role_attribute_path = contains(groups[*], 'admin') && 'Admin' || 'Viewer'
 
 The same settings can be made in Grafana under Administration > Authentication > Generic OAuth. `role_attribute_path` gives Home Assistant administrators Grafana's Admin role and everyone else Viewer.
 
-Grafana's documentation says it needs an email address to sign someone in, and this provider only sends one when the person's name in Home Assistant is an email address. So this example works for the people whose Home Assistant name is their email address.
+Grafana's documentation says it needs an email address to sign someone in, and this provider only sends one when the person's username or name in Home Assistant is an email address. So this example works for the people whose Home Assistant username or name is their email address.
 
 ## Clients that register themselves
 
