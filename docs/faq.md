@@ -65,7 +65,7 @@ Yes, when the integration it connects to describes its access, as an MCP server 
 
 ### Does the application get my email address?
 
-Only when your username or your name in Home Assistant is an email address, since Home Assistant keeps no email address for you otherwise. A username goes without saying whether the address is verified, as only an administrator sets it, and the application decides; a name goes marked as not verified, as you set it yourself. Some applications, such as Vaultwarden, refuse an address marked as not verified. The application gets your Home Assistant user ID as `sub` in any case, and your name and groups when it asks for them. See [Scopes and claims](reference.md#scopes-and-claims).
+Only when your username or your name in Home Assistant is an email address, since Home Assistant keeps no email address for you otherwise. A username goes without saying whether the address is verified, as only an administrator sets it, and the application decides; a name goes marked as not verified, as you set it yourself. Some applications refuse an address marked as not verified. Vaultwarden also refuses one without `email_verified`, unless its administrator sets `SSO_ALLOW_UNKNOWN_EMAIL_VERIFICATION=true`, which is reasonable here since only the Home Assistant owner can change usernames; [Vaultwarden's documentation](https://github.com/dani-garcia/vaultwarden/wiki/Enabling-SSO-support-using-OpenId-Connect#on-sso_allow_unknown_email_verification) advises turning off `SSO_SIGNUPS_MATCH_EMAIL` alongside it. The application gets your Home Assistant user ID as `sub` in any case, and your name and groups when it asks for them. See [Scopes and claims](reference.md#scopes-and-claims).
 
 ### Can a mobile app with its own address scheme sign in?
 

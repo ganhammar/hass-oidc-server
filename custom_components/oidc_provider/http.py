@@ -754,7 +754,7 @@ def _looks_like_email(value: str) -> bool:
     return bool(local) and "." in domain
 
 
-def _email_claims(user) -> dict:
+def _email_claims(user: Any) -> dict:
     """The email claims for a user, empty when Home Assistant knows no email for them.
 
     A username that looks like an email address goes without ``email_verified``:
@@ -762,7 +762,7 @@ def _email_claims(user) -> dict:
     client can then decide for itself. Failing that, a name that looks like one
     goes as unverified, since the person sets their own name.
     """
-    for credential in user.credentials:
+    for credential in getattr(user, "credentials", []):
         username = credential.data.get("username", "")
         if credential.auth_provider_type == "homeassistant" and _looks_like_email(username):
             return {"email": username}
