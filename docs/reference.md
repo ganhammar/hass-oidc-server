@@ -111,7 +111,7 @@ Every address in them is a full URL on the issuer's address.
 |---|---|
 | `openid` | Required. The person's Home Assistant user ID as `sub`, and an ID token |
 | `profile` | `name`: the person's name in Home Assistant |
-| `email` | `email` and `email_verified: false`, only when the person's name in Home Assistant looks like an email address. Home Assistant has no email address of its own for a person |
+| `email` | `email`, when the person's Home Assistant username looks like an email address, without `email_verified`: only an administrator sets usernames, but nobody checked the address. Failing that, when their name looks like one, `email` and `email_verified: false`, since people set their own name. Home Assistant has no email address of its own for a person |
 | `groups` | `groups`: `owner` for the owner, and `admin`, `user` or `read-only` for the Home Assistant group they are in |
 
 The discovery documents also list every scope an integration describes; see [Choosing what an application may do](consent.md#choosing-what-an-application-may-do). Those are granted as the person chooses on the consent screen, never from the authorization request.

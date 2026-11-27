@@ -34,10 +34,13 @@ def _make_keys():
     return private_key, public_pem
 
 
-def _make_user(name: str = "Test User", is_owner: bool = False):
+def _make_user(name: str = "Test User", is_owner: bool = False, username: str | None = None):
     user = Mock()
     user.id = "user123"
     user.name = name
+    user.credentials = (
+        [Mock(auth_provider_type="homeassistant", data={"username": username})] if username else []
+    )
     user.is_owner = is_owner
     user.groups = []
     return user
@@ -346,6 +349,36 @@ async def test_id_token_includes_scope_gated_claims():
     assert claims["email"] == "user@example.com"
     assert claims["email_verified"] is False
     assert claims["groups"] == ["owner"]
+
+
+@pytest.mark.asyncio
+async def test_id_token_takes_email_from_username_without_verification_status():
+    private_key, public_pem = _make_keys()
+    verifier, challenge = _pkce_pair()
+    user = _make_user(name="Javi", username="javi@example.com")
+
+    hass = _build_token_hass(
+        private_key,
+        user=user,
+        auth_code_data={
+            "client_id": "test_client",
+            "redirect_uri": "https://example.com/callback",
+            "user_id": "user123",
+            "scope": "openid email",
+            "nonce": None,
+            "auth_time": int(time.time()),
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "expires_at": time.time() + 600,
+        },
+    )
+
+    response = await OIDCTokenView().post(_post_authorization_code(hass, code_verifier=verifier))
+    body = json.loads(response.body.decode("utf-8"))
+    claims = _decode_id_token(body["id_token"], public_pem)
+
+    assert claims["email"] == "javi@example.com"
+    assert "email_verified" not in claims
 
 
 @pytest.mark.asyncio

@@ -754,6 +754,23 @@ def _looks_like_email(value: str) -> bool:
     return bool(local) and "." in domain
 
 
+def _email_claims(user: Any) -> dict:
+    """The email claims for a user, empty when Home Assistant knows no email for them.
+
+    A username that looks like an email address goes without ``email_verified``:
+    only an administrator sets usernames, but nobody checked the address, and a
+    client can then decide for itself. Failing that, a name that looks like one
+    goes as unverified, since the person sets their own name.
+    """
+    for credential in getattr(user, "credentials", []):
+        username = credential.data.get("username", "")
+        if credential.auth_provider_type == "homeassistant" and _looks_like_email(username):
+            return {"email": username}
+    if _looks_like_email(user.name or ""):
+        return {"email": user.name, "email_verified": False}
+    return {}
+
+
 async def setup_http_endpoints(hass: HomeAssistant) -> None:
     """Set up the OIDC HTTP endpoints."""
     # Load or generate the RSA keys tokens are signed and verified with
@@ -2096,10 +2113,7 @@ class OIDCTokenView(HomeAssistantView):
             payload["name"] = user.name
 
         if user and SCOPE_EMAIL in requested_scopes:
-            username = user.name or ""
-            if _looks_like_email(username):
-                payload["email"] = username
-                payload["email_verified"] = False
+            payload.update(_email_claims(user))
 
         if user and SCOPE_GROUPS in requested_scopes:
             payload["groups"] = _resolve_user_groups(user)
@@ -2168,10 +2182,7 @@ class OIDCUserInfoView(HomeAssistantView):
                 userinfo["name"] = user.name
 
             if SCOPE_EMAIL in requested_scopes:
-                username = user.name or ""
-                if _looks_like_email(username):
-                    userinfo["email"] = username
-                    userinfo["email_verified"] = False
+                userinfo.update(_email_claims(user))
 
             if SCOPE_GROUPS in requested_scopes:
                 userinfo["groups"] = _resolve_user_groups(user)
